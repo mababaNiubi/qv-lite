@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>Embedded KV time-series database engine — built for edge computing gateways and resource-constrained devices.</strong>
+  <strong>Lightweight Edge Embeddable KV Time-Series Database Engine.</strong>
 </p>
 
 <p align="center">

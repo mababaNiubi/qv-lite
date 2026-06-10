@@ -4,13 +4,14 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"github.com/mababaNiubi/variant"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"qvdb/tsdb"
 	"strings"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
+	"github.com/mababaNiubi/variant"
 )
 
 type HttpServer struct {
@@ -161,7 +162,7 @@ func (hs *HttpServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if req.Condition != nil {
 		stmt.Having = tsdb.Condition{
 			ColumnAttributeName: mapColumnName(req.Condition.Column),
-			Type:                tsdb.ConditionOperator(req.Condition.Operator),
+			Operator:            tsdb.ConditionOperator(req.Condition.Operator),
 			Value:               variant.New(req.Condition.Value),
 		}
 	}

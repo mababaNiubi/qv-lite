@@ -2,10 +2,11 @@ package server
 
 import (
 	"fmt"
-	"qvdb/tsdb"
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -474,17 +475,17 @@ func (p *parser) parseWhereClause(stmt *SelectStmt) error {
 			// Other conditions go to Having
 			cond := tsdb.Condition{
 				ColumnAttributeName: mapColumnName(ident),
-				Type:                tsdb.ConditionOperator(opTok.value),
+				Operator:            tsdb.ConditionOperator(opTok.value),
 				Value:               val,
 			}
 			if stmt.Having != nil {
-				if logical, ok := stmt.Having.(tsdb.LogicalCondition); ok && logical.Operator == tsdb.And {
-					logical.Conditions = append(logical.Conditions, cond)
+				if logical, ok := stmt.Having.(tsdb.LogicalCondition); ok && logical.Op == tsdb.LogicalAnd {
+					logical.Cond = append(logical.Cond, cond)
 					stmt.Having = logical
 				} else {
 					stmt.Having = tsdb.LogicalCondition{
-						Operator:   tsdb.And,
-						Conditions: []any{stmt.Having.(tsdb.Condition), cond},
+						Op:   tsdb.LogicalAnd,
+						Cond: []any{stmt.Having.(tsdb.Condition), cond},
 					}
 				}
 			} else {
@@ -535,7 +536,7 @@ func (p *parser) parseCondition() (tsdb.Condition, error) {
 
 	return tsdb.Condition{
 		ColumnAttributeName: mapColumnName(identTok.value),
-		Type:                tsdb.ConditionOperator(opTok.value),
+		Operator:            tsdb.ConditionOperator(opTok.value),
 		Value:               val,
 	}, nil
 }

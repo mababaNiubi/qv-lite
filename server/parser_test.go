@@ -1,8 +1,9 @@
 package server
 
 import (
-	"qvdb/tsdb"
 	"testing"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 
 	"github.com/mababaNiubi/variant"
 )

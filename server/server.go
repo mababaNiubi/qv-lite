@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"qvdb/tsdb"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
 type Server struct {

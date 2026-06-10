@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"qvdb/server"
-	"qvdb/tsdb"
 	"strings"
 	"syscall"
+
+	"github.com/mababaNiubi/qv-lite/server"
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
 func main() {

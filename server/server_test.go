@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"qvdb/tsdb"
 	"testing"
 	"time"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
 func startTestServer(t *testing.T) (string, func()) {

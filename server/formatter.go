@@ -2,7 +2,8 @@ package server
 
 import (
 	"encoding/json"
-	"qvdb/tsdb"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
 type pointJSON struct {

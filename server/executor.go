@@ -2,7 +2,8 @@ package server
 
 import (
 	"fmt"
-	"qvdb/tsdb"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
 type Executor struct {

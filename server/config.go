@@ -1,6 +1,6 @@
 package server
 
-import "qvdb/tsdb"
+import "github.com/mababaNiubi/qv-lite/tsdb"
 
 type Config struct {
 	// HttpAddr is the address for the HTTP API server (e.g., ":8080").

@@ -10,32 +10,32 @@ import (
 type ConditionOperator string
 
 const (
-	NotEqualQueryCondition           ConditionOperator = "!="
-	EqualQueryCondition              ConditionOperator = "="
-	GreaterThanQueryCondition        ConditionOperator = ">"
-	GreaterThanOrEqualQueryCondition ConditionOperator = ">="
-	LessThanQueryCondition           ConditionOperator = "<"
-	LessThanOrEqualQueryCondition    ConditionOperator = "<="
+	OpNotEqual           ConditionOperator = "!="
+	OpEqual              ConditionOperator = "="
+	OpGreaterThan        ConditionOperator = ">"
+	OpGreaterThanOrEqual ConditionOperator = ">="
+	OpLessThan           ConditionOperator = "<"
+	OpLessThanOrEqual    ConditionOperator = "<="
 )
 
 type LogicalOperator string
 
 const (
-	And LogicalOperator = "and"
-	Or  LogicalOperator = "or"
+	LogicalAnd LogicalOperator = "and"
+	LogicalOr  LogicalOperator = "or"
 )
 
 type Condition struct {
 	// ColumnAttributeName is the name of the column to evaluate.
 	ColumnAttributeName string
-	// Type is the condition operator (e.g., "=", ">", "<").
-	Type  ConditionOperator
-	Value variant.Variant
+	// Operator is the condition operator (e.g., "=", ">", "<").
+	Operator ConditionOperator
+	Value    variant.Variant
 }
 
 type LogicalCondition struct {
-	Operator   LogicalOperator
-	Conditions []any
+	Op   LogicalOperator
+	Cond []any
 }
 
 func EvalCondition(cond Condition, data variant.Variant) (bool, error) {
@@ -47,7 +47,6 @@ func EvalCondition(cond Condition, data variant.Variant) (bool, error) {
 		// Resolve column value from data by traversing nested keys.
 		columnValue, exists := data.MapGet(columnAttributeNames[i])
 		if !exists {
-			//return false, fmt.Errorf("column %s not found in data", columnAttributeNames[i])
 			return false, nil
 		}
 		if columnValue.Type() == variant.TypeMap {
@@ -61,36 +60,34 @@ func EvalCondition(cond Condition, data variant.Variant) (bool, error) {
 
 func CompareValue(cond Condition, columnValue variant.Variant) (bool, error) {
 	if columnValue.Type() == variant.TypeString || columnValue.Type() == variant.TypeList || columnValue.Type() == variant.TypeMap {
-		switch cond.Type {
-		case EqualQueryCondition:
+		switch cond.Operator {
+		case OpEqual:
 			return columnValue.IsEqual(cond.Value), nil
-		case NotEqualQueryCondition:
+		case OpNotEqual:
 			return !columnValue.IsEqual(cond.Value), nil
 		default:
-			return false, fmt.Errorf("invalid operator: %s", cond.Type)
+			return false, fmt.Errorf("invalid operator: %s", cond.Operator)
 		}
 	}
-	return columnValue.CompareNumberBySymbol(cond.Value, string(cond.Type))
+	return columnValue.CompareNumberBySymbol(cond.Value, string(cond.Operator))
 }
 
 func EvalLogicalCondition(logicalCond LogicalCondition, data variant.Variant) (bool, error) {
-	if len(logicalCond.Conditions) == 0 {
+	if len(logicalCond.Cond) == 0 {
 		return false, ErrorEmptyLogicalCondition
 	}
 
-	switch logicalCond.Operator {
-	case And:
-		// All conditions must be satisfied.
-		for _, cond := range logicalCond.Conditions {
+	switch logicalCond.Op {
+	case LogicalAnd:
+		for _, cond := range logicalCond.Cond {
 			result, err := evalAnyCondition(cond, data)
 			if err != nil || !result {
 				return false, err
 			}
 		}
 		return true, nil
-	case Or:
-		// At least one condition must be satisfied.
-		for _, cond := range logicalCond.Conditions {
+	case LogicalOr:
+		for _, cond := range logicalCond.Cond {
 			result, err := evalAnyCondition(cond, data)
 			if err != nil {
 				return false, err
@@ -101,7 +98,7 @@ func EvalLogicalCondition(logicalCond LogicalCondition, data variant.Variant) (b
 		}
 		return false, nil
 	default:
-		return false, fmt.Errorf("unknown logical operator: %s", logicalCond.Operator)
+		return false, fmt.Errorf("unknown logical operator: %s", logicalCond.Op)
 	}
 }
 

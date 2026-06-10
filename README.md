@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>A high-performance embedded time-series database engine written in Go.</strong>
+  <strong>Embedded KV time-series database engine — built for edge computing gateways and resource-constrained devices.</strong>
 </p>
 
 <p align="center">
@@ -16,7 +16,14 @@
 
 - [Features](#features)
 - [Installation](#installation)
-- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [Open & Close](#open--close)
+  - [Write](#write)
+  - [Query](#query)
+  - [Table Management](#table-management)
+  - [Data Types](#data-types)
+  - [Aggregation](#aggregation)
+  - [Condition Filtering](#condition-filtering)
 - [Configuration](#configuration)
 - [Compression Algorithms](#compression-algorithms)
 - [Data Encoding](#data-encoding)
@@ -24,16 +31,17 @@
 
 ## Features
 
-- **Embedded Architecture** — No external services required. Integrates as a library into Go applications.
-- **Strongly-Typed Column Store** — Supports Int, Float, String, Bool, Json, Structure, and more, each with specialized per-type compression.
-- **WAL + Segment Storage** — Writes are buffered in a WAL then periodically flushed to compressed on-disk segments.
-- **Multi-Table Support** — Manage multiple independent tables, each with its own tag dictionary and column set.
-- **Efficient Compression** — Timestamps use delta-of-delta + simple8b/RLE; integers use zigzag + simple8b; floats use XOR-delta; booleans use bit-packing; strings use Snappy; JSON uses LZ4.
+- **Embedded & Lightweight** — Designed for edge gateways, industrial controllers, and IoT devices with limited CPU/memory/disk.
+- **Minimal Codebase** — Compact, auditable core with weak third-party dependencies. Simple on-disk file structure — no complex storage engine, easy to inspect and maintain.
+- **Simple File Structure** — Straightforward directory layout: one metadata file per table, timestamp-named segment files, and WAL logs. No heavy database engine, easy to back up and migrate.
+- **High Write Throughput** — Single-threaded synchronous design. Achieves **8,000,000+ points/second** single-node write performance.
+- **Adaptive Type Encoding** — Auto-detects input data structure at runtime and selects the optimal compression codec per data type for maximum storage efficiency.
+- **High Compression Ratio** — Delta-of-delta timestamps, XOR-delta floats, zigzag integers, bit-packed booleans, plus Snappy/LZ4/Zstd block compression — typically 10x+ reduction vs raw storage.
+- **Multi-Table Support** — Manage multiple independent tables, each with its own schema definition and column set.
 - **Downsampling Queries** — Sliding-window aggregation (avg / min / max) for long time-range queries.
-- **Data Expiration** — Configurable time-based automatic data removal.
+- **Data Expiration** — Configurable time-based automatic data eviction.
 - **Dedup & Min Interval** — Configurable deduplication window and minimum write interval to prevent duplicate data.
-- **Block-Level Index** — Binary-search block index for fast time-range filtering.
-- **Crash Recovery** — Transaction state flags for BlockFile recovery; transaction rollback for segments.
+- **Block-Level Index** — Binary-search block index for fast time-range filtering without scanning irrelevant data.
 
 ## Installation
 
@@ -41,85 +49,201 @@
 go get github.com/mababaNiubi/qv-lite/tsdb
 ```
 
-## Quick Start
+## Usage
+
+### Open & Close
 
 ```go
-package main
-
 import (
     "context"
-    "fmt"
-    "time"
-
     "github.com/mababaNiubi/qv-lite/tsdb"
+)
+
+db, err := tsdb.Open(tsdb.Config{
+    Path: "./qvLite-data",
+}, context.Background())
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+```
+
+`Open` creates or opens a database at the given path. The `default` table is auto-created on first use. `Close()` flushes all buffered data and releases resources.
+
+### Write
+
+```go
+import (
+    "time"
     "github.com/mababaNiubi/variant"
 )
 
-func main() {
-    // Open or create a database
-    db, err := tsdb.Open(tsdb.Config{
-        Path: "./my_tsdb_data",
-        Segment: tsdb.SegmentConfig{
-            MaxSize:                64 * 1024 * 1024, // 64MB segment size
-            MaxSegmentTimeInterval: 3600,              // max time span in seconds
-        },
-        Wal: tsdb.WalConfig{
-            MaxCacheBufferSize: 128 * 1024 * 1024, // 128MB WAL cache
-            MaxWalFileNumber:   10,
-        },
-    }, context.Background())
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
+// Write to the default table (tableName = "" or "default")
+written, err := db.Write("", "sensor_temp", time.Now().UnixNano(), variant.New(25.6))
 
-    // Write a data point
-    db.Write("default", "cpu_usage", time.Now().UnixNano(), variant.New(42.5))
+// Write to a named table
+written, err := db.Write("metrics", "cpu_usage", time.Now().UnixNano(), variant.New(42.5))
+```
 
-    // Query data with downsampling
-    points, err := db.Query("default", "cpu_usage",
-        time.Now().Add(-1*time.Hour).UnixNano(),
-        time.Now().UnixNano(),
-        0, tsdb.AvgFusion, nil)
-    if err != nil {
-        panic(err)
-    }
-    for _, p := range points {
-        fmt.Printf("time: %d, value: %v\n", p.Tms, p.V)
-    }
+- `tableName` — empty string or `"default"` writes to the auto-created default table.
+- `tag` — the time-series identifier (e.g. sensor name, metric key).
+- `timestamp` — Unix timestamp in **nanoseconds**.
+- `value` — use `variant.New(v)` to wrap any supported Go value.
+- Returns `(true, nil)` if written; `(false, nil)` if skipped by dedup or min-interval rules.
+
+### Query
+
+```go
+// Range query with downsampling — best for long time ranges
+points, err := db.Query("default", "sensor_temp",
+    time.Now().Add(-1*time.Hour).UnixNano(), // startTime (ns)
+    time.Now().UnixNano(),                   // endTime (ns)
+    1000,                                    // maxNumber of returned points
+    tsdb.AvgFusion,                          // aggregation mode
+    nil,                                     // condition filter (nil = no filter)
+)
+
+// Fetch all raw data (no downsampling)
+points, err := db.QueryAll("default", "sensor_temp",
+    time.Now().Add(-30*time.Minute).UnixNano(),
+    time.Now().UnixNano(),
+    nil,
+)
+
+// Get the latest value for a tag
+point, err := db.QueryLatest("default", "sensor_temp")
+if point != nil {
+    fmt.Printf("latest: time=%d, value=%v\n", point.Tms, point.V)
 }
+```
+
+| Method | Description |
+|--------|-------------|
+| `Query(tableName, tag, startTime, endTime, maxNumber, polymerization, cond)` | Range query. For spans > 1 hour, returns up to `maxNumber` downsampled points. For spans ≤ 1 hour, returns all raw points directly. |
+| `QueryAll(tableName, tag, startTime, endTime, cond)` | Returns all raw data points in the range without limit. |
+| `QueryLatest(tableName, tag)` | Returns the most recent point for the given tag. |
+
+All timestamps are in **nanoseconds** (UnixNano). `maxNumber` defaults to 10000 when set to 0.
+
+### Table Management
+
+```go
+// Create a simple single-column table — highest write performance
+err := db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "metrics",
+        Desc: "Dev01.CPU",
+        Type: tsdb.ColumnTypeStructure,
+        Structure: []tsdb.ColumnAttribute{
+            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // auto-calculate precision
+        },
+    },
+})
+
+// Create a multi-column table
+err = db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "metrics",
+        Desc: "Dev01.CPU",
+        Type: tsdb.ColumnTypeStructure,
+        Structure: []tsdb.ColumnAttribute{
+            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2},
+            {Name: "quality", Type: tsdb.ColumnTypeInt},
+            {Name: "status",  Type: tsdb.ColumnTypeString},
+        },
+    },
+})
+
+// Create an adaptive-schema table (auto-discovers fields at runtime, slower than fixed schema)
+err = db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "events",
+        Desc: "dynamic event log",
+        Type: tsdb.ColumnTypeUnknown, // adaptive — discovers field format at runtime
+    },
+})
+```
+
+Table metadata is persisted in `{db_path}/table.json` and automatically reloaded on next `Open`.
+
+### Data Types
+
+| Constant | Type | Description |
+|----------|------|-------------|
+| `ColumnTypeUnknown` (0) | Adaptive | Auto-detect nested structure at runtime |
+| `ColumnTypeInt` (1) | Integer | Signed 64-bit integer |
+| `ColumnTypeFloat` (2) | Float | 64-bit float with configurable decimal precision |
+| `ColumnTypeString` (3) | String | UTF-8 string |
+| `ColumnTypeBool` (4) | Boolean | true / false |
+| `ColumnTypeJson` (5) | JSON | Arbitrary nested variant |
+| `ColumnTypeStructure` (6) | Fixed Struct | Pre-defined column schema |
+
+### Aggregation
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `AvgFusion` | 0 | Sliding-window average |
+| `MinFusion` | 1 | Sliding-window minimum |
+| `MaxFusion` | 2 | Sliding-window maximum |
+
+### Condition Filtering
+
+The `cond` parameter in query methods supports filtering data points by value:
+
+```go
+// Equality filter — only return points where value == "ok"
+cond := tsdb.Condition{
+    Operator: tsdb.OpEqual,
+    Value:    variant.New("ok"),
+}
+points, err := db.QueryAll("default", "status", startTs, endTs, cond)
+
+// Logical AND — combine multiple conditions
+logicalCond := tsdb.LogicalCondition{
+    Op:   tsdb.LogicalAnd,
+    Cond: []any{
+        tsdb.Condition{Operator: tsdb.OpGreaterThan, Value: variant.New(80)},
+        tsdb.Condition{Operator: tsdb.OpLessThan,    Value: variant.New(100)},
+    },
+}
+points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 ```
 
 ## Configuration
 
 ### Config
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `Path` | `string` | Database data storage path |
-| `Segment` | `SegmentConfig` | Segment file settings |
-| `Wal` | `WalConfig` | WAL settings |
-| `DataExpirationDays` | `int32` | Data expiration in days (0 = no expiration) |
-| `Dedup` | `bool` | Enable in-window deduplication |
-| `DedupWindowMs` | `int64` | Dedup window in milliseconds |
-| `MinIntervalMs` | `int64` | Minimum write interval in milliseconds |
-| `SecondaryCompression` | `bool` | Enable secondary compression for on-disk data |
-
-### SegmentConfig
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `MaxSize` | `int64` | Maximum segment file size in bytes |
-| `MaxSegmentTimeInterval` | `int64` | Maximum segment time span in seconds |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `Path` | `string` | `"./qvLite-data"` | Database data storage path |
+| `WalConfig` | `WalConfig` | — | WAL settings (see below) |
+| `MaxSegmentSize` | `int64` | `67108864` (64MB) | Maximum segment file size in bytes |
+| `MaxSegmentTimeInterval` | `int64` | `0` (unlimited) | Maximum segment time span in seconds |
+| `MaxStorageTime` | `int64` | `3600` (1 hour) | Reject writes with timestamps too far in the future |
+| `ExpirationMinuteTime` | `int64` | `0` (disabled) | Data expiration time in minutes, evicted on write |
+| `DedupWindowMs` | `int64` | `0` (disabled) | Dedup window in ms — skips writes with same value within this window |
+| `MinIntervalMs` | `int64` | `0` (disabled) | Minimum interval between consecutive writes in ms |
+| `SecondaryCompressionName` | `string` | `"zstd"` | Block compression: `"zstd"`, `"lz4"`, `"snappy"`, `"gzip"`, `"none"` |
 
 ### WalConfig
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `MaxCacheBufferSize` | `int64` | Maximum WAL in-memory cache size in bytes |
-| `MaxWalFileNumber` | `int32` | Maximum number of WAL files |
-| `CloseBuffer` | `bool` | Disable in-memory buffering |
-| `MaxBufferBatchSize` | `int64` | Maximum batch write size |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `MaxCacheSize` | `int64` | `67108864` (64MB) | Maximum WAL in-memory cache size in bytes |
+| `MaxFileNumber` | `int` | — | Maximum number of WAL files |
+| `CloseBuffer` | `bool` | `false` | Whether to disable in-memory WAL buffering |
+| `MaxBufferBatchSize` | `int` | `10000` | Max entries to buffer before sorting and flushing |
+
+**`CloseBuffer` behavior:**
+
+| Scenario | `CloseBuffer = true` | `CloseBuffer = false` |
+|----------|---------------------|----------------------|
+| Out-of-order writes | Rejected for the same key | Allowed within `MaxBufferBatchSize` batch window |
+| Write/query performance | Lower | Higher |
+| Crash safety | Data safe | May lose buffered data |
+| Memory usage | Typically within `MaxCacheSize` range | ~3–4× `MaxCacheSize` |
+
+> Control database memory usage by tuning `MaxCacheSize`.
 
 ## Compression Algorithms
 
@@ -179,11 +303,11 @@ Each `.tsb` file is a **BlockFile** containing compressed data blocks plus a blo
 └───────────────┴──────────────────────────────────────┘
 ```
 
-**Block index** sits at the end of the file and maps each physical block's position (CompOff) to its decompressed logical offset (RawOff), enabling direct seek to any block.
+The **block index** sits at the end of the file and maps each physical block's position to its decompressed logical offset, enabling direct seek to any block.
 
 ### Segment Index File (.tsb.idx)
 
-Sits alongside each `.tsb` segment and provides time-range + tag filtering without reading the segment data:
+Sits alongside each `.tsb` segment for time-range + tag filtering without reading segment data:
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -200,11 +324,11 @@ Sits alongside each `.tsb` segment and provides time-range + tag filtering witho
 └──────────────┴───────────────────────────────────┘
 ```
 
-Each entry records which tag column a logical block belongs to, its time range, and where to find it in the `.tsb` file. Queries use this to binary-search for relevant blocks and skip the rest.
+Each entry records which tag column a logical block belongs to, its time range, and where to find it in the `.tsb` file. Queries binary-search the index to skip irrelevant blocks.
 
 ### Logical Block
 
-A logical block is the unit of data written by column encoders. Multiple logical blocks are concatenated and compressed into one physical block:
+The basic unit written by column encoders. Multiple logical blocks are concatenated and compressed into one physical block:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -221,8 +345,6 @@ A logical block is the unit of data written by column encoders. Multiple logical
 ```
 
 ### Payload Formats
-
-Two layout variants depending on the value type:
 
 **Scalar types** (Int, Float, String, Bool, Json):
 
@@ -242,7 +364,7 @@ Two layout variants depending on the value type:
 └────────┴──────────┴──────────┴─────┴──────────────────┴──────────────────┘
 ```
 
-Each field within a struct is independently encoded using its own type-specific compressor, then concatenated. The marker byte identifies whether the schema is fixed (pre-registered columns) or adaptive (auto-discovered from Maps).
+Each field within a struct is independently encoded using its own type-specific compressor, then concatenated. The marker identifies whether the schema is fixed (pre-registered) or adaptive (auto-discovered from Maps).
 
 ## Dependencies
 

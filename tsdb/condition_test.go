@@ -17,21 +17,21 @@ func TestCompareValue(t *testing.T) {
 		// String type tests
 		{
 			name:        "string equal",
-			cond:        Condition{Type: EqualQueryCondition, Value: variant.NewString("test")},
+			cond:        Condition{Operator: OpEqual, Value: variant.NewString("test")},
 			columnValue: variant.NewString("test"),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "string not equal",
-			cond:        Condition{Type: NotEqualQueryCondition, Value: variant.NewString("other")},
+			cond:        Condition{Operator: OpNotEqual, Value: variant.NewString("other")},
 			columnValue: variant.NewString("test"),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "string invalid operator (>)",
-			cond:        Condition{Type: GreaterThanQueryCondition, Value: variant.NewString("b")},
+			cond:        Condition{Operator: OpGreaterThan, Value: variant.NewString("b")},
 			columnValue: variant.NewString("a"),
 			want:        false,
 			wantErr:     true,
@@ -40,21 +40,21 @@ func TestCompareValue(t *testing.T) {
 		// Integer type tests
 		{
 			name:        "int equal",
-			cond:        Condition{Type: EqualQueryCondition, Value: variant.NewInt(10)},
+			cond:        Condition{Operator: OpEqual, Value: variant.NewInt(10)},
 			columnValue: variant.NewInt(10),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "int greater than",
-			cond:        Condition{Type: GreaterThanQueryCondition, Value: variant.NewInt(5)},
+			cond:        Condition{Operator: OpGreaterThan, Value: variant.NewInt(5)},
 			columnValue: variant.NewInt(10),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "int less than or equal",
-			cond:        Condition{Type: LessThanOrEqualQueryCondition, Value: variant.NewInt(10)},
+			cond:        Condition{Operator: OpLessThanOrEqual, Value: variant.NewInt(10)},
 			columnValue: variant.NewInt(10),
 			want:        true,
 			wantErr:     false,
@@ -63,14 +63,14 @@ func TestCompareValue(t *testing.T) {
 		// Float type tests
 		{
 			name:        "float not equal",
-			cond:        Condition{Type: NotEqualQueryCondition, Value: variant.New(3.14)},
+			cond:        Condition{Operator: OpNotEqual, Value: variant.New(3.14)},
 			columnValue: variant.New(2.71),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "float less than",
-			cond:        Condition{Type: LessThanQueryCondition, Value: variant.New(5.0)},
+			cond:        Condition{Operator: OpLessThan, Value: variant.New(5.0)},
 			columnValue: variant.New(3.0),
 			want:        true,
 			wantErr:     false,
@@ -79,14 +79,14 @@ func TestCompareValue(t *testing.T) {
 		// List type tests
 		{
 			name:        "list equal",
-			cond:        Condition{Type: EqualQueryCondition, Value: variant.New([]variant.Variant{variant.NewInt(1), variant.NewInt(2)})},
+			cond:        Condition{Operator: OpEqual, Value: variant.New([]variant.Variant{variant.NewInt(1), variant.NewInt(2)})},
 			columnValue: variant.New([]variant.Variant{variant.NewInt(1), variant.NewInt(2)}),
 			want:        true,
 			wantErr:     false,
 		},
 		{
 			name:        "list invalid operator (>=)",
-			cond:        Condition{Type: GreaterThanOrEqualQueryCondition, Value: variant.New([]variant.Variant{})},
+			cond:        Condition{Operator: OpGreaterThanOrEqual, Value: variant.New([]variant.Variant{})},
 			columnValue: variant.New([]variant.Variant{}),
 			want:        false,
 			wantErr:     true,
@@ -95,7 +95,7 @@ func TestCompareValue(t *testing.T) {
 		// Map type tests
 		{
 			name:        "map not equal",
-			cond:        Condition{Type: NotEqualQueryCondition, Value: variant.New(map[string]variant.Variant{"k": variant.NewInt(1)})},
+			cond:        Condition{Operator: OpNotEqual, Value: variant.New(map[string]variant.Variant{"k": variant.NewInt(1)})},
 			columnValue: variant.New(map[string]variant.Variant{"k": variant.NewInt(2)}),
 			want:        true,
 			wantErr:     false,
@@ -142,42 +142,42 @@ func TestEvalCondition(t *testing.T) {
 	}{
 		{
 			name:    "flat map column exists (equal)",
-			cond:    Condition{ColumnAttributeName: "age", Type: EqualQueryCondition, Value: variant.NewInt(25)},
+			cond:    Condition{ColumnAttributeName: "age", Operator: OpEqual, Value: variant.NewInt(25)},
 			data:    flatMap,
 			want:    true,
 			wantErr: false,
 		},
 		{
 			name:    "flat map column exists (greater than)",
-			cond:    Condition{ColumnAttributeName: "score", Type: GreaterThanQueryCondition, Value: variant.New(80.0)},
+			cond:    Condition{ColumnAttributeName: "score", Operator: OpGreaterThan, Value: variant.New(80.0)},
 			data:    flatMap,
 			want:    true,
 			wantErr: false,
 		},
 		{
 			name:    "column not found in map",
-			cond:    Condition{ColumnAttributeName: "email", Type: EqualQueryCondition, Value: variant.NewString("a@x.com")},
+			cond:    Condition{ColumnAttributeName: "email", Operator: OpEqual, Value: variant.NewString("a@x.com")},
 			data:    flatMap,
 			want:    false,
 			wantErr: true,
 		},
 		{
 			name:    "nested column (user.profile.height)",
-			cond:    Condition{ColumnAttributeName: "user.profile.height", Type: LessThanQueryCondition, Value: variant.NewInt(180)},
+			cond:    Condition{ColumnAttributeName: "user.profile.height", Operator: OpLessThan, Value: variant.NewInt(180)},
 			data:    nestedMap,
 			want:    true,
 			wantErr: false,
 		},
 		{
 			name:    "empty column name with non-map data",
-			cond:    Condition{ColumnAttributeName: "", Type: GreaterThanQueryCondition, Value: variant.NewInt(40)},
+			cond:    Condition{ColumnAttributeName: "", Operator: OpGreaterThan, Value: variant.NewInt(40)},
 			data:    nonMapData, // Compare data directly (50 > 40).
 			want:    true,
 			wantErr: false,
 		},
 		{
 			name:    "empty column name with map data (key not exists)",
-			cond:    Condition{ColumnAttributeName: "", Type: EqualQueryCondition, Value: variant.NewInt(0)},
+			cond:    Condition{ColumnAttributeName: "", Operator: OpEqual, Value: variant.NewInt(0)},
 			data:    flatMap, // Attempt to get key="" (does not exist).
 			want:    false,
 			wantErr: true,
@@ -201,10 +201,10 @@ func TestEvalCondition(t *testing.T) {
 // TestEvalLogicalCondition covers AND/OR logic and nested conditions.
 func TestEvalLogicalCondition(t *testing.T) {
 	// Define base conditions.
-	condAge25 := Condition{ColumnAttributeName: "age", Type: EqualQueryCondition, Value: variant.NewInt(25)}
-	condNameAlice := Condition{ColumnAttributeName: "name", Type: EqualQueryCondition, Value: variant.NewString("Alice")}
-	condScorePass := Condition{ColumnAttributeName: "score", Type: GreaterThanQueryCondition, Value: variant.NewInt(60)}
-	condInvalid := Condition{ColumnAttributeName: "invalid_col", Type: EqualQueryCondition, Value: variant.NewInt(0)} // Non-existent column.
+	condAge25 := Condition{ColumnAttributeName: "age", Operator: OpEqual, Value: variant.NewInt(25)}
+	condNameAlice := Condition{ColumnAttributeName: "name", Operator: OpEqual, Value: variant.NewString("Alice")}
+	condScorePass := Condition{ColumnAttributeName: "score", Operator: OpGreaterThan, Value: variant.NewInt(60)}
+	condInvalid := Condition{ColumnAttributeName: "invalid_col", Operator: OpEqual, Value: variant.NewInt(0)} // Non-existent column.
 
 	// Test data.
 	data := variant.New(map[string]variant.Variant{
@@ -215,15 +215,15 @@ func TestEvalLogicalCondition(t *testing.T) {
 
 	// Nested logical conditions.
 	nestedOr := LogicalCondition{
-		Operator: Or,
-		Conditions: []any{
-			Condition{ColumnAttributeName: "score", Type: LessThanQueryCondition, Value: variant.NewInt(50)}, // false
-			Condition{ColumnAttributeName: "age", Type: EqualQueryCondition, Value: variant.NewInt(25)},      // true
+		Op: LogicalOr,
+		Cond: []any{
+			Condition{ColumnAttributeName: "score", Operator: OpLessThan, Value: variant.NewInt(50)}, // false
+			Condition{ColumnAttributeName: "age", Operator: OpEqual, Value: variant.NewInt(25)},      // true
 		},
 	}
 	nestedAnd := LogicalCondition{
-		Operator: And,
-		Conditions: []any{
+		Op: LogicalAnd,
+		Cond: []any{
 			condAge25,     // true
 			nestedOr,      // true
 			condScorePass, // true
@@ -240,8 +240,8 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "AND: all conditions true",
 			logicalCond: LogicalCondition{
-				Operator:   And,
-				Conditions: []any{condAge25, condNameAlice, condScorePass},
+				Op:   LogicalAnd,
+				Cond: []any{condAge25, condNameAlice, condScorePass},
 			},
 			data:    data,
 			want:    true,
@@ -250,10 +250,10 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "AND: one condition false",
 			logicalCond: LogicalCondition{
-				Operator: And,
-				Conditions: []any{
+				Op: LogicalAnd,
+				Cond: []any{
 					condAge25,
-					Condition{ColumnAttributeName: "name", Type: EqualQueryCondition, Value: variant.NewString("Bob")}, // false
+					Condition{ColumnAttributeName: "name", Operator: OpEqual, Value: variant.NewString("Bob")}, // false
 					condScorePass,
 				},
 			},
@@ -264,8 +264,8 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "AND: with error condition",
 			logicalCond: LogicalCondition{
-				Operator:   And,
-				Conditions: []any{condAge25, condInvalid},
+				Op:   LogicalAnd,
+				Cond: []any{condAge25, condInvalid},
 			},
 			data:    data,
 			want:    false,
@@ -274,11 +274,11 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "OR: one condition true",
 			logicalCond: LogicalCondition{
-				Operator: Or,
-				Conditions: []any{
-					Condition{ColumnAttributeName: "age", Type: EqualQueryCondition, Value: variant.NewInt(30)}, // false
+				Op: LogicalOr,
+				Cond: []any{
+					Condition{ColumnAttributeName: "age", Operator: OpEqual, Value: variant.NewInt(30)}, // false
 					condNameAlice, // true
-					Condition{ColumnAttributeName: "score", Type: LessThanQueryCondition, Value: variant.NewInt(50)}, // false
+					Condition{ColumnAttributeName: "score", Operator: OpLessThan, Value: variant.NewInt(50)}, // false
 				},
 			},
 			data:    data,
@@ -288,10 +288,10 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "OR: all conditions false",
 			logicalCond: LogicalCondition{
-				Operator: Or,
-				Conditions: []any{
-					Condition{ColumnAttributeName: "age", Type: EqualQueryCondition, Value: variant.NewInt(30)},
-					Condition{ColumnAttributeName: "name", Type: EqualQueryCondition, Value: variant.NewString("Bob")},
+				Op: LogicalOr,
+				Cond: []any{
+					Condition{ColumnAttributeName: "age", Operator: OpEqual, Value: variant.NewInt(30)},
+					Condition{ColumnAttributeName: "name", Operator: OpEqual, Value: variant.NewString("Bob")},
 				},
 			},
 			data:    data,
@@ -301,8 +301,8 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "OR: with error condition",
 			logicalCond: LogicalCondition{
-				Operator:   Or,
-				Conditions: []any{condInvalid, condNameAlice},
+				Op:   LogicalOr,
+				Cond: []any{condInvalid, condNameAlice},
 			},
 			data:    data,
 			want:    false,
@@ -318,8 +318,8 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "empty sub-conditions",
 			logicalCond: LogicalCondition{
-				Operator:   And,
-				Conditions: []any{},
+				Op:   LogicalAnd,
+				Cond: []any{},
 			},
 			data:    data,
 			want:    false,
@@ -328,8 +328,8 @@ func TestEvalLogicalCondition(t *testing.T) {
 		{
 			name: "unknown logical operator",
 			logicalCond: LogicalCondition{
-				Operator:   "xor", // Unknown operator.
-				Conditions: []any{condAge25},
+				Op:   "xor", // Unknown operator.
+				Cond: []any{condAge25},
 			},
 			data:    data,
 			want:    false,
@@ -364,7 +364,7 @@ func TestEvalCondition_NestedMapNotFound(t *testing.T) {
 	// Intermediate key doesn't exist in path
 	cond := Condition{
 		ColumnAttributeName: "user.settings.theme",
-		Type:                EqualQueryCondition,
+		Operator:            OpEqual,
 		Value:               variant.NewString("dark"),
 	}
 	_, err := EvalCondition(cond, nestedMap)
@@ -377,19 +377,19 @@ func TestCompareValue_UInt64(t *testing.T) {
 	v := variant.NewUInt64(100)
 	r := variant.NewUInt64(50)
 
-	ok, err := CompareValue(Condition{Type: GreaterThanQueryCondition, Value: r}, v)
+	ok, err := CompareValue(Condition{Operator: OpGreaterThan, Value: r}, v)
 	if err != nil || !ok {
 		t.Errorf("100 > 50 should be true, got ok=%v err=%v", ok, err)
 	}
 
-	ok, err = CompareValue(Condition{Type: LessThanQueryCondition, Value: r}, v)
+	ok, err = CompareValue(Condition{Operator: OpLessThan, Value: r}, v)
 	if err != nil || ok {
 		t.Errorf("100 < 50 should be false, got ok=%v err=%v", ok, err)
 	}
 }
 
 func TestCompareValue_Bool(t *testing.T) {
-	ok, err := CompareValue(Condition{Type: EqualQueryCondition, Value: variant.NewBool(true)}, variant.NewBool(false))
+	ok, err := CompareValue(Condition{Operator: OpEqual, Value: variant.NewBool(true)}, variant.NewBool(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,13 +400,13 @@ func TestCompareValue_Bool(t *testing.T) {
 
 func TestEvalLogicalCondition_OrWithError(t *testing.T) {
 	data := variant.New(map[string]variant.Variant{"x": variant.NewInt(1)})
-	invalidCond := Condition{ColumnAttributeName: "nonexistent", Type: EqualQueryCondition, Value: variant.NewInt(0)}
-	validCond := Condition{ColumnAttributeName: "x", Type: EqualQueryCondition, Value: variant.NewInt(1)}
+	invalidCond := Condition{ColumnAttributeName: "nonexistent", Operator: OpEqual, Value: variant.NewInt(0)}
+	validCond := Condition{ColumnAttributeName: "x", Operator: OpEqual, Value: variant.NewInt(1)}
 
 	// OR: first condition errors -> should return error immediately
 	lc := LogicalCondition{
-		Operator:   Or,
-		Conditions: []any{invalidCond, validCond},
+		Op:   LogicalOr,
+		Cond: []any{invalidCond, validCond},
 	}
 	_, err := EvalLogicalCondition(lc, data)
 	if err == nil {
@@ -419,7 +419,7 @@ func TestEvalCondition_NonMapDataWithColumnName(t *testing.T) {
 	v := variant.NewInt(100)
 	cond := Condition{
 		ColumnAttributeName: "some_col",
-		Type:                EqualQueryCondition,
+		Operator:            OpEqual,
 		Value:               variant.NewInt(100),
 	}
 	_, err := EvalCondition(cond, v)
@@ -432,10 +432,10 @@ func TestEvalAnyCondition(t *testing.T) {
 	data := variant.New(map[string]variant.Variant{
 		"value": variant.NewInt(100),
 	})
-	validCond := Condition{ColumnAttributeName: "value", Type: EqualQueryCondition, Value: variant.NewInt(100)}
+	validCond := Condition{ColumnAttributeName: "value", Operator: OpEqual, Value: variant.NewInt(100)}
 	validLogicalCond := LogicalCondition{
-		Operator:   And,
-		Conditions: []any{validCond},
+		Op:   LogicalAnd,
+		Cond: []any{validCond},
 	}
 
 	tests := []struct {

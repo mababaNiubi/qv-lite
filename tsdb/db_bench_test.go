@@ -114,16 +114,16 @@ func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
 	// 查询阶段
 	queryStart := time.Now()
 	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, LogicalCondition{
-		Operator: And,
-		Conditions: []any{
+		Op: LogicalAnd,
+		Cond: []any{
 			Condition{
 				ColumnAttributeName: "value",
-				Type:                GreaterThanQueryCondition,
+				Operator:            OpGreaterThan,
 				Value:               variant.NewFloat64(60 * 60 * 10),
 			},
 			Condition{
 				ColumnAttributeName: "value",
-				Type:                LessThanQueryCondition,
+				Operator:            OpLessThan,
 				Value:               variant.NewFloat64(60 * 60 * 10 * 2),
 			},
 		},

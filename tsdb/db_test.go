@@ -283,11 +283,11 @@ func TestDB_QueryWithCondition(t *testing.T) {
 
 	// Query with condition: score > 50
 	cond := LogicalCondition{
-		Operator: And,
-		Conditions: []any{
+		Op: LogicalAnd,
+		Cond: []any{
 			Condition{
 				ColumnAttributeName: "score",
-				Type:                GreaterThanQueryCondition,
+				Operator:            OpGreaterThan,
 				Value:               variant.NewInt(50),
 			},
 		},

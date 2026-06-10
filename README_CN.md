@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>高性能嵌入式时序数据库引擎，使用 Go 语言编写。</strong>
+  <strong>嵌入式 KV 时序数据库引擎 — 适用于边缘计算网关等性能受限设备部署使用。</strong>
 </p>
 
 <p align="center">
@@ -16,7 +16,14 @@
 
 - [特性](#特性)
 - [安装](#安装)
-- [快速开始](#快速开始)
+- [使用方法](#使用方法)
+  - [打开与关闭](#打开与关闭)
+  - [写入](#写入)
+  - [查询](#查询)
+  - [表管理](#表管理)
+  - [数据类型](#数据类型)
+  - [聚合](#聚合)
+  - [条件过滤](#条件过滤)
 - [配置项](#配置项)
 - [压缩算法](#压缩算法)
 - [数据编码](#数据编码)
@@ -24,16 +31,17 @@
 
 ## 特性
 
-- **嵌入式架构** — 无需外部服务，以库的形式直接集成到 Go 应用中。
-- **强类型列存储** — 支持 Int、Float、String、Bool、Json、Structure 等多种类型，每种类型使用专门的压缩算法。
-- **WAL + 段存储** — 写操作先缓冲到 WAL，再定期刷入压缩后的磁盘段文件。
-- **多表支持** — 管理多个独立表，每个表拥有独立的标签字典和列集合。
-- **高效压缩** — 时间戳使用 delta-of-delta + simple8b/RLE；整数使用 zigzag + simple8b；浮点数使用 XOR-delta；布尔值使用位打包；字符串使用 Snappy；JSON 使用 LZ4。
+- **嵌入轻量** — 专为边缘网关、工业控制器、IoT 设备等 CPU/内存/磁盘受限场景设计。
+- **代码精简** — 紧凑、可审计的核心代码，弱三方依赖。简易的磁盘文件结构 — 无复杂存储引擎，易于排查和维护。
+- **文件结构简单** — 直观的目录布局：每表一个元数据文件、时间戳命名的段文件与 WAL 日志。不依赖重型数据库引擎，便于备份和迁移。
+- **高性能写入** — 单线程同步设计。单点写入性能 **800 万+ 点/秒**。
+- **自适应类型编码** — 运行时自动识别输入数据的结构，根据数据类型选择合适的压缩编码器，达到最优存储效率。
+- **高压缩率** — 时间戳 delta-of-delta、浮点数 XOR-delta、整数 zigzag、布尔值位打包，块级 Snappy/LZ4/Zstd 二次压缩 — 相较原始数据通常 10 倍以上压缩率。
+- **多表支持** — 管理多个独立表，每个表拥有独立的 Schema 定义和列集合。
 - **降采样查询** — 长时间范围查询支持滑动窗口聚合（avg / min / max）。
-- **数据过期** — 可配置的基于时间的数据自动删除。
+- **数据过期** — 可配置的基于时间的数据自动清理。
 - **去重与最小间隔** — 可配置的去重窗口和最小写入间隔，防止重复数据。
-- **块级索引** — 基于二分搜索的块索引，实现快速时间范围过滤。
-- **崩溃恢复** — BlockFile 事务状态标记支持崩溃恢复；段文件支持事务回滚。
+- **块级索引** — 基于二分搜索的块索引，快速过滤时间范围，无需扫描无关数据。
 
 ## 安装
 
@@ -41,85 +49,199 @@
 go get github.com/mababaNiubi/qv-lite/tsdb
 ```
 
-## 快速开始
+## 使用方法
+
+### 打开与关闭
 
 ```go
-package main
-
 import (
     "context"
-    "fmt"
-    "time"
-
     "github.com/mababaNiubi/qv-lite/tsdb"
+)
+
+db, err := tsdb.Open(tsdb.Config{
+    Path: "./qvLite-data",
+}, context.Background())
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+```
+
+`Open` 在给定路径创建或打开数据库。`default` 表在首次使用时自动创建。`Close()` 会刷新所有缓冲数据并释放资源。
+
+### 写入
+
+```go
+import (
+    "time"
     "github.com/mababaNiubi/variant"
 )
 
-func main() {
-    // 打开或创建数据库
-    db, err := tsdb.Open(tsdb.Config{
-        Path: "./my_tsdb_data",
-        Segment: tsdb.SegmentConfig{
-            MaxSize:                64 * 1024 * 1024, // 64MB 段大小
-            MaxSegmentTimeInterval: 3600,              // 最长时间跨度（秒）
-        },
-        Wal: tsdb.WalConfig{
-            MaxCacheBufferSize: 128 * 1024 * 1024, // 128MB WAL 缓存
-            MaxWalFileNumber:   10,
-        },
-    }, context.Background())
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
+// 写入 default 表（tableName = "" 或 "default"）
+written, err := db.Write("", "sensor_temp", time.Now().UnixNano(), variant.New(25.6))
 
-    // 写入数据点
-    db.Write("default", "cpu_usage", time.Now().UnixNano(), variant.New(42.5))
+// 写入指定的表
+written, err := db.Write("metrics", "cpu_usage", time.Now().UnixNano(), variant.New(42.5))
+```
 
-    // 查询数据（带降采样）
-    points, err := db.Query("default", "cpu_usage",
-        time.Now().Add(-1*time.Hour).UnixNano(),
-        time.Now().UnixNano(),
-        0, tsdb.AvgFusion, nil)
-    if err != nil {
-        panic(err)
-    }
-    for _, p := range points {
-        fmt.Printf("time: %d, value: %v\n", p.Tms, p.V)
-    }
+- `tableName` — 空字符串或 `"default"` 写入自动创建的默认表。
+- `tag` — 时序标识（如传感器名称、指标 key）。
+- `timestamp` — Unix 时间戳，单位为**纳秒**。
+- `value` — 使用 `variant.New(v)` 包装任意支持的 Go 值。
+- 返回 `(true, nil)` 表示写入成功；`(false, nil)` 规则跳过。
+
+### 查询
+
+```go
+// 范围查询 + 降采样 — 适用于长时间范围
+points, err := db.Query("default", "sensor_temp",
+    time.Now().Add(-1*time.Hour).UnixNano(), // startTime (ns)
+    time.Now().UnixNano(),                   // endTime (ns)
+    1000,                                    // maxNumber 返回最大点数
+    tsdb.AvgFusion,                          // 聚合模式
+    nil,                                     // 条件过滤（nil = 无过滤）
+)
+
+// 获取全部原始数据（不降采样）
+points, err := db.QueryAll("default", "sensor_temp",
+    time.Now().Add(-30*time.Minute).UnixNano(),
+    time.Now().UnixNano(),
+    nil,
+)
+
+// 获取 tag 的最新值
+point, err := db.QueryLatest("default", "sensor_temp")
+if point != nil {
+    fmt.Printf("latest: time=%d, value=%v\n", point.Tms, point.V)
 }
+```
+
+| 方法 | 说明 |
+|------|------|
+| `Query(tableName, tag, startTime, endTime, maxNumber, polymerization, cond)` | 范围查询。时间跨度 > 1 小时时返回最多 `maxNumber` 个降采样点；≤ 1 小时时直接返回全部原始数据。 |
+| `QueryAll(tableName, tag, startTime, endTime, cond)` | 返回范围内的全部原始数据点，不做数量限制。 |
+| `QueryLatest(tableName, tag)` | 返回指定 tag 的最新一条数据。 |
+
+所有时间戳单位为**纳秒**（UnixNano）。`maxNumber` 设为 0 时默认 10000。
+
+### 表管理
+
+```go
+// 创建简化指标表，拥有最高的写入性能
+err := db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "metrics",
+        Desc: "Dev01.CPU",
+        Type: tsdb.ColumnTypeStructure,
+        Structure: []tsdb.ColumnAttribute{
+            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // 自动计算精度
+        },
+    },
+})
+
+// 创建多列表
+err = db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "metrics",
+        Desc: "Dev01.CPU",
+        Type: tsdb.ColumnTypeStructure,
+        Structure: []tsdb.ColumnAttribute{
+            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2},
+            {Name: "quality", Type: tsdb.ColumnTypeInt},
+            {Name: "status",  Type: tsdb.ColumnTypeString},
+        },
+    },
+})
+
+// 创建自适应 Schema 的表（运行时自动发现字段，比固定结构慢）
+err = db.CreateTable(tsdb.TableInfo{
+    ColumnAttribute: tsdb.ColumnAttribute{
+        Name: "events",
+        Desc: "动态事件日志",
+        Type: tsdb.ColumnTypeUnknown, // 自适应 — 运行时发现字段格式
+    },
+})
+```
+
+### 数据类型
+
+| 常量 | 类型 | 说明 |
+|------|------|------|
+| `ColumnTypeUnknown` (0) | 自适应 | 运行时自动检测嵌套结构 |
+| `ColumnTypeInt` (1) | 整数 | 有符号 64 位整数 |
+| `ColumnTypeFloat` (2) | 浮点数 | 64 位浮点数，可配置小数精度 |
+| `ColumnTypeString` (3) | 字符串 | UTF-8 字符串 |
+| `ColumnTypeBool` (4) | 布尔值 | true / false |
+| `ColumnTypeJson` (5) | JSON | 任意嵌套 variant |
+| `ColumnTypeStructure` (6) | 固定结构体 | 预定义列 Schema |
+
+### 聚合
+
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `AvgFusion` | 0 | 滑动窗口取平均值 |
+| `MinFusion` | 1 | 滑动窗口取最小值 |
+| `MaxFusion` | 2 | 滑动窗口取最大值 |
+
+### 条件过滤
+
+查询方法的 `cond` 参数支持按值过滤数据点：
+
+```go
+// 等值过滤 — 仅返回 value == "ok" 的点
+cond := tsdb.Condition{
+    Operator: tsdb.OpEqual,
+    Value:    variant.New("ok"),
+}
+points, err := db.QueryAll("default", "status", startTs, endTs, cond)
+
+// 逻辑与 — 组合多个条件
+logicalCond := tsdb.LogicalCondition{
+    Op:   tsdb.LogicalAnd,
+    Cond: []any{
+        tsdb.Condition{Operator: tsdb.OpGreaterThan, Value: variant.New(80)},
+        tsdb.Condition{Operator: tsdb.OpLessThan,    Value: variant.New(100)},
+    },
+}
+points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 ```
 
 ## 配置项
 
 ### Config
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `Path` | `string` | 数据库数据存储路径 |
-| `Segment` | `SegmentConfig` | 段文件配置 |
-| `Wal` | `WalConfig` | WAL 配置 |
-| `DataExpirationDays` | `int32` | 数据过期天数（0 = 不过期） |
-| `Dedup` | `bool` | 是否启用窗口内去重 |
-| `DedupWindowMs` | `int64` | 去重窗口（毫秒） |
-| `MinIntervalMs` | `int64` | 最小写入间隔（毫秒） |
-| `SecondaryCompression` | `bool` | 是否启用磁盘数据二次压缩 |
-
-### SegmentConfig
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `MaxSize` | `int64` | 单个段文件最大大小（字节） |
-| `MaxSegmentTimeInterval` | `int64` | 单个段文件最大时间跨度（秒） |
+| 字段 | 类型 | 默认值 | 说明                                                  |
+|------|------|--------|-----------------------------------------------------|
+| `Path` | `string` | `"./qvLite-data"` | 数据库数据存储路径                                           |
+| `WalConfig` | `WalConfig` | — | WAL 配置（见下）                                          |
+| `MaxSegmentSize` | `int64` | `67108864` (64MB) | 单个段文件最大大小（字节）                                       |
+| `MaxSegmentTimeInterval` | `int64` | `0`（不限制） | 单个段文件最大时间跨度（秒）                                      |
+| `MaxStorageTime` | `int64` | `3600`（1 小时） | 拒绝远大于当前时间的数据写入                                      |
+| `ExpirationMinuteTime` | `int64` | `0`（禁用） | 数据过期时间（分钟），写入时清理 |
+| `DedupWindowMs` | `int64` | `0`（禁用） | 去重窗口（毫秒），两次写入窗口内相同的值跳过写入                            |
+| `MinIntervalMs` | `int64` | `0`（禁用） | 两次写入之间的最小间隔（毫秒）,小于这个值跳过写入                               |
+| `SecondaryCompressionName` | `string` | `"zstd"` | 块压缩算法：`"zstd"`、`"lz4"`、`"snappy"`、`"gzip"`、`"none"` |
 
 ### WalConfig
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `MaxCacheBufferSize` | `int64` | WAL 内存缓存最大大小（字节） |
-| `MaxWalFileNumber` | `int32` | 最大 WAL 文件数量 |
-| `CloseBuffer` | `bool` | 是否关闭内存缓冲 |
-| `MaxBufferBatchSize` | `int64` | 最大批量写入大小 |
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `MaxCacheSize` | `int64` | `67108864` (64MB) | WAL 内存缓存最大大小（字节） |
+| `MaxFileNumber` | `int` | — | 最大 WAL 文件数量 |
+| `CloseBuffer` | `bool` | `false` | 是否关闭内存 WAL 缓冲 |
+| `MaxBufferBatchSize` | `int` | `10000` | 排序刷盘前的最大缓冲条目数 |
+
+**`CloseBuffer` 行为说明：**
+
+| 场景 | `CloseBuffer = true` | `CloseBuffer = false` |
+|------|---------------------|----------------------|
+| 乱序写入 | 同 key 下禁止乱序时间写入 | `MaxBufferBatchSize` 批处理范围内允许乱序写入 |
+| 写入/查询性能 | 较低 | 较高 |
+| 异常中断 | 数据安全 | 可能丢失部分缓冲数据 |
+| 内存占用 | 通常在 `MaxCacheSize` 范围内 | 约 `MaxCacheSize` 的 3~4 倍 |
+
+> 可通过限制 `MaxCacheSize` 大小来控制数据库内存使用。
 
 ## 压缩算法
 
@@ -178,11 +300,11 @@ func main() {
 └───────────────┴──────────────────────────────────────┘
 ```
 
-**块索引**位于文件末尾，记录每个物理块在文件中的物理位置（CompOff）与解压后的逻辑偏移（RawOff）的映射关系，支持按偏移直接定位到任意块。
+**块索引**位于文件末尾，记录每个物理块的物理位置与解压后逻辑偏移的映射关系，支持按偏移直接定位到任意块。
 
 ### 段索引文件 (.tsb.idx)
 
-与 `.tsb` 段文件配套存在，提供时间范围和标签维度的快速过滤，无需读取段内数据：
+与 `.tsb` 段文件配套存在，用于时间范围和标签维度的快速过滤：
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -203,7 +325,7 @@ func main() {
 
 ### 逻辑块
 
-逻辑块是列编码器写入的基本单元，多个逻辑块拼接后压缩为一个物理块：
+列编码器写入的基本单元，多个逻辑块拼接后压缩为一个物理块：
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -220,8 +342,6 @@ func main() {
 ```
 
 ### 负载格式
-
-根据值类型分为两种布局：
 
 **标量类型**（Int、Float、String、Bool、Json）：
 

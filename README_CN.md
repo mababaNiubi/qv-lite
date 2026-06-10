@@ -131,14 +131,13 @@ if point != nil {
 // 创建简化指标表，拥有最高的写入性能
 err := db.CreateTable(tsdb.TableInfo{
     ColumnAttribute: tsdb.ColumnAttribute{
-        Name: "metrics",
-        Desc: "Dev01.CPU",
-        Type: tsdb.ColumnTypeStructure,
-        Structure: []tsdb.ColumnAttribute{
-            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // 自动计算精度
-        },
+        Name: "device",
+        Desc: "attributes",
+        Type: tsdb.ColumnTypeFloat,
+        FloatPrecision: 2,
     },
 })
+
 
 // 创建多列表
 err = db.CreateTable(tsdb.TableInfo{

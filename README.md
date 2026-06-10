@@ -131,12 +131,10 @@ All timestamps are in **nanoseconds** (UnixNano). `maxNumber` defaults to 10000 
 // Create a simple single-column table — highest write performance
 err := db.CreateTable(tsdb.TableInfo{
     ColumnAttribute: tsdb.ColumnAttribute{
-        Name: "metrics",
-        Desc: "Dev01.CPU",
-        Type: tsdb.ColumnTypeStructure,
-        Structure: []tsdb.ColumnAttribute{
-            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // auto-calculate precision
-        },
+        Name: "device",
+        Desc: "attributes",
+        Type: tsdb.ColumnTypeFloat,
+        FloatPrecision: 2,
     },
 })
 
@@ -147,7 +145,7 @@ err = db.CreateTable(tsdb.TableInfo{
         Desc: "Dev01.CPU",
         Type: tsdb.ColumnTypeStructure,
         Structure: []tsdb.ColumnAttribute{
-            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2},
+            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2}, // auto-calculate precision
             {Name: "quality", Type: tsdb.ColumnTypeInt},
             {Name: "status",  Type: tsdb.ColumnTypeString},
         },

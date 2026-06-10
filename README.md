@@ -32,11 +32,10 @@
 ## Features
 
 - **Embedded & Lightweight** — Designed for edge gateways, industrial controllers, and IoT devices with limited CPU/memory/disk.
-- **Minimal Codebase** — Compact, auditable core with weak third-party dependencies. Simple on-disk file structure — no complex storage engine, easy to inspect and maintain.
-- **Simple File Structure** — Straightforward directory layout: one metadata file per table, timestamp-named segment files, and WAL logs. No heavy database engine, easy to back up and migrate.
+- **Minimal & Self-Contained** — Compact, auditable codebase with minimal third-party dependencies. Straightforward on-disk layout: one metadata file per table, timestamp-named segment files, and WAL logs — no heavy database engine, easy to inspect, back up, and migrate.
 - **High Write Throughput** — Single-threaded synchronous design. Achieves **8,000,000+ points/second** single-node write performance.
 - **Adaptive Type Encoding** — Auto-detects input data structure at runtime and selects the optimal compression codec per data type for maximum storage efficiency.
-- **High Compression Ratio** — Delta-of-delta timestamps, XOR-delta floats, zigzag integers, bit-packed booleans, plus Snappy/LZ4/Zstd block compression — typically 10x+ reduction vs raw storage.
+- **High Compression Ratio** — Compact data encoding plus secondary block compression for extreme storage savings.
 - **Multi-Table Support** — Manage multiple independent tables, each with its own schema definition and column set.
 - **Downsampling Queries** — Sliding-window aggregation (avg / min / max) for long time-range queries.
 - **Data Expiration** — Configurable time-based automatic data eviction.
@@ -131,12 +130,10 @@ All timestamps are in **nanoseconds** (UnixNano). `maxNumber` defaults to 10000 
 // Create a simple single-column table — highest write performance
 err := db.CreateTable(tsdb.TableInfo{
     ColumnAttribute: tsdb.ColumnAttribute{
-        Name: "metrics",
-        Desc: "Dev01.CPU",
-        Type: tsdb.ColumnTypeStructure,
-        Structure: []tsdb.ColumnAttribute{
-            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // auto-calculate precision
-        },
+        Name: "device",
+        Desc: "attributes",
+        Type: tsdb.ColumnTypeFloat,
+        FloatPrecision: 2,
     },
 })
 
@@ -147,7 +144,7 @@ err = db.CreateTable(tsdb.TableInfo{
         Desc: "Dev01.CPU",
         Type: tsdb.ColumnTypeStructure,
         Structure: []tsdb.ColumnAttribute{
-            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2},
+            {Name: "value",   Type: tsdb.ColumnTypeFloat, FloatPrecision: 2}, // auto-calculate precision
             {Name: "quality", Type: tsdb.ColumnTypeInt},
             {Name: "status",  Type: tsdb.ColumnTypeString},
         },
@@ -219,10 +216,10 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `WalConfig` | `WalConfig` | — | WAL settings (see below) |
 | `MaxSegmentSize` | `int64` | `67108864` (64MB) | Maximum segment file size in bytes |
 | `MaxSegmentTimeInterval` | `int64` | `0` (unlimited) | Maximum segment time span in seconds |
-| `MaxStorageTime` | `int64` | `3600` (1 hour) | Reject writes with timestamps too far in the future |
-| `ExpirationMinuteTime` | `int64` | `0` (disabled) | Data expiration time in minutes, evicted on write |
-| `DedupWindowMs` | `int64` | `0` (disabled) | Dedup window in ms — skips writes with same value within this window |
-| `MinIntervalMs` | `int64` | `0` (disabled) | Minimum interval between consecutive writes in ms |
+| `MaxStorageTime` | `int64` | `3600` (1 hour) | Reject writes whose timestamps are too far ahead of current time |
+| `ExpirationMinuteTime` | `int64` | `0` (disabled) | Auto-evict data older than this many minutes (checked on each write) |
+| `DedupWindowMs` | `int64` | `0` (disabled) | Dedup window in ms — skips writes with the same value for the same tag within this window |
+| `MinIntervalMs` | `int64` | `0` (disabled) | Minimum interval between consecutive writes in ms — writes arriving too quickly are skipped |
 | `SecondaryCompressionName` | `string` | `"zstd"` | Block compression: `"zstd"`, `"lz4"`, `"snappy"`, `"gzip"`, `"none"` |
 
 ### WalConfig
@@ -241,7 +238,7 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | Out-of-order writes | Rejected for the same key | Allowed within `MaxBufferBatchSize` batch window |
 | Write/query performance | Lower | Higher |
 | Crash safety | Data safe | May lose buffered data |
-| Memory usage | Typically within `MaxCacheSize` range | ~3–4× `MaxCacheSize` |
+| Memory usage | Typically within `MaxCacheSize` | ~3–4× `MaxCacheSize` |
 
 > Control database memory usage by tuning `MaxCacheSize`.
 

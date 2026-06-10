@@ -32,11 +32,10 @@
 ## 特性
 
 - **嵌入轻量** — 专为边缘网关、工业控制器、IoT 设备等 CPU/内存/磁盘受限场景设计。
-- **代码精简** — 紧凑、可审计的核心代码，弱三方依赖。简易的磁盘文件结构 — 无复杂存储引擎，易于排查和维护。
-- **文件结构简单** — 直观的目录布局：每表一个元数据文件、时间戳命名的段文件与 WAL 日志。不依赖重型数据库引擎，便于备份和迁移。
+- **代码精简** — 紧凑、可审计的核心代码，极少三方依赖。直观的目录布局：每表一个元数据文件、时间戳命名的段文件与 WAL 日志 — 不依赖重型数据库引擎，便于排查、备份和迁移。
 - **高性能写入** — 单线程同步设计。单点写入性能 **800 万+ 点/秒**。
 - **自适应类型编码** — 运行时自动识别输入数据的结构，根据数据类型选择合适的压缩编码器，达到最优存储效率。
-- **高压缩率** — 时间戳 delta-of-delta、浮点数 XOR-delta、整数 zigzag、布尔值位打包，块级 Snappy/LZ4/Zstd 二次压缩 — 相较原始数据通常 10 倍以上压缩率。
+- **高压缩率** — 紧凑的数据编码加二次块压缩，实现极致的存储效率。
 - **多表支持** — 管理多个独立表，每个表拥有独立的 Schema 定义和列集合。
 - **降采样查询** — 长时间范围查询支持滑动窗口聚合（avg / min / max）。
 - **数据过期** — 可配置的基于时间的数据自动清理。
@@ -89,7 +88,7 @@ written, err := db.Write("metrics", "cpu_usage", time.Now().UnixNano(), variant.
 - `tag` — 时序标识（如传感器名称、指标 key）。
 - `timestamp` — Unix 时间戳，单位为**纳秒**。
 - `value` — 使用 `variant.New(v)` 包装任意支持的 Go 值。
-- 返回 `(true, nil)` 表示写入成功；`(false, nil)` 规则跳过。
+- 返回 `(true, nil)` 表示写入成功；`(false, nil)` 表示因去重或最小间隔规则被跳过。
 
 ### 查询
 
@@ -131,14 +130,13 @@ if point != nil {
 // 创建简化指标表，拥有最高的写入性能
 err := db.CreateTable(tsdb.TableInfo{
     ColumnAttribute: tsdb.ColumnAttribute{
-        Name: "metrics",
-        Desc: "Dev01.CPU",
-        Type: tsdb.ColumnTypeStructure,
-        Structure: []tsdb.ColumnAttribute{
-            {Name: "value", Type: tsdb.ColumnTypeFloat, FloatPrecision: 0}, // 自动计算精度
-        },
+        Name: "device",
+        Desc: "attributes",
+        Type: tsdb.ColumnTypeFloat,
+        FloatPrecision: 2,
     },
 })
+
 
 // 创建多列表
 err = db.CreateTable(tsdb.TableInfo{
@@ -217,10 +215,10 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `WalConfig` | `WalConfig` | — | WAL 配置（见下）                                          |
 | `MaxSegmentSize` | `int64` | `67108864` (64MB) | 单个段文件最大大小（字节）                                       |
 | `MaxSegmentTimeInterval` | `int64` | `0`（不限制） | 单个段文件最大时间跨度（秒）                                      |
-| `MaxStorageTime` | `int64` | `3600`（1 小时） | 拒绝远大于当前时间的数据写入                                      |
-| `ExpirationMinuteTime` | `int64` | `0`（禁用） | 数据过期时间（分钟），写入时清理 |
-| `DedupWindowMs` | `int64` | `0`（禁用） | 去重窗口（毫秒），两次写入窗口内相同的值跳过写入                            |
-| `MinIntervalMs` | `int64` | `0`（禁用） | 两次写入之间的最小间隔（毫秒）,小于这个值跳过写入                               |
+| `MaxStorageTime` | `int64` | `3600`（1 小时） | 拒绝时间戳远超当前时间的数据写入                                      |
+| `ExpirationMinuteTime` | `int64` | `0`（禁用） | 数据过期时间（分钟），每次写入时自动清理超出时间的数据 |
+| `DedupWindowMs` | `int64` | `0`（禁用） | 去重窗口（毫秒），同一 tag 相同值在此窗口内重复写入时跳过                            |
+| `MinIntervalMs` | `int64` | `0`（禁用） | 最小写入间隔（毫秒），两次写入间隔小于该值时跳过                               |
 | `SecondaryCompressionName` | `string` | `"zstd"` | 块压缩算法：`"zstd"`、`"lz4"`、`"snappy"`、`"gzip"`、`"none"` |
 
 ### WalConfig

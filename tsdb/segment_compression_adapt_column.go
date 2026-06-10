@@ -152,7 +152,7 @@ func (m *AdaptColumnEncoder) writeStruct(v variant.Variant) bool {
 			// New column — add to schema.
 			m.columnOrder = append(m.columnOrder, p.key)
 			m.columnTypes = append(m.columnTypes, cVt)
-			m.seenColumns = append(m.seenColumns, false)
+			m.seenColumns = append(m.seenColumns, true)
 			encoder := m.findColumnEncoder(cVt)
 			m.columnEncoders = append(m.columnEncoders, encoder)
 			// Backfill previous rows with empty.
@@ -161,7 +161,9 @@ func (m *AdaptColumnEncoder) writeStruct(v variant.Variant) bool {
 			}
 			encoder.Write(p.value)
 		}
-		m.seenColumns[idx] = true
+		if idx >= 0 {
+			m.seenColumns[idx] = true
+		}
 	}
 
 	// Fill missing columns with empty (skip when all columns present).
@@ -253,12 +255,10 @@ func (m *AdaptColumnEncoder) encodeStruct() ([]byte, error) {
 
 	// 3. Allocate underlying byte slice in one go, using indexed writes (avoids append bounds checking overhead)
 	b := make([]byte, totalLen)
+	b[0] = byte(adaptColumnCompressed)
+	b[1] = 0x00
+	binary.LittleEndian.PutUint16(b[2:4], nCols)
 	pos := 4
-	// marker & flags
-	b[pos] = byte(adaptColumnCompressed)
-	b[pos] = 0x00
-	// column count
-	binary.LittleEndian.PutUint16(b[pos:], nCols)
 
 	for _, name := range m.columnOrder {
 		b[pos] = byte(len(name))
@@ -424,7 +424,7 @@ func (d *AdaptColumnDecoder) Next() bool {
 		return d.decoder.Next()
 	}
 	if len(d.columnDecoder) == 0 {
-		return true // empty rows: row count provides iteration, Read returns empty map
+		return false
 	}
 	for _, name := range d.columnOrder {
 		if !d.columnDecoder[name].Next() {

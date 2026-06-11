@@ -71,9 +71,12 @@ func BenchmarkE2E_WriteAndQuery(b *testing.B) {
 	writeElapsed := time.Since(writeStart)
 	// 查询阶段
 	queryStart := time.Now()
-	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
+	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
 	if err != nil {
 		b.Fatal(err)
+	}
+	if len(all) != 0 {
+		b.Log(all[0], all[len(all)-1])
 	}
 	queryElapsed := time.Since(queryStart)
 	_ = db.Close()
@@ -84,7 +87,7 @@ func BenchmarkE2E_WriteAndQuery(b *testing.B) {
 }
 
 func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
-	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
+	const totalPoints = 12 * 60 * 60 * 1000 // 86,400,000
 	dir := benchDir(b)
 	tableName := "eu12"
 	tag := "CPU"

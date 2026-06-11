@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>嵌入式 KV 时序数据库引擎 — 适用于边缘计算网关等性能受限设备部署使用。</strong>
+  <strong>轻量化边端可嵌入式KV时序数据库引擎。</strong>
 </p>
 
 <p align="center">

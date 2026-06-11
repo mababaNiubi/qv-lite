@@ -432,11 +432,14 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		targetValue = v
 		count = 1
 		windowNumeric = isNumericType(v)
-		interval = (endTime - lastTms) / (maxNumber - pointsLen)
+		n := maxNumber - pointsLen
+		if n > 0 {
+			interval = (endTime - lastTms) / n
+		}
 	}
 
 	slideFunc := func(pack PointPack) ([]Point, error) {
-		fgPoints := make([]Point, 0, 2)
+		fgPoints := make([]Point, 0, 100)
 		for pack.Next() {
 			tms, v := pack.Read()
 			if lastTms == 0 {
@@ -444,15 +447,18 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 				continue
 			}
 			if tms-lastTms > interval {
-				condition, err := evalAnyCondition(cond, targetValue)
+				condition, err := evalAnyCondition(cond, v)
 				if err != nil {
 					return nil, err
 				}
 				if condition {
 					fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
+					resetWindow(tms, v)
+					pointsLen++
+					if pointsLen >= maxNumber-1 {
+						return fgPoints, nil
+					}
 				}
-				pointsLen++
-				resetWindow(tms, v)
 				continue
 			}
 			// If the window started with a non-numeric value, skip all aggregation
@@ -460,7 +466,6 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 			if !windowNumeric || !isNumericType(v) {
 				continue
 			}
-			count++
 			switch fusion {
 			case MinFusion:
 				if targetValue.Comparable(v) {
@@ -473,6 +478,7 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 					targetTms = tms
 				}
 			default:
+				count++
 				targetTms = targetTms + (tms-targetTms)/count
 				reduceVariant, err := v.Reduce(targetValue)
 				if err != nil {

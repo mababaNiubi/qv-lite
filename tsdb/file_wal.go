@@ -444,39 +444,36 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int
 			estCap = total
 		}
 	}
-	tmsAll := make([]int64, 0, estCap)
-	tmsAllValue := make([]variant.Variant, 0, estCap)
 	defer ws.mutex.RUnlock()
+	var err error
+	entries := make([]Point, 0, estCap)
 	for i := range ws.walFiles {
-		isFirstData := true
 		if !ws.closeBuffer {
 			ws.walFiles[i].readBuffer.forEach(func(p walDataEntry) bool {
-				if p.Key == tag {
-					if isFirstData && endTime < p.Timestamp {
-						return true
-					}
-					isFirstData = false
-					if p.Timestamp >= starTime && p.Timestamp <= endTime {
-						tmsAll = append(tmsAll, p.Timestamp)
-						tmsAllValue = append(tmsAllValue, p.Value)
-					}
+				if p.Key == tag && p.Timestamp >= starTime && p.Timestamp <= endTime {
+					entries = append(entries, Point{Tms: p.Timestamp, V: p.Value})
 				}
 				return true
 			})
 		} else {
-			err := forEachWalFile(ws.walFiles[i].fileName, func(key tagCode, timestamp int64, value variant.Variant, offset int64) bool {
+			err = forEachWalFile(ws.walFiles[i].fileName, func(key tagCode, timestamp int64, value variant.Variant, offset int64) bool {
 				if key == tag && timestamp >= starTime && timestamp <= endTime {
-					tmsAll = append(tmsAll, timestamp)
-					tmsAllValue = append(tmsAllValue, value)
+					entries = append(entries, Point{Tms: timestamp, V: value})
 				}
 				return true
 			})
-			if err != nil {
-				return tmsAll, tmsAllValue, err
-			}
 		}
 	}
-	return tmsAll, tmsAllValue, nil
+	tmsAll := make([]int64, len(entries))
+	tmsAllValue := make([]variant.Variant, len(entries))
+	if len(entries) > 0 {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Tms < entries[j].Tms })
+		for i := range entries {
+			tmsAll[i] = entries[i].Tms
+			tmsAllValue[i] = entries[i].V
+		}
+	}
+	return tmsAll, tmsAllValue, err
 }
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) error {

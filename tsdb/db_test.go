@@ -300,3 +300,111 @@ func TestDB_QueryWithCondition(t *testing.T) {
 		t.Errorf("condition score>50: expected 49 points, got %d", len(points))
 	}
 }
+
+func TestDB_Query_WithUnsortedWAL(t *testing.T) {
+	db, err := Open(Config{
+		Path:           tempDir(t),
+		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		MaxStorageTime: 24 * 60 * 60 * 365,
+	}, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{
+			Name: "unsorted_table",
+			Type: ColumnTypeInt,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now().UnixNano()
+	// Write out-of-order timestamps: 100, 50, 75, 200, 150
+	for _, offset := range []int64{100, 50, 75, 200, 150} {
+		_, err = db.Write("unsorted_table", "tag1", baseTime+offset, variant.NewInt(int(offset)))
+		if err != nil {
+			t.Fatalf("Write offset %d failed: %v", offset, err)
+		}
+	}
+
+	points, err := db.QueryAll("unsorted_table", "tag1", baseTime, baseTime+300, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 5 {
+		t.Fatalf("expected 5 points, got %d", len(points))
+	}
+	for i := 1; i < len(points); i++ {
+		if points[i].Tms < points[i-1].Tms {
+			t.Errorf("points not sorted: points[%d].Tms=%d > points[%d].Tms=%d",
+				i-1, points[i-1].Tms, i, points[i].Tms)
+		}
+	}
+	expected := []int64{50, 75, 100, 150, 200}
+	for i := range expected {
+		if v, _ := points[i].V.AsInt64(); v != expected[i] {
+			t.Errorf("points[%d].V=%d, want %d", i, v, expected[i])
+		}
+	}
+}
+
+func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
+	db, err := Open(Config{
+		Path:           tempDir(t),
+		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		MaxStorageTime: 24 * 60 * 60 * 365,
+	}, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{
+			Name: "limit_unsorted",
+			Type: ColumnTypeInt,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now().UnixNano()
+	// Write sequential points spanning several seconds.
+	for i := 0; i < 10; i++ {
+		_, err = db.Write("limit_unsorted", "tag1", baseTime+int64(i)*int64(time.Second), variant.NewInt(i))
+		if err != nil {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+	// Write out-of-order points into the WAL cache.
+	extraBase := baseTime + 5*int64(time.Second)
+	for _, offset := range []int64{300, 100, 400, 200, 500} {
+		_, err = db.Write("limit_unsorted", "tag1", extraBase+offset*int64(time.Millisecond), variant.NewInt(int(offset)))
+		if err != nil {
+			t.Fatalf("Write extra offset %d failed: %v", offset, err)
+		}
+	}
+
+	// Query with maxNumber=5 -- triggers QueryLimitNumber (range > 3.6ms threshold).
+	points, err := db.Query("limit_unsorted", "tag1", baseTime, baseTime+20*int64(time.Second), 5, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) == 0 {
+		t.Fatal("expected at least 1 point, got 0")
+	}
+	if len(points) > 5 {
+		t.Errorf("expected at most 5 points, got %d", len(points))
+	}
+	for i := 1; i < len(points); i++ {
+		if points[i].Tms < points[i-1].Tms {
+			t.Errorf("points not sorted: points[%d].Tms=%d > points[%d].Tms=%d",
+				i-1, points[i-1].Tms, i, points[i].Tms)
+		}
+	}
+}

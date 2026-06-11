@@ -3,10 +3,11 @@ package tsdb
 import (
 	"context"
 	"encoding/json"
-	"github.com/mababaNiubi/qv-lite/container"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/mababaNiubi/qv-lite/container"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -250,7 +251,7 @@ func (db *DB) Query(tableName string, tag string, startTime int64, endTime int64
 		maxNumber = 10000
 	}
 	// For queries spanning less than 1 hour, read all data directly.
-	if endTime-startTime > int64(time.Hour/time.Millisecond) {
+	if endTime-startTime > int64(time.Hour) {
 		return table.QueryLimitNumber(tag, startTime, endTime, maxNumber, polymerization, cond)
 	}
 	return table.Query(tag, startTime, endTime, cond)

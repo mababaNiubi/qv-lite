@@ -208,18 +208,6 @@ func (m *ColumnDecoder) Read() variant.Variant {
 	return v
 }
 
-// ReadColumn reads a single column value by name without building the full map.
-func (m *ColumnDecoder) ReadColumn(name string) (variant.Variant, bool) {
-	if len(m.columnIndex) == 0 && len(m.columnDecoder) == 1 {
-		return m.columnDecoder[0].Read(), true
-	}
-	idx, ok := m.columnIndex[name]
-	if !ok {
-		return emptyVariant, false
-	}
-	return m.columnDecoder[idx].Read(), true
-}
-
 func (m *ColumnDecoder) Error() error {
 	var errStr = ""
 	if m.err != nil {

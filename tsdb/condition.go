@@ -9,6 +9,8 @@ import (
 
 type ConditionOperator string
 
+type ConditionFilter func(v variant.Variant) (bool, error)
+
 const (
 	OpNotEqual           ConditionOperator = "!="
 	OpEqual              ConditionOperator = "="
@@ -119,7 +121,7 @@ func evalAnyCondition(cond any, data variant.Variant) (bool, error) {
 // CompileCondition pre-compiles a condition into an evaluator function,
 // hoisting the type switch and pre-splitting column attribute names
 // so that per-point evaluation only does the essential work.
-func CompileCondition(cond any) func(v variant.Variant) (bool, error) {
+func CompileCondition(cond any) ConditionFilter {
 	if cond == nil {
 		return func(v variant.Variant) (bool, error) { return true, nil }
 	}
@@ -146,7 +148,7 @@ func CompileCondition(cond any) func(v variant.Variant) (bool, error) {
 	}
 }
 
-func compileLogical(logicalCond LogicalCondition) func(v variant.Variant) (bool, error) {
+func compileLogical(logicalCond LogicalCondition) ConditionFilter {
 	if len(logicalCond.Cond) == 0 {
 		return func(variant.Variant) (bool, error) { return false, ErrorEmptyLogicalCondition }
 	}

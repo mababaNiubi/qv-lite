@@ -2,11 +2,12 @@ package tsdb
 
 import (
 	"encoding/json"
-	"github.com/mababaNiubi/qv-lite/container"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/mababaNiubi/qv-lite/container"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -251,7 +252,7 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	return s.MaxPointDict, nil
 }
 
-func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, cond any) ([]Point, error) {
+func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
 	// Read from WAL cache.
 	allTms, allValue, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
@@ -260,7 +261,6 @@ func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, cond 
 	if len(allTms) != len(allValue) {
 		return nil, ErrorWALDataMayBeDamaged
 	}
-	evalCond := CompileCondition(cond)
 	points := make([]Point, 0, len(allTms))
 	for i := range allTms {
 		condition, err := evalCond(allValue[i])
@@ -334,10 +334,9 @@ func (s *ssTable) scanSegment(fs FileSegment, code tagCode, startTime, endTime i
 	}
 }
 
-func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond any) ([]Point, error) {
+func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
 	var points pointCollector
-	evalCond := CompileCondition(cond)
-	pack := NewPointPackImpl(s.tableInfo.Structure)
+	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
 	err := s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
 		if e := pack.AddSegment(compressedTimeData, compressedValueData); e != nil {
@@ -365,11 +364,12 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	cachePoints, err := s.queryCache(code, startTime, endTime, cond)
+	evalCond := CompileCondition(cond)
+	cachePoints, err := s.queryCache(code, startTime, endTime, evalCond)
 	if err != nil {
 		return nil, err
 	}
-	disk, err := s.queryDisk(code, startTime, endTime, cond)
+	disk, err := s.queryDisk(code, startTime, endTime, evalCond)
 	if err != nil {
 		return nil, err
 	}
@@ -445,22 +445,23 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		fgPoints := make([]Point, 0, 100)
 		for pack.Next() {
 			tms, v := pack.Read()
+			condition, err := evalCond(v)
+			if err != nil {
+				return nil, err
+			}
+			if !condition {
+				continue
+			}
 			if lastTms == 0 {
 				resetWindow(tms, v)
 				continue
 			}
-			if tms-lastTms > interval {
-				condition, err := evalCond(v)
-				if err != nil {
-					return nil, err
-				}
-				if condition {
-					fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
-					resetWindow(tms, v)
-					pointsLen++
-					if pointsLen >= maxNumber-1 {
-						return fgPoints, nil
-					}
+			if tms-lastTms >= interval {
+				fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
+				resetWindow(tms, v)
+				pointsLen++
+				if pointsLen >= maxNumber-1 {
+					return fgPoints, nil
 				}
 				continue
 			}
@@ -497,10 +498,12 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 				}
 			}
 		}
+
 		return fgPoints, nil
 	}
+
 	var err error
-	pack := NewPointPackImpl(s.tableInfo.Structure)
+	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
 	points := make([]Point, 0, maxNumber)
 	err = s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
@@ -517,30 +520,22 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 	if err != nil {
 		return points, err
 	}
-	// Read data from cache.
-	pack.Reset()
+
 	cacheTms, cacheVale, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
-	pack.AddCacheSegment(cacheTms, cacheVale)
-	ps, err := slideFunc(pack)
+
+	ps, err := slideFunc(NewPointCachePack(cacheTms, cacheVale))
 	if err != nil {
 		return points, err
 	}
 	points = append(points, ps...)
-	// Handle the last data point.
 	if lastTms != 0 {
-		condition, err := evalCond(targetValue)
-		if err != nil {
-			return points, err
-		}
-		if condition {
-			points = append(points, Point{
-				Tms: targetTms,
-				V:   targetValue,
-			})
-		}
+		points = append(points, Point{
+			Tms: targetTms,
+			V:   targetValue,
+		})
 	}
 	return points, err
 }

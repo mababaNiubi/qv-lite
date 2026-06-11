@@ -93,11 +93,13 @@ type PointPack interface {
 	Next() bool
 	// Read returns the current point's timestamp and value.
 	Read() (int64, variant.Variant)
+
+	Reset()
 }
 
 func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, compressedValueData []byte, cond any) ([]Point, error) {
 	points := make([]Point, 0, 256)
-	var pack = NewPointPackImpl(attribute)
+	var pack = NewPointDiskPack(attribute, 0, 0)
 	err := pack.AddSegment(compressedTimeData, compressedValueData)
 	if err != nil {
 		return points, err
@@ -119,38 +121,31 @@ func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, 
 	return points, nil
 }
 
-type PointPackImpl struct {
-	segments     []Segment
-	currentIdx   int
-	currentTs    int64
-	currentValue variant.Variant
-
-	cacheTms   []int64
-	cacheValue []variant.Variant
+type PointDiskPack struct {
+	segments   []Segment
+	currentIdx int
 
 	attribute []ColumnAttribute
+
+	startTime int64
+	endTime   int64
 }
 
-func NewPointPackImpl(attribute []ColumnAttribute) *PointPackImpl {
-	return &PointPackImpl{
+func NewPointDiskPack(attribute []ColumnAttribute, startTime int64, endTime int64) *PointDiskPack {
+	return &PointDiskPack{
 		attribute: attribute,
+		startTime: startTime,
+		endTime:   endTime,
 	}
 }
 
-func (p *PointPackImpl) AddCacheSegment(cacheTms []int64, cacheValue []variant.Variant) {
-	p.cacheTms = cacheTms
-	p.cacheValue = cacheValue
-}
-
-func (p *PointPackImpl) Reset() {
+func (p *PointDiskPack) Reset() {
 	p.segments = p.segments[:0]
 	p.currentIdx = 0
-	p.cacheTms = nil
-	p.cacheValue = nil
 }
 
 // AddSegment adds a new data segment containing compressed timestamp and value byte streams.
-func (p *PointPackImpl) AddSegment(tmsData []byte, valueData []byte) error {
+func (p *PointDiskPack) AddSegment(tmsData []byte, valueData []byte) error {
 	if len(tmsData) == 0 || len(valueData) == 0 {
 		return nil
 	}
@@ -188,45 +183,66 @@ func (p *PointPackImpl) AddSegment(tmsData []byte, valueData []byte) error {
 }
 
 // Next Attempt to read the next timestamp and value, automatically switch to the next shard
-func (p *PointPackImpl) Next() bool {
-	for ; p.currentIdx < len(p.segments); p.currentIdx++ {
+func (p *PointDiskPack) Next() bool {
+	for p.currentIdx < len(p.segments) {
 		seg := &p.segments[p.currentIdx]
 
 		timeOK := seg.timeDecoder.Next()
 		valueOK := seg.valueDecoder.Next()
 
 		if !timeOK || !valueOK {
+			p.currentIdx++
 			continue // The current shard has ended, try the next one
 		}
 
-		p.currentTs = seg.timeDecoder.Read()
-		p.currentValue = seg.valueDecoder.Read()
+		if p.endTime > 0 {
+			tms := seg.timeDecoder.Read()
+			if tms > p.endTime || tms < p.startTime {
+				continue
+			}
+		}
+
 		return true
 	}
-	if p.currentIdx-len(p.segments) < len(p.cacheTms) {
-		index := p.currentIdx - len(p.segments)
-		p.currentTs = p.cacheTms[index]
-		p.currentValue = p.cacheValue[index]
-		p.currentIdx++
-		return true
-	}
+
 	return false
 }
 
 // Read returns the current timestamp and value.
-func (p *PointPackImpl) Read() (int64, variant.Variant) {
-	return p.currentTs, p.currentValue
+func (p *PointDiskPack) Read() (int64, variant.Variant) {
+	seg := &p.segments[p.currentIdx]
+	return seg.timeDecoder.Read(), seg.valueDecoder.Read()
 }
 
-// ReadColumnValue reads a single column value by name, skipping the full map
-// construction when the underlying decoder supports it. Falls back to MapGet on
-// the full value when the column decoder doesn't support direct column reads.
-func (p *PointPackImpl) ReadColumnValue(name string) (variant.Variant, bool) {
-	if p.currentIdx < len(p.segments) {
-		seg := &p.segments[p.currentIdx]
-		if cr, ok := seg.valueDecoder.(ColumnReader); ok {
-			return cr.ReadColumn(name)
-		}
+type PointCachePack struct {
+	currentIdx int
+	cacheTms   []int64
+	cacheValue []variant.Variant
+}
+
+func NewPointCachePack(cacheTms []int64, cacheValue []variant.Variant) PointPack {
+	return &PointCachePack{
+		cacheTms:   cacheTms,
+		cacheValue: cacheValue,
 	}
-	return p.currentValue.MapGet(name)
+}
+
+func (p *PointCachePack) Reset() {
+	p.currentIdx = 0
+	p.cacheTms = nil
+	p.cacheValue = nil
+}
+
+// Next Attempt to read the next timestamp and value, automatically switch to the next shard
+func (p *PointCachePack) Next() bool {
+	p.currentIdx++
+	if p.currentIdx >= len(p.cacheTms) {
+		return false
+	}
+	return true
+}
+
+// Read returns the current timestamp and value.
+func (p *PointCachePack) Read() (int64, variant.Variant) {
+	return p.cacheTms[p.currentIdx], p.cacheValue[p.currentIdx]
 }

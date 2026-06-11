@@ -260,9 +260,10 @@ func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, cond 
 	if len(allTms) != len(allValue) {
 		return nil, ErrorWALDataMayBeDamaged
 	}
+	evalCond := CompileCondition(cond)
 	points := make([]Point, 0, len(allTms))
 	for i := range allTms {
-		condition, err := evalAnyCondition(cond, allValue[i])
+		condition, err := evalCond(allValue[i])
 		if err != nil {
 			return nil, err
 		}
@@ -335,6 +336,7 @@ func (s *ssTable) scanSegment(fs FileSegment, code tagCode, startTime, endTime i
 
 func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond any) ([]Point, error) {
 	var points pointCollector
+	evalCond := CompileCondition(cond)
 	pack := NewPointPackImpl(s.tableInfo.Structure)
 	err := s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
@@ -343,7 +345,7 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond a
 		}
 		for pack.Next() {
 			tms, value := pack.Read()
-			ok, e := evalAnyCondition(cond, value)
+			ok, e := evalCond(value)
 			if e != nil {
 				return e
 			}
@@ -422,6 +424,7 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		return s.Query(tag, startTime, endTime, cond)
 	}
 
+	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()
 	var targetTms, count, lastTms, pointsLen int64
 	var windowNumeric bool
@@ -447,7 +450,7 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 				continue
 			}
 			if tms-lastTms > interval {
-				condition, err := evalAnyCondition(cond, v)
+				condition, err := evalCond(v)
 				if err != nil {
 					return nil, err
 				}
@@ -528,7 +531,7 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 	points = append(points, ps...)
 	// Handle the last data point.
 	if lastTms != 0 {
-		condition, err := evalAnyCondition(cond, targetValue)
+		condition, err := evalCond(targetValue)
 		if err != nil {
 			return points, err
 		}

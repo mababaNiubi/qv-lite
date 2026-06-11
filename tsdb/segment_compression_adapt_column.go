@@ -453,6 +453,21 @@ func (d *AdaptColumnDecoder) Read() variant.Variant {
 	return v
 }
 
+// ReadColumn reads a single column value by name without building the full map.
+func (d *AdaptColumnDecoder) ReadColumn(name string) (variant.Variant, bool) {
+	if d.isNotStruct {
+		if d.decoder != nil {
+			return d.decoder.Read(), true
+		}
+		return emptyVariant, false
+	}
+	dec, ok := d.columnDecoder[name]
+	if !ok {
+		return emptyVariant, false
+	}
+	return dec.Read(), true
+}
+
 // Error returns the first error encountered during decoding.
 func (d *AdaptColumnDecoder) Error() error {
 	if d.err != nil {

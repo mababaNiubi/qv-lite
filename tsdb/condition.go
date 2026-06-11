@@ -115,3 +115,87 @@ func evalAnyCondition(cond any, data variant.Variant) (bool, error) {
 		return false, fmt.Errorf("invalid condition type: %T", cond)
 	}
 }
+
+// CompileCondition pre-compiles a condition into an evaluator function,
+// hoisting the type switch and pre-splitting column attribute names
+// so that per-point evaluation only does the essential work.
+func CompileCondition(cond any) func(v variant.Variant) (bool, error) {
+	if cond == nil {
+		return func(v variant.Variant) (bool, error) { return true, nil }
+	}
+	switch c := cond.(type) {
+	case Condition:
+		parts := strings.Split(c.ColumnAttributeName, ".")
+		if len(parts) == 1 && parts[0] == "" {
+			return func(v variant.Variant) (bool, error) {
+				if v.Type() != variant.TypeMap {
+					return CompareValue(c, v)
+				}
+				return false, nil
+			}
+		}
+		return func(v variant.Variant) (bool, error) {
+			return evalCompiledCondition(c, parts, v)
+		}
+	case LogicalCondition:
+		return compileLogical(c)
+	default:
+		return func(v variant.Variant) (bool, error) {
+			return false, fmt.Errorf("invalid condition type: %T", cond)
+		}
+	}
+}
+
+func compileLogical(logicalCond LogicalCondition) func(v variant.Variant) (bool, error) {
+	if len(logicalCond.Cond) == 0 {
+		return func(variant.Variant) (bool, error) { return false, ErrorEmptyLogicalCondition }
+	}
+	compiled := make([]func(variant.Variant) (bool, error), len(logicalCond.Cond))
+	for i, sub := range logicalCond.Cond {
+		compiled[i] = CompileCondition(sub)
+	}
+	switch logicalCond.Op {
+	case LogicalAnd:
+		return func(v variant.Variant) (bool, error) {
+			for _, fn := range compiled {
+				ok, err := fn(v)
+				if err != nil || !ok {
+					return false, err
+				}
+			}
+			return true, nil
+		}
+	case LogicalOr:
+		return func(v variant.Variant) (bool, error) {
+			for _, fn := range compiled {
+				ok, err := fn(v)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	default:
+		return func(variant.Variant) (bool, error) {
+			return false, fmt.Errorf("unknown logical operator: %s", logicalCond.Op)
+		}
+	}
+}
+
+func evalCompiledCondition(cond Condition, parts []string, data variant.Variant) (bool, error) {
+	for i := range parts {
+		columnValue, exists := data.MapGet(parts[i])
+		if !exists {
+			return false, nil
+		}
+		if columnValue.Type() == variant.TypeMap {
+			data = columnValue
+			continue
+		}
+		return CompareValue(cond, columnValue)
+	}
+	return false, nil
+}

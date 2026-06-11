@@ -64,6 +64,12 @@ type Decoder interface {
 	Error() error
 }
 
+// ColumnReader is an optional interface implemented by decoders that can read a
+// single column value by name, avoiding the per-row map allocation of Read().
+type ColumnReader interface {
+	ReadColumn(name string) (variant.Variant, bool)
+}
+
 // Sub-encoder marker bytes. Each encoder's Bytes() output begins with one of
 // these markers so the decoder can identify the encoding type.
 const (

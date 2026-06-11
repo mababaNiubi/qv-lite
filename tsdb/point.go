@@ -217,3 +217,16 @@ func (p *PointPackImpl) Next() bool {
 func (p *PointPackImpl) Read() (int64, variant.Variant) {
 	return p.currentTs, p.currentValue
 }
+
+// ReadColumnValue reads a single column value by name, skipping the full map
+// construction when the underlying decoder supports it. Falls back to MapGet on
+// the full value when the column decoder doesn't support direct column reads.
+func (p *PointPackImpl) ReadColumnValue(name string) (variant.Variant, bool) {
+	if p.currentIdx < len(p.segments) {
+		seg := &p.segments[p.currentIdx]
+		if cr, ok := seg.valueDecoder.(ColumnReader); ok {
+			return cr.ReadColumn(name)
+		}
+	}
+	return p.currentValue.MapGet(name)
+}

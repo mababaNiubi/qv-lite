@@ -29,7 +29,7 @@ type FileSegment interface {
 	GetMinTms() int64
 	GetIndex() *FileIndex
 	PersistIndex() error
-	InspectBlockIndex(tableInfo *TableInfo) error
+	InspectBlockIndex(tableInfo *TableInfo) (map[tagCode]Point, error)
 	Remove() error
 }
 
@@ -83,20 +83,27 @@ func (w *fileSegment) PersistIndex() error {
 	return writeIndexFile(indexFilePath(w.filePath), w.index)
 }
 
-func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) error {
+func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) (map[tagCode]Point, error) {
 	_ = w.OpenReader()
 	idx := &FileIndex{
 		Blocks: make([]BlockIndexEntry, 0, 5),
 	}
+	lastPoints := make(map[tagCode]Point)
 	for {
 		lastOffset := w.GetReadEffectiveSize()
 		head, compressedTimeData, compressedValueData, err := w.NextRead(func(header SegmentHeader) bool { return true }, tableInfo)
 		if err != nil || head == nil {
 			break
 		}
-		_, err = GetAllPointByBytes(tableInfo.Structure, compressedTimeData, compressedValueData, nil)
+		points, err := GetAllPointByBytes(tableInfo.Structure, compressedTimeData, compressedValueData)
 		if err != nil {
 			break
+		}
+		if len(points) > 0 {
+			last := points[len(points)-1]
+			if lp, ok := lastPoints[head.Attribute]; !ok || last.Tms > lp.Tms {
+				lastPoints[head.Attribute] = last
+			}
 		}
 		if idx.MinTime == 0 || head.MinTime < idx.MinTime {
 			idx.MinTime = head.MinTime
@@ -118,12 +125,12 @@ func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) error {
 	if effectiveSize > 0 {
 		bf, err := OpenBlockFile(w.filePath, w.compressor, BlockSizeDef)
 		if err != nil {
-			return err
+			return lastPoints, err
 		}
 		if effectiveSize < bf.Size() {
 			if err := bf.Truncate(effectiveSize); err != nil {
 				bf.Close()
-				return err
+				return lastPoints, err
 			}
 		}
 		bf.Close()
@@ -131,7 +138,7 @@ func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) error {
 	if w.index == nil {
 		w.index = idx
 	}
-	return nil
+	return lastPoints, nil
 }
 
 // ─── Segment list (array-based, time-sorted) ────────────────────────
@@ -155,10 +162,10 @@ func (s *fileSegmentList) GetLastFragmentation() FileSegment {
 	return s.segments[s.activeIdx]
 }
 
-func (s *fileSegmentList) InspectLastBlockIndex(tableInfo *TableInfo) error {
+func (s *fileSegmentList) InspectLastBlockIndex(tableInfo *TableInfo) (map[tagCode]Point, error) {
 	f := s.GetLastFragmentation()
 	if f == nil {
-		return nil
+		return nil, nil
 	}
 	return f.InspectBlockIndex(tableInfo)
 }

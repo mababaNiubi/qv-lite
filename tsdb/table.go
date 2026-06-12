@@ -62,9 +62,12 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		return nil, err
 	}
 	// Handle file corruption caused by an abnormal interruption during writes.
-	err = s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
+	lastPoints, err := s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
 	if err != nil {
 		return nil, err
+	}
+	for k, lp := range lastPoints {
+		s.walFile.SetLastPoint(k, lp.Tms, lp.V)
 	}
 	return s, nil
 }
@@ -419,10 +422,11 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	var interval = (endTime - startTime) / maxNumber
-	if interval <= 0 {
-		return s.Query(tag, startTime, endTime, cond)
+	tms, _, ok := s.walFile.GetTagMaxTimestamp(code)
+	if ok {
+		endTime = min(endTime, tms)
 	}
+	var interval = (endTime - startTime) / maxNumber
 
 	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()

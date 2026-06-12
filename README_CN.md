@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>轻量化边端可嵌入式KV时序数据库引擎。</strong>
+  <strong>轻量化边端KV时序数据库引擎。</strong>
 </p>
 
 <p align="center">

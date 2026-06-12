@@ -79,6 +79,7 @@ type WalFile interface {
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int64, []variant.Variant, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
+	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
 	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) error
@@ -88,10 +89,9 @@ type WalFile interface {
 }
 
 type walFile struct {
-	mutex           sync.RWMutex
-	walFiles        []walFileEnty
-	tagMaxTimestamp map[tagCode]int64
-	tagLastValue    map[tagCode]variant.Variant
+	mutex     sync.RWMutex
+	walFiles  []walFileEnty
+	lastPoint map[tagCode]Point
 
 	writefile   *os.File
 	writeBuffer *bufio.Writer
@@ -138,13 +138,11 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 	lastRB := walFiles[len(walFiles)-1].readBuffer
 	lastRB.chunks = append(lastRB.chunks, make([]walDataEntry, 0, maxWalBatchSize))
 
-	tagMaxTimestamp := make(map[tagCode]int64)
-	tagLastValue := make(map[tagCode]variant.Variant)
+	lastPoint := make(map[tagCode]Point)
 	for i := range walFiles {
 		walFiles[i].readBuffer.forEach(func(entry walDataEntry) bool {
-			if maxTs, ok := tagMaxTimestamp[entry.Key]; !ok || entry.Timestamp > maxTs {
-				tagMaxTimestamp[entry.Key] = entry.Timestamp
-				tagLastValue[entry.Key] = entry.Value
+			if lp, ok := lastPoint[entry.Key]; !ok || entry.Timestamp > lp.Tms {
+				lastPoint[entry.Key] = Point{Tms: entry.Timestamp, V: entry.Value}
 			}
 			return true
 		})
@@ -159,8 +157,7 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 		writefile:       file,
 		writeBuffer:     bufio.NewWriter(file),
 		walFiles:        walFiles,
-		tagMaxTimestamp: tagMaxTimestamp,
-		tagLastValue:    tagLastValue,
+		lastPoint:       lastPoint,
 		filePath:        filePath,
 		closeBuffer:     closeBuffer,
 		maxWalCacheSize: maxWalCacheSize,
@@ -187,8 +184,8 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 
 	if ws.closeBuffer {
 		// Immediate write: require monotonic timestamps, write directly to disk.
-		maxTimestamp, ok := ws.tagMaxTimestamp[key]
-		if ok && timestamp < maxTimestamp {
+		lp, ok := ws.lastPoint[key]
+		if ok && timestamp < lp.Tms {
 			return false, 0, ErrorWALClose
 		}
 		if ws.skipDedup(key, timestamp, value, false) {
@@ -205,8 +202,7 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 
 		ent := &ws.walFiles[fileIndex]
 		ent.length += dataLen
-		ws.tagMaxTimestamp[key] = timestamp
-		ws.tagLastValue[key] = value
+		ws.lastPoint[key] = Point{Tms: timestamp, V: value}
 
 		if err := ws.rotateIfFull(); err != nil {
 			return false, 0, err
@@ -282,8 +278,7 @@ func (ws *walFile) flushPending() error {
 
 		ent.length += dataLen
 		e.EndPosition = ent.length
-		ws.tagMaxTimestamp[e.Key] = e.Timestamp
-		ws.tagLastValue[e.Key] = e.Value
+		ws.lastPoint[e.Key] = Point{Tms: e.Timestamp, V: e.Value}
 	}
 
 	if len(batchBuf) > 0 {
@@ -327,21 +322,21 @@ func appendSerialized(dst []byte, key tagCode, timestamp int64, value variant.Va
 // skipDedup returns true if the entry should be skipped due to minIntervalMs
 // or dedupWindowMs. For normal (batched) mode, only checks when ts >= prevTs.
 func (ws *walFile) skipDedup(key tagCode, ts int64, value variant.Variant, requireOrder bool) bool {
-	prevTs, ok := ws.tagMaxTimestamp[key]
+	lp, ok := ws.lastPoint[key]
 	if !ok {
 		return false
 	}
-	if requireOrder && ts < prevTs {
+	if requireOrder && ts < lp.Tms {
 		return false
 	}
-	if ts < prevTs {
+	if ts < lp.Tms {
 		return false
 	}
-	if ws.minIntervalMs > 0 && ts-prevTs < ws.minIntervalMs {
+	if ws.minIntervalMs > 0 && ts-lp.Tms < ws.minIntervalMs {
 		return true
 	}
-	if ws.dedupWindowMs > 0 && ts-prevTs <= ws.dedupWindowMs {
-		if prevVal, ok := ws.tagLastValue[key]; ok && prevVal.IsEqual(value) {
+	if ws.dedupWindowMs > 0 && ts-lp.Tms <= ws.dedupWindowMs {
+		if lp.V.IsEqual(value) {
 			return true
 		}
 	}
@@ -372,17 +367,16 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 	ws.mutex.RLock()
 	defer ws.mutex.RUnlock()
 
-	maxTs, ok := ws.tagMaxTimestamp[key]
-	maxVal := ws.tagLastValue[key]
+	lp, ok := ws.lastPoint[key]
 
 	// Also scan the unflushed last chunk for newer data.
 	fileIndex := len(ws.walFiles) - 1
 	lastChunk := ws.walFiles[fileIndex].readBuffer.chunks[len(ws.walFiles[fileIndex].readBuffer.chunks)-1]
 	for i := range lastChunk {
 		e := &lastChunk[i]
-		if e.Key == key && e.Timestamp >= maxTs {
-			maxTs = e.Timestamp
-			maxVal = e.Value
+		if e.Key == key && e.Timestamp >= lp.Tms {
+			lp.Tms = e.Timestamp
+			lp.V = e.Value
 			ok = true
 		}
 	}
@@ -390,7 +384,15 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 	if !ok {
 		return 0, variant.Variant{}, false
 	}
-	return maxTs, maxVal, true
+	return lp.Tms, lp.V, true
+}
+
+func (ws *walFile) SetLastPoint(key tagCode, ts int64, value variant.Variant) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+	if lp, ok := ws.lastPoint[key]; !ok || ts > lp.Tms {
+		ws.lastPoint[key] = Point{Tms: ts, V: value}
+	}
 }
 
 func (ws *walFile) addWalFile() error {

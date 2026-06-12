@@ -5,7 +5,7 @@
 <h1 align="center">qv-lite</h1>
 
 <p align="center">
-  <strong>Lightweight Edge Embeddable KV Time-Series Database Engine.</strong>
+  <strong>Lightweight Edge KV Time-Series Database Engine.</strong>
 </p>
 
 <p align="center">

@@ -97,7 +97,7 @@ type PointPack interface {
 	Reset()
 }
 
-func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, compressedValueData []byte, cond any) ([]Point, error) {
+func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, compressedValueData []byte) ([]Point, error) {
 	points := make([]Point, 0, 256)
 	var pack = NewPointDiskPack(attribute, 0, 0)
 	err := pack.AddSegment(compressedTimeData, compressedValueData)
@@ -106,17 +106,10 @@ func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, 
 	}
 	for pack.Next() {
 		tms, value := pack.Read()
-		// Evaluate condition filter.
-		condition, err := evalAnyCondition(cond, value)
-		if err != nil {
-			return nil, err
-		}
-		if condition {
-			points = append(points, Point{
-				Tms: tms,
-				V:   value,
-			})
-		}
+		points = append(points, Point{
+			Tms: tms,
+			V:   value,
+		})
 	}
 	return points, nil
 }

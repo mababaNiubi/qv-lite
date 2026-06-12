@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mababaNiubi/qv-lite/container"
-
 	"github.com/mababaNiubi/variant"
 )
 
@@ -24,7 +22,7 @@ type ssTable struct {
 	dirPath   string // Table directory path.
 	meta
 	fragmentation          fileSegmentList
-	columnMap              container.SyncMap[tagCode, *ssColumn]
+	columnMap              map[tagCode]*ssColumn
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
 	expirationMinuteTime   int64
@@ -43,6 +41,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		meta: meta{
 			PointDict: make(map[string]tagCode),
 		},
+		columnMap:              make(map[tagCode]*ssColumn),
 		maxSegmentSize:         maxSegmentSize,
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
@@ -127,7 +126,7 @@ func (s *ssTable) flushCache() error {
 	// Track the position of the last successfully read entry for error recovery.
 	errIndex := 0
 	err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
-		column, ok := s.columnMap.Load(tag)
+		column, ok := s.columnMap[tag]
 		if !ok {
 			return true
 		}
@@ -159,10 +158,9 @@ func (s *ssTable) flushCache() error {
 	})
 	if err != nil || readErr != nil {
 		// Reset all encoder state.
-		s.columnMap.Range(func(tag tagCode, column *ssColumn) bool {
+		for _, column := range s.columnMap {
 			column.Reset()
-			return true
-		})
+		}
 		// Roll back all data segments.
 		errRollback := s.fragmentation.RollbackLastCommitTransaction()
 		if errRollback != nil {
@@ -179,21 +177,20 @@ func (s *ssTable) flushCache() error {
 		return err
 	}
 	// Flush remaining encoder data to disk.
-	s.columnMap.Range(func(tag tagCode, column *ssColumn) bool {
+	for _, column := range s.columnMap {
 		var needNewFile bool
 		needNewFile, err = column.glowWrite(&s.fragmentation)
 		if err != nil {
-			return false
+			break
 		}
 		if needNewFile {
 			_ = s.fragmentation.PersistLastIndex()
 			err = s.fragmentation.AddTransactionSegment()
 			if err != nil {
-				return false
+				break
 			}
 		}
-		return true
-	})
+	}
 	// Commit the data segments.
 	err = s.fragmentation.CommitTransactionFileSegment()
 	if err != nil {
@@ -222,7 +219,7 @@ func (s *ssTable) BuildColumn() error {
 			return err
 		}
 		for _, u := range s.meta.PointDict {
-			s.columnMap.Store(u, newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
+			s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
 		}
 	}
 	return nil
@@ -237,7 +234,9 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	// Create the tag.
 	s.MaxPointDict += 1
 	s.PointDict[tag] = s.MaxPointDict
-	s.columnMap.Store(s.MaxPointDict, newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
+	s.flushMute.Lock()
+	s.columnMap[s.MaxPointDict] = newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+	s.flushMute.Unlock()
 	// Persist metadata to disk.
 	marshal, err := json.Marshal(&s.meta)
 	if err != nil {

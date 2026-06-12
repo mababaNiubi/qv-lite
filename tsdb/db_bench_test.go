@@ -71,7 +71,8 @@ func BenchmarkE2E_WriteAndQuery(b *testing.B) {
 	writeElapsed := time.Since(writeStart)
 	// 查询阶段
 	queryStart := time.Now()
-	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
+	//all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
+	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

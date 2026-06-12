@@ -15,6 +15,26 @@ import (
 
 var segmentHeaderSize = int64(binary.Size(SegmentHeader{}))
 
+const segmentHeaderRawSize = 32
+
+func encodeSegmentHeader(h *SegmentHeader) [segmentHeaderRawSize]byte {
+	var buf [segmentHeaderRawSize]byte
+	binary.BigEndian.PutUint32(buf[0:4], uint32(h.Attribute))
+	binary.BigEndian.PutUint64(buf[4:12], uint64(h.MinTime))
+	binary.BigEndian.PutUint64(buf[12:20], uint64(h.MaxTime))
+	binary.BigEndian.PutUint64(buf[20:28], uint64(h.DataSize))
+	binary.BigEndian.PutUint32(buf[28:32], h.Crc)
+	return buf
+}
+
+func decodeSegmentHeader(data []byte, h *SegmentHeader) {
+	h.Attribute = tagCode(binary.BigEndian.Uint32(data[0:4]))
+	h.MinTime = int64(binary.BigEndian.Uint64(data[4:12]))
+	h.MaxTime = int64(binary.BigEndian.Uint64(data[12:20]))
+	h.DataSize = int64(binary.BigEndian.Uint64(data[20:28]))
+	h.Crc = binary.BigEndian.Uint32(data[28:32])
+}
+
 type SegmentHeader struct {
 	Attribute tagCode `json:"attribute"`
 	MinTime   int64   `json:"min_time"`

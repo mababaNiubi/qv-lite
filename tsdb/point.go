@@ -56,6 +56,16 @@ var pointChunkPool = sync.Pool{
 	},
 }
 
+var (
+	timeDecoderPool     = sync.Pool{New: func() any { return &TimeDecoder{} }}
+	intDecoderPool      = sync.Pool{New: func() any { return &IntegerDecoder{} }}
+	floatDecoderPool    = sync.Pool{New: func() any { return &FloatDecoder{} }}
+	strDecoderPool      = sync.Pool{New: func() any { return &StringDecoder{} }}
+	boolDecoderPool     = sync.Pool{New: func() any { return &BooleanDecoder{} }}
+	jsonDecoderPool     = sync.Pool{New: func() any { return &JsonDecoder{} }}
+	adaptColDecoderPool = sync.Pool{New: func() any { return &AdaptColumnDecoder{} }}
+)
+
 func (c *pointCollector) append(p Point) {
 	n := len(c.chunks)
 	if n == 0 || len(c.chunks[n-1]) >= pointChunkSize {
@@ -100,6 +110,7 @@ type PointPack interface {
 func GetAllPointByBytes(attribute []ColumnAttribute, compressedTimeData []byte, compressedValueData []byte) ([]Point, error) {
 	points := make([]Point, 0, 256)
 	var pack = NewPointDiskPack(attribute, 0, 0)
+	defer pack.Reset()
 	err := pack.AddSegment(compressedTimeData, compressedValueData)
 	if err != nil {
 		return points, err
@@ -133,6 +144,24 @@ func NewPointDiskPack(attribute []ColumnAttribute, startTime int64, endTime int6
 }
 
 func (p *PointDiskPack) Reset() {
+	for i := range p.segments {
+		seg := &p.segments[i]
+		timeDecoderPool.Put(seg.timeDecoder)
+		switch d := seg.valueDecoder.(type) {
+		case *IntegerDecoder:
+			intDecoderPool.Put(d)
+		case *FloatDecoder:
+			floatDecoderPool.Put(d)
+		case *StringDecoder:
+			strDecoderPool.Put(d)
+		case *BooleanDecoder:
+			boolDecoderPool.Put(d)
+		case *JsonDecoder:
+			jsonDecoderPool.Put(d)
+		case *AdaptColumnDecoder:
+			adaptColDecoderPool.Put(d)
+		}
+	}
 	p.segments = p.segments[:0]
 	p.currentIdx = 0
 }
@@ -145,19 +174,19 @@ func (p *PointDiskPack) AddSegment(tmsData []byte, valueData []byte) error {
 	var valueDecoder Decoder
 	switch valueData[0] {
 	case intUncompressed, intCompressedSimple, intCompressedRLE:
-		valueDecoder = &IntegerDecoder{}
+		valueDecoder = intDecoderPool.Get().(*IntegerDecoder)
 	case jsonCompressed:
-		valueDecoder = &JsonDecoder{}
+		valueDecoder = jsonDecoderPool.Get().(*JsonDecoder)
 	case floatCompressedXDMI:
-		valueDecoder = &FloatDecoder{}
+		valueDecoder = floatDecoderPool.Get().(*FloatDecoder)
 	case stringCompressedSnappy:
-		valueDecoder = &StringDecoder{}
+		valueDecoder = strDecoderPool.Get().(*StringDecoder)
 	case booleanCompressedRLEFalse, booleanCompressedRLETrue, booleanCompressedBitPacked:
-		valueDecoder = &BooleanDecoder{}
+		valueDecoder = boolDecoderPool.Get().(*BooleanDecoder)
 	case columnCompressed:
 		valueDecoder = NewColumnDecoder(p.attribute)
 	case adaptColumnCompressed:
-		valueDecoder = &AdaptColumnDecoder{}
+		valueDecoder = adaptColDecoderPool.Get().(*AdaptColumnDecoder)
 	default:
 		return errorUnknownValueCompressionType(valueData[0])
 	}
@@ -165,7 +194,7 @@ func (p *PointDiskPack) AddSegment(tmsData []byte, valueData []byte) error {
 	if valueDecoder.Error() != nil {
 		return valueDecoder.Error()
 	}
-	td := &TimeDecoder{}
+	td := timeDecoderPool.Get().(*TimeDecoder)
 	td.Init(tmsData)
 	p.segments = append(p.segments, Segment{
 		timeDecoder:  td,
@@ -209,33 +238,26 @@ func (p *PointDiskPack) Read() (int64, variant.Variant) {
 
 type PointCachePack struct {
 	currentIdx int
-	cacheTms   []int64
-	cacheValue []variant.Variant
+	points     []Point
 }
 
-func NewPointCachePack(cacheTms []int64, cacheValue []variant.Variant) PointPack {
+func NewPointCachePack(points []Point) PointPack {
 	return &PointCachePack{
-		cacheTms:   cacheTms,
-		cacheValue: cacheValue,
+		points: points,
 	}
 }
 
 func (p *PointCachePack) Reset() {
 	p.currentIdx = 0
-	p.cacheTms = nil
-	p.cacheValue = nil
+	p.points = nil
 }
 
-// Next Attempt to read the next timestamp and value, automatically switch to the next shard
 func (p *PointCachePack) Next() bool {
 	p.currentIdx++
-	if p.currentIdx >= len(p.cacheTms) {
-		return false
-	}
-	return true
+	return p.currentIdx < len(p.points)
 }
 
-// Read returns the current timestamp and value.
 func (p *PointCachePack) Read() (int64, variant.Variant) {
-	return p.cacheTms[p.currentIdx], p.cacheValue[p.currentIdx]
+	pt := p.points[p.currentIdx]
+	return pt.Tms, pt.V
 }

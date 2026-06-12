@@ -256,25 +256,18 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 }
 
 func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
-	// Read from WAL cache.
-	allTms, allValue, err := s.walFile.ReadByTime(code, startTime, endTime)
+	allPoints, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
-	if len(allTms) != len(allValue) {
-		return nil, ErrorWALDataMayBeDamaged
-	}
-	points := make([]Point, 0, len(allTms))
-	for i := range allTms {
-		condition, err := evalCond(allValue[i])
+	points := make([]Point, 0, len(allPoints))
+	for i := range allPoints {
+		condition, err := evalCond(allPoints[i].V)
 		if err != nil {
 			return nil, err
 		}
 		if condition {
-			points = append(points, Point{
-				Tms: allTms[i],
-				V:   allValue[i],
-			})
+			points = append(points, allPoints[i])
 		}
 	}
 	return points, nil
@@ -525,12 +518,12 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		return points, err
 	}
 
-	cacheTms, cacheVale, err := s.walFile.ReadByTime(code, startTime, endTime)
+	cachePoints, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
 
-	ps, err := slideFunc(NewPointCachePack(cacheTms, cacheVale))
+	ps, err := slideFunc(NewPointCachePack(cachePoints))
 	if err != nil {
 		return points, err
 	}

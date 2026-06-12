@@ -132,14 +132,18 @@ func (s *ssColumn) glowWrite(fileSegments *fileSegmentList) (bool, error) {
 	blockOffset := w.Size()
 	if s.tableInfo.Type != ColumnTypeStructure {
 		header.DataSize += 8
-		if err := binary.Write(w, binary.BigEndian, header); err != nil {
+		headerBuf := encodeSegmentHeader(header)
+		if _, err := w.Write(headerBuf[:]); err != nil {
 			return false, err
 		}
-		if err := binary.Write(w, binary.BigEndian, uint64(len(compressedValueData))); err != nil {
+		var lenBuf [8]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(compressedValueData)))
+		if _, err := w.Write(lenBuf[:]); err != nil {
 			return false, err
 		}
 	} else {
-		if err := binary.Write(w, binary.BigEndian, header); err != nil {
+		headerBuf := encodeSegmentHeader(header)
+		if _, err := w.Write(headerBuf[:]); err != nil {
 			return false, err
 		}
 	}

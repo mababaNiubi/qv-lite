@@ -77,7 +77,7 @@ type walFileEnty struct {
 // WalFile is the File-like interface for the write-ahead log cache.
 type WalFile interface {
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
-	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int64, []variant.Variant, error)
+	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
@@ -420,7 +420,7 @@ func (ws *walFile) NeedFlush() bool {
 	return len(ws.walFiles) > 1
 }
 
-func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int64, []variant.Variant, error) {
+func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
 	if ws.closeBuffer {
 		ws.mutex.RLock()
 		needFlush := len(ws.walFiles) > 0
@@ -466,16 +466,10 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int
 			})
 		}
 	}
-	tmsAll := make([]int64, len(entries))
-	tmsAllValue := make([]variant.Variant, len(entries))
 	if len(entries) > 0 {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Tms < entries[j].Tms })
-		for i := range entries {
-			tmsAll[i] = entries[i].Tms
-			tmsAllValue[i] = entries[i].V
-		}
 	}
-	return tmsAll, tmsAllValue, err
+	return entries, err
 }
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) error {

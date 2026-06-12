@@ -84,13 +84,15 @@ func (r *fileReader) NextRead(checkHead func(SegmentHeader) bool, tableInfo *Tab
 			}
 			r.needSeek = false
 		}
-		var header SegmentHeader
-		if err := binary.Read(r.bf, binary.BigEndian, &header); err != nil {
-			if err == io.EOF {
+		var headerBuf [segmentHeaderRawSize]byte
+		if _, err := io.ReadFull(r.bf, headerBuf[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil, nil, nil, nil
 			}
 			return nil, nil, nil, err
 		}
+		var header SegmentHeader
+		decodeSegmentHeader(headerBuf[:], &header)
 		if header.Attribute == 0 {
 			return nil, nil, nil, nil
 		}
@@ -153,10 +155,12 @@ func (r *fileReader) ReadAt(offset int64, tableInfo *TableInfo) (*SegmentHeader,
 		return nil, nil, nil, err
 	}
 
-	var header SegmentHeader
-	if err := binary.Read(r.bf, binary.BigEndian, &header); err != nil {
+	var headerBuf [segmentHeaderRawSize]byte
+	if _, err := io.ReadFull(r.bf, headerBuf[:]); err != nil {
 		return nil, nil, nil, err
 	}
+	var header SegmentHeader
+	decodeSegmentHeader(headerBuf[:], &header)
 	if header.Attribute == 0 {
 		return nil, nil, nil, nil
 	}

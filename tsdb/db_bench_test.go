@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"sync"
@@ -45,6 +47,9 @@ func openBenchDB(b *testing.B, dir string, walCacheSize int64) *DB {
 // 写入 86400 秒 * 1000 点/秒 = 86,400,000 个数据点，然后全量查询。
 // 使用 -benchtime=1x 确保只运行一次。
 func BenchmarkE2E_WriteAndQuery(b *testing.B) {
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
 	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
 	dir := benchDir(b)
 	tableName := "eu12"

@@ -1,10 +1,6 @@
 package tsdb
 
 import (
-	"encoding/json"
-	"github.com/mababaNiubi/qv-lite/container"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -12,18 +8,14 @@ import (
 )
 
 type tagCode uint32
-type meta struct {
-	MaxPointDict tagCode
-	PointDict    map[string]tagCode
-}
 
 type ssTable struct {
 	mute      sync.RWMutex
 	tableInfo TableInfo
 	dirPath   string // Table directory path.
-	meta
+	*Meta
 	fragmentation          fileSegmentList
-	columnMap              container.SyncMap[tagCode, *ssColumn]
+	columnMap              map[tagCode]*ssColumn
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
 	expirationMinuteTime   int64
@@ -37,11 +29,9 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		walConfig.MaxCacheSize = 1024 * 1024 * 64
 	}
 	s := &ssTable{
-		tableInfo: tableInfo,
-		dirPath:   dirPath,
-		meta: meta{
-			PointDict: make(map[string]tagCode),
-		},
+		tableInfo:              tableInfo,
+		dirPath:                dirPath,
+		columnMap:              make(map[tagCode]*ssColumn),
 		maxSegmentSize:         maxSegmentSize,
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
@@ -61,9 +51,12 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		return nil, err
 	}
 	// Handle file corruption caused by an abnormal interruption during writes.
-	err = s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
+	lastPoints, err := s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
 	if err != nil {
 		return nil, err
+	}
+	for k, lp := range lastPoints {
+		s.walFile.SetLastPoint(k, lp.Tms, lp.V)
 	}
 	return s, nil
 }
@@ -72,10 +65,8 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 	if s.walFile == nil {
 		return false, ErrorWALCacheIsNil
 	}
-	s.mute.RLock()
 	// Look up the column index.
-	code, ok := s.meta.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		var err error
 		code, err = s.CreateColumn(tag)
@@ -123,7 +114,7 @@ func (s *ssTable) flushCache() error {
 	// Track the position of the last successfully read entry for error recovery.
 	errIndex := 0
 	err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
-		column, ok := s.columnMap.Load(tag)
+		column, ok := s.columnMap[tag]
 		if !ok {
 			return true
 		}
@@ -155,10 +146,9 @@ func (s *ssTable) flushCache() error {
 	})
 	if err != nil || readErr != nil {
 		// Reset all encoder state.
-		s.columnMap.Range(func(tag tagCode, column *ssColumn) bool {
+		for _, column := range s.columnMap {
 			column.Reset()
-			return true
-		})
+		}
 		// Roll back all data segments.
 		errRollback := s.fragmentation.RollbackLastCommitTransaction()
 		if errRollback != nil {
@@ -175,21 +165,20 @@ func (s *ssTable) flushCache() error {
 		return err
 	}
 	// Flush remaining encoder data to disk.
-	s.columnMap.Range(func(tag tagCode, column *ssColumn) bool {
+	for _, column := range s.columnMap {
 		var needNewFile bool
 		needNewFile, err = column.glowWrite(&s.fragmentation)
 		if err != nil {
-			return false
+			break
 		}
 		if needNewFile {
 			_ = s.fragmentation.PersistLastIndex()
 			err = s.fragmentation.AddTransactionSegment()
 			if err != nil {
-				return false
+				break
 			}
 		}
-		return true
-	})
+	}
 	// Commit the data segments.
 	err = s.fragmentation.CommitTransactionFileSegment()
 	if err != nil {
@@ -208,19 +197,15 @@ func (s *ssTable) flushCache() error {
 func (s *ssTable) BuildColumn() error {
 	s.mute.Lock()
 	defer s.mute.Unlock()
-	metaFilePath := filepath.Join(s.dirPath, metaFile)
-	fileData, err := os.ReadFile(metaFilePath)
-	if err != nil && !os.IsNotExist(err) {
+	meta, err := NewMeta(s.dirPath)
+	if err != nil {
 		return err
 	}
-	if fileData != nil {
-		if err := json.Unmarshal(fileData, &s.meta); err != nil {
-			return err
-		}
-		for _, u := range s.meta.PointDict {
-			s.columnMap.Store(u, newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
-		}
-	}
+	s.Meta = meta
+	s.Meta.Range(func(k string, u tagCode) bool {
+		s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+		return true
+	})
 	return nil
 }
 
@@ -230,47 +215,29 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	}
 	s.mute.Lock()
 	defer s.mute.Unlock()
-	// Create the tag.
-	s.MaxPointDict += 1
-	s.PointDict[tag] = s.MaxPointDict
-	s.columnMap.Store(s.MaxPointDict, newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
-	// Persist metadata to disk.
-	marshal, err := json.Marshal(&s.meta)
+	pointDict, err := s.Meta.addTag(tag)
 	if err != nil {
 		return 0, err
 	}
-	create, err := os.Create(filepath.Join(s.dirPath, metaFile))
-	if err != nil {
-		return 0, err
-	}
-	defer create.Close()
-	_, err = create.Write(marshal)
-	if err != nil {
-		return 0, err
-	}
-	return s.MaxPointDict, nil
+	s.flushMute.Lock()
+	s.columnMap[s.MaxPointDict] = newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+	s.flushMute.Unlock()
+	return pointDict, nil
 }
 
-func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, cond any) ([]Point, error) {
-	// Read from WAL cache.
-	allTms, allValue, err := s.walFile.ReadByTime(code, startTime, endTime)
+func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
+	allPoints, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
-	if len(allTms) != len(allValue) {
-		return nil, ErrorWALDataMayBeDamaged
-	}
-	points := make([]Point, 0, len(allTms))
-	for i := range allTms {
-		condition, err := evalAnyCondition(cond, allValue[i])
+	points := make([]Point, 0, len(allPoints))
+	for i := range allPoints {
+		condition, err := evalCond(allPoints[i].V)
 		if err != nil {
 			return nil, err
 		}
 		if condition {
-			points = append(points, Point{
-				Tms: allTms[i],
-				V:   allValue[i],
-			})
+			points = append(points, allPoints[i])
 		}
 	}
 	return points, nil
@@ -333,9 +300,9 @@ func (s *ssTable) scanSegment(fs FileSegment, code tagCode, startTime, endTime i
 	}
 }
 
-func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond any) ([]Point, error) {
+func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
 	var points pointCollector
-	pack := NewPointPackImpl(s.tableInfo.Structure)
+	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
 	err := s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
 		if e := pack.AddSegment(compressedTimeData, compressedValueData); e != nil {
@@ -343,7 +310,7 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond a
 		}
 		for pack.Next() {
 			tms, value := pack.Read()
-			ok, e := evalAnyCondition(cond, value)
+			ok, e := evalCond(value)
 			if e != nil {
 				return e
 			}
@@ -358,16 +325,17 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, cond a
 
 func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([]Point, error) {
 	s.mute.RLock()
-	code, ok := s.PointDict[tag]
+	code, ok := s.Meta.Load(tag)
 	s.mute.RUnlock()
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	cachePoints, err := s.queryCache(code, startTime, endTime, cond)
+	evalCond := CompileCondition(cond)
+	cachePoints, err := s.queryCache(code, startTime, endTime, evalCond)
 	if err != nil {
 		return nil, err
 	}
-	disk, err := s.queryDisk(code, startTime, endTime, cond)
+	disk, err := s.queryDisk(code, startTime, endTime, evalCond)
 	if err != nil {
 		return nil, err
 	}
@@ -382,9 +350,7 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 
 // QueryLatest returns the most recent data point for the specified tag.
 func (s *ssTable) QueryLatest(tag string) (*Point, error) {
-	s.mute.RLock()
-	code, ok := s.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
@@ -411,17 +377,17 @@ func isNumericType(v variant.Variant) bool {
 // QueryLimitNumber queries data for a tag within a time range, limited to maxNumber points.
 // fusion controls aggregation: 0=avg, 1=min, 2=max.
 func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, maxNumber int64, fusion uint8, cond any) ([]Point, error) {
-	s.mute.RLock()
-	code, ok := s.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	var interval = (endTime - startTime) / maxNumber
-	if interval <= 0 {
-		return s.Query(tag, startTime, endTime, cond)
+	tms, _, ok := s.walFile.GetTagMaxTimestamp(code)
+	if ok {
+		endTime = min(endTime, tms)
 	}
+	var interval = (endTime - startTime) / maxNumber
 
+	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()
 	var targetTms, count, lastTms, pointsLen int64
 	var windowNumeric bool
@@ -442,22 +408,23 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		fgPoints := make([]Point, 0, 100)
 		for pack.Next() {
 			tms, v := pack.Read()
+			condition, err := evalCond(v)
+			if err != nil {
+				return nil, err
+			}
+			if !condition {
+				continue
+			}
 			if lastTms == 0 {
 				resetWindow(tms, v)
 				continue
 			}
-			if tms-lastTms > interval {
-				condition, err := evalAnyCondition(cond, v)
-				if err != nil {
-					return nil, err
-				}
-				if condition {
-					fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
-					resetWindow(tms, v)
-					pointsLen++
-					if pointsLen >= maxNumber-1 {
-						return fgPoints, nil
-					}
+			if tms-lastTms >= interval {
+				fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
+				resetWindow(tms, v)
+				pointsLen++
+				if pointsLen >= maxNumber-1 {
+					return fgPoints, nil
 				}
 				continue
 			}
@@ -494,10 +461,12 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 				}
 			}
 		}
+
 		return fgPoints, nil
 	}
+
 	var err error
-	pack := NewPointPackImpl(s.tableInfo.Structure)
+	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
 	points := make([]Point, 0, maxNumber)
 	err = s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
@@ -514,30 +483,22 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 	if err != nil {
 		return points, err
 	}
-	// Read data from cache.
-	pack.Reset()
-	cacheTms, cacheVale, err := s.walFile.ReadByTime(code, startTime, endTime)
+
+	cachePoints, err := s.walFile.ReadByTime(code, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
-	pack.AddCacheSegment(cacheTms, cacheVale)
-	ps, err := slideFunc(pack)
+
+	ps, err := slideFunc(NewPointCachePack(cachePoints))
 	if err != nil {
 		return points, err
 	}
 	points = append(points, ps...)
-	// Handle the last data point.
 	if lastTms != 0 {
-		condition, err := evalAnyCondition(cond, targetValue)
-		if err != nil {
-			return points, err
-		}
-		if condition {
-			points = append(points, Point{
-				Tms: targetTms,
-				V:   targetValue,
-			})
-		}
+		points = append(points, Point{
+			Tms: targetTms,
+			V:   targetValue,
+		})
 	}
 	return points, err
 }

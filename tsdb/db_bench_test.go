@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"sync"
@@ -45,6 +47,9 @@ func openBenchDB(b *testing.B, dir string, walCacheSize int64) *DB {
 // 写入 86400 秒 * 1000 点/秒 = 86,400,000 个数据点，然后全量查询。
 // 使用 -benchtime=1x 确保只运行一次。
 func BenchmarkE2E_WriteAndQuery(b *testing.B) {
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
 	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
 	dir := benchDir(b)
 	tableName := "eu12"
@@ -71,12 +76,13 @@ func BenchmarkE2E_WriteAndQuery(b *testing.B) {
 	writeElapsed := time.Since(writeStart)
 	// 查询阶段
 	queryStart := time.Now()
-	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
+	//all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
+	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
-	if len(all) != 0 {
-		b.Log(all[0], all[len(all)-1])
+	if len(all) >= 2 {
+		b.Log(all[0], all[len(all)-1], all[len(all)-2])
 	}
 	queryElapsed := time.Since(queryStart)
 	_ = db.Close()
@@ -106,7 +112,7 @@ func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
 	baseTime := writeStart.UnixNano()
 	for i := 0; i < totalPoints; i++ {
 		mp := make(map[string]any)
-		mp["value"] = float64(123) + float64(i)*0.01
+		mp["value"] = float64(i) * 0.01
 		mp["tag"] = fmt.Sprintf("AX%v", i)
 		_, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond), variant.New(mp))
 		if err != nil {
@@ -116,7 +122,7 @@ func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
 	writeElapsed := time.Since(writeStart)
 	// 查询阶段
 	queryStart := time.Now()
-	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, LogicalCondition{
+	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, LogicalCondition{
 		Op: LogicalAnd,
 		Cond: []any{
 			Condition{
@@ -133,6 +139,9 @@ func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
 	})
 	if err != nil {
 		b.Fatal(err)
+	}
+	if len(all) >= 2 {
+		b.Log(all[0], all[1], all[len(all)-1], all[len(all)-2])
 	}
 	queryElapsed := time.Since(queryStart)
 	_ = db.Close()

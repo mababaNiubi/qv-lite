@@ -77,8 +77,9 @@ type walFileEnty struct {
 // WalFile is the File-like interface for the write-ahead log cache.
 type WalFile interface {
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
-	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int64, []variant.Variant, error)
+	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
+	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
 	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) error
@@ -88,12 +89,12 @@ type WalFile interface {
 }
 
 type walFile struct {
-	mutex           sync.RWMutex
+	mutex           sync.Mutex
 	walFiles        []walFileEnty
 	tagMaxTimestamp map[tagCode]int64
 	tagLastValue    map[tagCode]variant.Variant
 
-	writefile   *os.File
+	writeFile   *os.File
 	writeBuffer *bufio.Writer
 
 	filePath        string
@@ -156,7 +157,7 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 	}
 
 	wls := &walFile{
-		writefile:       file,
+		writeFile:       file,
 		writeBuffer:     bufio.NewWriter(file),
 		walFiles:        walFiles,
 		tagMaxTimestamp: tagMaxTimestamp,
@@ -173,7 +174,7 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
-	if ws.writefile == nil || ws.writeBuffer == nil {
+	if ws.writeFile == nil || ws.writeBuffer == nil {
 		return false, 0, ErrorWALClose
 	}
 
@@ -191,7 +192,7 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 		if ok && timestamp < maxTimestamp {
 			return false, 0, ErrorWALClose
 		}
-		if ws.skipDedup(key, timestamp, value, false) {
+		if ws.skipDedup(key, timestamp, value) {
 			return false, 0, nil
 		}
 
@@ -269,7 +270,7 @@ func (ws *walFile) flushPending() error {
 	for i := range chunk {
 		e := &chunk[i]
 
-		if ws.skipDedup(e.Key, e.Timestamp, e.Value, false) {
+		if ws.skipDedup(e.Key, e.Timestamp, e.Value) {
 			continue
 		}
 
@@ -326,16 +327,13 @@ func appendSerialized(dst []byte, key tagCode, timestamp int64, value variant.Va
 
 // skipDedup returns true if the entry should be skipped due to minIntervalMs
 // or dedupWindowMs. For normal (batched) mode, only checks when ts >= prevTs.
-func (ws *walFile) skipDedup(key tagCode, ts int64, value variant.Variant, requireOrder bool) bool {
+func (ws *walFile) skipDedup(key tagCode, ts int64, value variant.Variant) bool {
 	prevTs, ok := ws.tagMaxTimestamp[key]
 	if !ok {
 		return false
 	}
-	if requireOrder && ts < prevTs {
-		return false
-	}
 	if ts < prevTs {
-		return false
+		return true
 	}
 	if ws.minIntervalMs > 0 && ts-prevTs < ws.minIntervalMs {
 		return true
@@ -369,8 +367,8 @@ func (ws *walFile) FlushPending() error {
 }
 
 func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool) {
-	ws.mutex.RLock()
-	defer ws.mutex.RUnlock()
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 
 	maxTs, ok := ws.tagMaxTimestamp[key]
 	maxVal := ws.tagLastValue[key]
@@ -393,6 +391,15 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 	return maxTs, maxVal, true
 }
 
+func (ws *walFile) SetLastPoint(key tagCode, ts int64, value variant.Variant) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+	if lp, ok := ws.tagMaxTimestamp[key]; !ok || ts > lp {
+		ws.tagMaxTimestamp[key] = ts
+		ws.tagLastValue[key] = value
+	}
+}
+
 func (ws *walFile) addWalFile() error {
 	tm := time.Now().UnixNano()
 	fileName := filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
@@ -400,7 +407,7 @@ func (ws *walFile) addWalFile() error {
 	if err != nil {
 		return err
 	}
-	err = ws.writefile.Close()
+	err = ws.writeFile.Close()
 	if err != nil {
 		return err
 	}
@@ -409,7 +416,7 @@ func (ws *walFile) addWalFile() error {
 		length:     0,
 		readBuffer: newWalReadBuffer(ws.maxWalBatchSize),
 	})
-	ws.writefile = file
+	ws.writeFile = file
 	ws.writeBuffer.Reset(file)
 	return err
 }
@@ -418,22 +425,18 @@ func (ws *walFile) NeedFlush() bool {
 	return len(ws.walFiles) > 1
 }
 
-func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int64, []variant.Variant, error) {
-	if ws.closeBuffer {
-		ws.mutex.RLock()
-		needFlush := len(ws.walFiles) > 0
-		ws.mutex.RUnlock()
-		if needFlush {
-			ws.mutex.Lock()
-			_ = ws.flushPending()
-			if ws.writeBuffer != nil {
-				_ = ws.writeBuffer.Flush()
-			}
-			ws.mutex.Unlock()
+func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
+	if ws.closeBuffer && len(ws.walFiles) > 0 {
+		ws.mutex.Lock()
+		_ = ws.flushPending()
+		if ws.writeBuffer != nil {
+			_ = ws.writeBuffer.Flush()
 		}
+		ws.mutex.Unlock()
 	}
 
-	ws.mutex.RLock()
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	estCap := 512
 	if !ws.closeBuffer {
 		total := 0
@@ -444,7 +447,6 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int
 			estCap = total
 		}
 	}
-	defer ws.mutex.RUnlock()
 	var err error
 	entries := make([]Point, 0, estCap)
 	for i := range ws.walFiles {
@@ -464,16 +466,10 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]int
 			})
 		}
 	}
-	tmsAll := make([]int64, len(entries))
-	tmsAllValue := make([]variant.Variant, len(entries))
 	if len(entries) > 0 {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Tms < entries[j].Tms })
-		for i := range entries {
-			tmsAll[i] = entries[i].Tms
-			tmsAllValue[i] = entries[i].V
-		}
 	}
-	return tmsAll, tmsAllValue, err
+	return entries, err
 }
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) error {
@@ -502,7 +498,7 @@ func (ws *walFile) retainWalFilePrefix(index int, truncateSize int64) error {
 		if err != nil {
 			return err
 		}
-		err = ws.writefile.Truncate(truncateSize)
+		err = ws.writeFile.Truncate(truncateSize)
 		if err != nil {
 			return err
 		}
@@ -528,7 +524,7 @@ func (ws *walFile) Close() error {
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 
-	if ws.writefile == nil {
+	if ws.writeFile == nil {
 		return nil
 	}
 	if err := ws.flushPending(); err != nil {
@@ -537,11 +533,11 @@ func (ws *walFile) Close() error {
 	if err := ws.writeBuffer.Flush(); err != nil {
 		return err
 	}
-	err := ws.writefile.Close()
+	err := ws.writeFile.Close()
 	if err != nil {
 		return err
 	}
-	ws.writefile = nil
+	ws.writeFile = nil
 	return err
 }
 

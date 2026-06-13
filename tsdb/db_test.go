@@ -352,6 +352,109 @@ func TestDB_Query_WithUnsortedWAL(t *testing.T) {
 	}
 }
 
+func TestDB_ColumnQuery_WhyNot10000(t *testing.T) {
+	// 模拟 BenchmarkE2E_WriteAndColumnQuery 的简化版本
+	// 写入 20000 条 column 数据，每条带 value 列，然后测试查询为什么不能返回期望条数
+	db, err := Open(Config{
+		Path:           tempDir(t),
+		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		MaxStorageTime: 24 * 60 * 60 * 365,
+	}, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: "test_col", FloatPrecision: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const totalPoints = 20000
+	baseTime := time.Now().UnixNano()
+
+	// 写入：每条数据是一个 map，包含 value 和 tag 字段
+	for i := 0; i < totalPoints; i++ {
+		mp := make(map[string]any)
+		mp["value"] = float64(i)
+		mp["name"] = "sensor_" + strconv.Itoa(i%100)
+		_, err := db.Write("test_col", "tag1", baseTime+int64(i)*int64(time.Second), variant.New(mp))
+		if err != nil {
+			t.Fatalf("write %d failed: %v", i, err)
+		}
+	}
+
+	t.Logf("===== 写入 %d 条数据完成 =====", totalPoints)
+
+	// 测试1：无条件的全量查询 — 期望返回所有 20000 条，但 maxNumber 默认为 10000
+	points1, err := db.Query("test_col", "tag1",
+		baseTime, baseTime+int64(totalPoints)*int64(time.Second), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试1 (无条件, maxNumber=0→10000, fusion=1): 返回 %d 条", len(points1))
+
+	// 测试2：指定大 maxNumber
+	points2, err := db.Query("test_col", "tag1",
+		baseTime, baseTime+int64(totalPoints)*int64(time.Second), 30000, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试2 (无条件, maxNumber=30000, fusion=1): 返回 %d 条", len(points2))
+
+	// 测试3：用 QueryAll 直接查询
+	points3, err := db.QueryAll("test_col", "tag1",
+		baseTime, baseTime+int64(totalPoints)*int64(time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试3 (QueryAll 无条件): 返回 %d 条", len(points3))
+
+	// 测试4：列条件查询 — 参考 BenchmarkE2E_WriteAndColumnQuery
+	// value > 5000 AND value < 15000 (预期有 9999 条匹配)
+	points4, err := db.Query("test_col", "tag1",
+		baseTime, baseTime+int64(totalPoints)*int64(time.Second), 0, 1,
+		LogicalCondition{
+			Op: LogicalAnd,
+			Cond: []any{
+				Condition{ColumnAttributeName: "value", Operator: OpGreaterThan, Value: variant.NewInt64(5000)},
+				Condition{ColumnAttributeName: "value", Operator: OpLessThan, Value: variant.NewInt64(15000)},
+			},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试4 (value>5000 AND value<15000, maxNumber=0): 返回 %d 条 (预期约9999)", len(points4))
+
+	// 测试5：缩小查询时间范围，绕过 QueryLimitNumber
+	// db.Query 中：如果 endTime-startTime <= 3600000ns，直接用 Query (不限制)
+	// 但这要求时间范围极小，不实用
+	points5, err := db.Query("test_col", "tag1",
+		baseTime+5000*int64(time.Second), baseTime+15000*int64(time.Second), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试5 (无条件, 时间范围10s, 绕过QueryLimitNumber): 返回 %d 条", len(points5))
+
+	// 测试6：使用不带条件的列查询 + 大 maxNumber
+	points6, err := db.Query("test_col", "tag1",
+		baseTime+5000*int64(time.Second), baseTime+15000*int64(time.Second), 10001, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试6 (无条件, 时间范围10s, maxNumber=10001): 返回 %d 条", len(points6))
+
+	// 测试7：使用 avg 聚合（fusion=0）
+	points7, err := db.Query("test_col", "tag1",
+		baseTime, baseTime+int64(totalPoints)*int64(time.Second), 0, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("测试7 (无条件, maxNumber=0→10000, fusion=0 avg): 返回 %d 条", len(points7))
+}
+
 func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),

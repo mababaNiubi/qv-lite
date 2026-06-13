@@ -1,11 +1,9 @@
 package tsdb
 
 import (
-	"bytes"
 	"math"
 	"math/bits"
 
-	"github.com/dgryski/go-bitstream"
 	"github.com/mababaNiubi/variant"
 )
 
@@ -49,6 +47,7 @@ func NewFloatEncoder(decimalQuantity uint8) Encoder {
 	}
 	return &ZFloatEncoder{
 		decimalQuantity: decimalQuantity,
+		scale:           math.Pow(10, float64(decimalQuantity)),
 	}
 }
 
@@ -75,6 +74,7 @@ func (s *ZeroFloatPrecisionEncoder) Write(value variant.Variant) bool {
 func (s *ZeroFloatPrecisionEncoder) Bytes() ([]byte, error) {
 	s.ZFloatEncoder.Reset()
 	s.ZFloatEncoder.decimalQuantity = s.decimalQuantity
+	s.scale = math.Pow(10, float64(s.decimalQuantity))
 	for i := range s.fls {
 		s.ZFloatEncoder.Write(s.fls[i])
 	}
@@ -124,20 +124,23 @@ type ZFloatEncoder struct {
 	val float64
 	err error
 
-	buf             bytes.Buffer
-	bw              *bitstream.BitWriter
+	//buf             bytes.Buffer
+	bw              BitWriter
 	decimalQuantity uint8
-
-	hasFirst bool
-	finished bool
+	scale           float64
+	hasFirst        bool
+	finished        bool
 }
 
 func (s *ZFloatEncoder) Bytes() ([]byte, error) {
 	if !s.finished {
 		s.finished = true
-		s.bw.Flush(bitstream.Zero)
+		err := s.bw.Flush(false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return s.buf.Bytes(), s.err
+	return s.bw.Bytes(), s.err
 }
 
 func (s *ZFloatEncoder) Write(value variant.Variant) bool {
@@ -157,14 +160,21 @@ func (s *ZFloatEncoder) Write(value variant.Variant) bool {
 		s.err = ErrorUnsupportedInf
 		return true
 	}
-	// Round before computing XOR delta so encoder and decoder stay symmetric.
-	vr := round(v, int(s.decimalQuantity))
+	//Round before computing XOR delta so encoder and decoder stay symmetric.
+	vr := round(v, s.scale)
 	if !s.hasFirst {
-		if s.bw == nil {
-			s.bw = bitstream.NewWriter(&s.buf)
+		//if s.bw == nil {
+		//	s.bw = bitstream.NewWriter(&s.buf)
+		//}
+		s.bw.Reset()
+		err = s.bw.WriteByte(floatCompressedXDMI)
+		if err != nil {
+			s.err = err
 		}
-		s.buf.WriteByte(floatCompressedXDMI)
-		s.err = s.bw.WriteBits(uint64(s.decimalQuantity), 5)
+		err = s.bw.WriteBits(uint64(s.decimalQuantity), 5)
+		if err != nil {
+			s.err = err
+		}
 		s.val = vr
 		s.hasFirst = true
 		err = s.bw.WriteBits(math.Float64bits(vr), 64)
@@ -224,11 +234,12 @@ func (s *ZFloatEncoder) Write(value variant.Variant) bool {
 func (s *ZFloatEncoder) Reset() {
 	s.val = 0
 	s.err = nil
-	s.buf.Reset()
-	if s.bw == nil {
-		s.bw = bitstream.NewWriter(&s.buf)
-	}
-	s.bw.Resume(0x0, 8)
+	//s.buf.Reset()
+	//if s.bw == nil {
+	//	s.bw = bitstream.NewWriter(&s.buf)
+	//}
+	//s.bw.Resume(0x0, 8)
+	s.bw.Reset()
 	s.finished = false
 	s.hasFirst = false
 	s.decimalQuantity = 0
@@ -390,12 +401,8 @@ func (it *FloatDecoder) roundBits(x uint64) uint64 {
 // round rounds num to n decimal places (n >= 0) using ceiling rounding.
 // A tiny epsilon is subtracted before Ceil to prevent overshoot when the
 // reconstructed value lands just above the exact decimal boundary.
-func round(num float64, n int) float64 {
-	if n < 0 {
-		return num
-	}
-	scale := math.Pow(10, float64(n))
-	if math.IsInf(scale, 1) {
+func round(num float64, scale float64) float64 {
+	if scale == 0 || math.IsInf(scale, 1) {
 		return num
 	}
 	product := num * scale

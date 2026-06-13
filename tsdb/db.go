@@ -3,10 +3,11 @@ package tsdb
 import (
 	"context"
 	"encoding/json"
-	"github.com/mababaNiubi/qv-lite/container"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/mababaNiubi/qv-lite/container"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -201,26 +202,20 @@ func (db *DB) Close() error {
 	return nil
 }
 
-func (db *DB) check(timestamp int64, value variant.Variant) error {
+// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
+// An empty tableName writes to the default table, which is auto-created on first use.
+func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
 	if value.IsEmpty() {
-		return ErrorValueIsEmpty
+		return false, ErrorValueIsEmpty
 	}
 	if db.MaxStorageTime != 0 {
 		// Reject data with timestamps too far beyond the current time.
 		if time.Now().UnixNano()+db.MaxStorageTime*int64(time.Second) < timestamp {
-			return ErrorTimeOut
+			return false, ErrorTimeOut
 		}
 	}
-	return nil
-}
 
-// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
-// An empty tableName writes to the default table, which is auto-created on first use.
-func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
 	tableName = db.resolveTableName(tableName)
-	if err := db.check(timestamp, value); err != nil {
-		return false, err
-	}
 	table, ok := db.ssTables.Load(tableName)
 	if !ok {
 		if tableName == DefaultTableName {
@@ -250,7 +245,7 @@ func (db *DB) Query(tableName string, tag string, startTime int64, endTime int64
 		maxNumber = 10000
 	}
 	// For queries spanning less than 1 hour, read all data directly.
-	if endTime-startTime > int64(time.Hour/time.Millisecond) {
+	if endTime-startTime > int64(time.Hour) {
 		return table.QueryLimitNumber(tag, startTime, endTime, maxNumber, polymerization, cond)
 	}
 	return table.Query(tag, startTime, endTime, cond)

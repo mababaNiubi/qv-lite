@@ -1,9 +1,6 @@
 package tsdb
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -11,16 +8,12 @@ import (
 )
 
 type tagCode uint32
-type meta struct {
-	MaxPointDict tagCode
-	PointDict    map[string]tagCode
-}
 
 type ssTable struct {
 	mute      sync.RWMutex
 	tableInfo TableInfo
 	dirPath   string // Table directory path.
-	meta
+	*Meta
 	fragmentation          fileSegmentList
 	columnMap              map[tagCode]*ssColumn
 	maxSegmentSize         int64
@@ -36,11 +29,8 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		walConfig.MaxCacheSize = 1024 * 1024 * 64
 	}
 	s := &ssTable{
-		tableInfo: tableInfo,
-		dirPath:   dirPath,
-		meta: meta{
-			PointDict: make(map[string]tagCode),
-		},
+		tableInfo:              tableInfo,
+		dirPath:                dirPath,
 		columnMap:              make(map[tagCode]*ssColumn),
 		maxSegmentSize:         maxSegmentSize,
 		expirationMinuteTime:   expirationMinuteTime,
@@ -75,10 +65,8 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 	if s.walFile == nil {
 		return false, ErrorWALCacheIsNil
 	}
-	s.mute.RLock()
 	// Look up the column index.
-	code, ok := s.meta.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		var err error
 		code, err = s.CreateColumn(tag)
@@ -209,19 +197,15 @@ func (s *ssTable) flushCache() error {
 func (s *ssTable) BuildColumn() error {
 	s.mute.Lock()
 	defer s.mute.Unlock()
-	metaFilePath := filepath.Join(s.dirPath, metaFile)
-	fileData, err := os.ReadFile(metaFilePath)
-	if err != nil && !os.IsNotExist(err) {
+	meta, err := NewMeta(s.dirPath)
+	if err != nil {
 		return err
 	}
-	if fileData != nil {
-		if err := json.Unmarshal(fileData, &s.meta); err != nil {
-			return err
-		}
-		for _, u := range s.meta.PointDict {
-			s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
-		}
-	}
+	s.Meta = meta
+	s.Meta.Range(func(k string, u tagCode) bool {
+		s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+		return true
+	})
 	return nil
 }
 
@@ -231,27 +215,14 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	}
 	s.mute.Lock()
 	defer s.mute.Unlock()
-	// Create the tag.
-	s.MaxPointDict += 1
-	s.PointDict[tag] = s.MaxPointDict
+	pointDict, err := s.Meta.addTag(tag)
+	if err != nil {
+		return 0, err
+	}
 	s.flushMute.Lock()
 	s.columnMap[s.MaxPointDict] = newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
 	s.flushMute.Unlock()
-	// Persist metadata to disk.
-	marshal, err := json.Marshal(&s.meta)
-	if err != nil {
-		return 0, err
-	}
-	create, err := os.Create(filepath.Join(s.dirPath, metaFile))
-	if err != nil {
-		return 0, err
-	}
-	defer create.Close()
-	_, err = create.Write(marshal)
-	if err != nil {
-		return 0, err
-	}
-	return s.MaxPointDict, nil
+	return pointDict, nil
 }
 
 func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
@@ -354,7 +325,7 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCo
 
 func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([]Point, error) {
 	s.mute.RLock()
-	code, ok := s.PointDict[tag]
+	code, ok := s.Meta.Load(tag)
 	s.mute.RUnlock()
 	if !ok {
 		return nil, ErrorTagNotFound
@@ -379,9 +350,7 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 
 // QueryLatest returns the most recent data point for the specified tag.
 func (s *ssTable) QueryLatest(tag string) (*Point, error) {
-	s.mute.RLock()
-	code, ok := s.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
@@ -408,9 +377,7 @@ func isNumericType(v variant.Variant) bool {
 // QueryLimitNumber queries data for a tag within a time range, limited to maxNumber points.
 // fusion controls aggregation: 0=avg, 1=min, 2=max.
 func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, maxNumber int64, fusion uint8, cond any) ([]Point, error) {
-	s.mute.RLock()
-	code, ok := s.PointDict[tag]
-	s.mute.RUnlock()
+	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
 	}

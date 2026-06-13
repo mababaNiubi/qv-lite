@@ -363,13 +363,3 @@ The basic unit written by column encoders. Multiple logical blocks are concatena
 
 Each field within a struct is independently encoded using its own type-specific compressor, then concatenated. The marker identifies whether the schema is fixed (pre-registered) or adaptive (auto-discovered from Maps).
 
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `github.com/mababaNiubi/variant` | Dynamic type system for value representations |
-| `github.com/golang/snappy` | Snappy compression for strings and block files |
-| `github.com/jwilder/encoding/simple8b` | Simple-8b packing for integers and timestamps |
-| `github.com/dgryski/go-bitstream` | Bit-level I/O for float compression |
-| `github.com/pierrec/lz4/v4` | LZ4 compression for JSON and block files |
-| `github.com/klauspost/compress/zstd` | Zstd compression for block files |

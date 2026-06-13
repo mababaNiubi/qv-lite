@@ -360,14 +360,3 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 ```
 
 结构体的每个字段使用各自类型对应的压缩器独立编码后拼接。Marker 标记区分固定结构体（预注册列）和自适应结构体（运行时自动发现 Map 中的列）。
-
-## 依赖
-
-| 包 | 用途 |
-|---|------|
-| `github.com/mababaNiubi/variant` | 动态类型系统，用于值表示 |
-| `github.com/golang/snappy` | Snappy 压缩（字符串、块文件） |
-| `github.com/jwilder/encoding/simple8b` | 整数/时间戳的 simple8b 编码 |
-| `github.com/dgryski/go-bitstream` | 位级读写（浮点数压缩） |
-| `github.com/pierrec/lz4/v4` | LZ4 压缩（JSON、块文件） |
-| `github.com/klauspost/compress/zstd` | Zstd 压缩（块文件） |

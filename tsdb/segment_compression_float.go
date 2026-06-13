@@ -1,11 +1,9 @@
 package tsdb
 
 import (
-	"bytes"
 	"math"
 	"math/bits"
 
-	"github.com/dgryski/go-bitstream"
 	"github.com/mababaNiubi/variant"
 )
 
@@ -126,8 +124,8 @@ type ZFloatEncoder struct {
 	val float64
 	err error
 
-	buf             bytes.Buffer
-	bw              *bitstream.BitWriter
+	//buf             bytes.Buffer
+	bw              BitWriter
 	decimalQuantity uint8
 	scale           float64
 	hasFirst        bool
@@ -137,9 +135,12 @@ type ZFloatEncoder struct {
 func (s *ZFloatEncoder) Bytes() ([]byte, error) {
 	if !s.finished {
 		s.finished = true
-		s.bw.Flush(bitstream.Zero)
+		err := s.bw.Flush(false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return s.buf.Bytes(), s.err
+	return s.bw.Bytes(), s.err
 }
 
 func (s *ZFloatEncoder) Write(value variant.Variant) bool {
@@ -162,11 +163,18 @@ func (s *ZFloatEncoder) Write(value variant.Variant) bool {
 	//Round before computing XOR delta so encoder and decoder stay symmetric.
 	vr := round(v, s.scale)
 	if !s.hasFirst {
-		if s.bw == nil {
-			s.bw = bitstream.NewWriter(&s.buf)
+		//if s.bw == nil {
+		//	s.bw = bitstream.NewWriter(&s.buf)
+		//}
+		s.bw.Reset()
+		err = s.bw.WriteByte(floatCompressedXDMI)
+		if err != nil {
+			s.err = err
 		}
-		s.buf.WriteByte(floatCompressedXDMI)
-		s.err = s.bw.WriteBits(uint64(s.decimalQuantity), 5)
+		err = s.bw.WriteBits(uint64(s.decimalQuantity), 5)
+		if err != nil {
+			s.err = err
+		}
 		s.val = vr
 		s.hasFirst = true
 		err = s.bw.WriteBits(math.Float64bits(vr), 64)
@@ -226,11 +234,12 @@ func (s *ZFloatEncoder) Write(value variant.Variant) bool {
 func (s *ZFloatEncoder) Reset() {
 	s.val = 0
 	s.err = nil
-	s.buf.Reset()
-	if s.bw == nil {
-		s.bw = bitstream.NewWriter(&s.buf)
-	}
-	s.bw.Resume(0x0, 8)
+	//s.buf.Reset()
+	//if s.bw == nil {
+	//	s.bw = bitstream.NewWriter(&s.buf)
+	//}
+	//s.bw.Resume(0x0, 8)
+	s.bw.Reset()
 	s.finished = false
 	s.hasFirst = false
 	s.decimalQuantity = 0

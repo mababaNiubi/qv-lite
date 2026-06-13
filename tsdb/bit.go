@@ -1,6 +1,9 @@
 package tsdb
 
-import "io"
+import (
+	"errors"
+	"io"
+)
 
 // Ported from InfluxDB.
 // BitReader reads bits from an io.Reader.
@@ -84,6 +87,11 @@ func (r *BitReader) ReadBits(nbits uint) (uint64, error) {
 	r.buf.v, r.buf.n = 0, 0
 	r.readBuf()
 
+	// If no data left and we don't have enough bits, report EOF.
+	if r.buf.n == 0 && n < nbits {
+		return 0, io.EOF
+	}
+
 	// Append new buffer to previous buffer and shift to remove unnecessary bits.
 	v |= r.buf.v >> n
 	v >>= 64 - nbits
@@ -131,4 +139,127 @@ func (r *BitReader) readBuf() {
 
 	// Move data forward.
 	r.data = r.data[byteN:]
+}
+
+type BitWriter struct {
+	data  []byte
+	b     byte
+	count uint8
+	pos   int
+}
+
+func (b *BitWriter) WriteBits(u uint64, nbits int) error {
+	u <<= (64 - uint(nbits))
+	for nbits >= 8 {
+		byt := byte(u >> 56)
+		err := b.WriteByte(byt)
+		if err != nil {
+			return err
+		}
+		u <<= 8
+		nbits -= 8
+	}
+
+	for nbits > 0 {
+		err := b.WriteBit((u >> 63) == 1)
+		if err != nil {
+			return err
+		}
+		u <<= 1
+		nbits--
+	}
+
+	return nil
+}
+
+// WriteBit writes a single bit to the stream, writing a new byte to 'w' if required.
+func (b *BitWriter) WriteBit(bit bool) error {
+
+	if bit {
+		b.b |= 1 << (b.count - 1)
+	}
+
+	b.count--
+
+	if b.count == 0 {
+		if err := b.append(); err != nil {
+			return err
+		}
+		b.b = 0
+		b.count = 8
+	}
+
+	return nil
+}
+
+// WriteByte writes a single byte to the stream, regardless of alignment
+func (b *BitWriter) WriteByte(byt byte) error {
+
+	// fill up b.b with b.count bits from byt
+	b.b |= byt >> (8 - b.count)
+	if err := b.append(); err != nil {
+		return err
+	}
+	b.b = byt << b.count
+
+	return nil
+}
+
+const maxInt = int(^uint(0) >> 1)
+
+func (b *BitWriter) append() error {
+	if b.data == nil {
+		b.data = make([]byte, 1, 64)
+		b.data[0] = b.b
+		b.pos = 1
+		return nil
+	}
+	c := cap(b.data)
+	if c > maxInt-c-1 {
+		return errors.New("bytes.Buffer: too large")
+	}
+	if b.pos >= c {
+		newCap := c * 2
+		if newCap == 0 {
+			newCap = 64
+		}
+		newData := make([]byte, b.pos, newCap)
+		copy(newData, b.data)
+		b.data = newData
+	}
+	b.data = b.data[:b.pos+1]
+	b.data[b.pos] = b.b
+	b.pos++
+	return nil
+}
+
+// NewBitWriter returns a new BitWriter ready for writing.
+func NewBitWriter() *BitWriter {
+	var bw BitWriter
+	bw.Reset()
+	return &bw
+}
+
+func (b *BitWriter) Reset() {
+	b.b = 0x0
+	b.count = 8
+	b.data = b.data[:0]
+	b.pos = 0
+}
+
+func (b *BitWriter) Bytes() []byte {
+	return b.data
+}
+
+// Flush empties the currently in-process byte by filling it with 'bit'.
+func (b *BitWriter) Flush(bit bool) error {
+
+	for b.count != 8 {
+		err := b.WriteBit(bit)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

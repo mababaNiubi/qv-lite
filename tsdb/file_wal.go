@@ -89,9 +89,8 @@ type WalFile interface {
 }
 
 type walFile struct {
-	mutex    sync.RWMutex
-	walFiles []walFileEnty
-	//lastPoint map[tagCode]Point
+	mutex           sync.Mutex
+	walFiles        []walFileEnty
 	tagMaxTimestamp map[tagCode]int64
 	tagLastValue    map[tagCode]variant.Variant
 
@@ -368,8 +367,8 @@ func (ws *walFile) FlushPending() error {
 }
 
 func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool) {
-	ws.mutex.RLock()
-	defer ws.mutex.RUnlock()
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 
 	maxTs, ok := ws.tagMaxTimestamp[key]
 	maxVal := ws.tagLastValue[key]
@@ -427,21 +426,17 @@ func (ws *walFile) NeedFlush() bool {
 }
 
 func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
-	if ws.closeBuffer {
-		ws.mutex.RLock()
-		needFlush := len(ws.walFiles) > 0
-		ws.mutex.RUnlock()
-		if needFlush {
-			ws.mutex.Lock()
-			_ = ws.flushPending()
-			if ws.writeBuffer != nil {
-				_ = ws.writeBuffer.Flush()
-			}
-			ws.mutex.Unlock()
+	if ws.closeBuffer && len(ws.walFiles) > 0 {
+		ws.mutex.Lock()
+		_ = ws.flushPending()
+		if ws.writeBuffer != nil {
+			_ = ws.writeBuffer.Flush()
 		}
+		ws.mutex.Unlock()
 	}
 
-	ws.mutex.RLock()
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	estCap := 512
 	if !ws.closeBuffer {
 		total := 0
@@ -452,7 +447,6 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 			estCap = total
 		}
 	}
-	defer ws.mutex.RUnlock()
 	var err error
 	entries := make([]Point, 0, estCap)
 	for i := range ws.walFiles {

@@ -28,8 +28,10 @@ func benchDir(b *testing.B) string {
 
 func openBenchDB(b *testing.B, dir string, walCacheSize int64) *DB {
 	db, err := Open(Config{
-		Path:           dir,
-		WalConfig:      WalConfig{MaxCacheSize: walCacheSize},
+		Path: dir,
+		WalConfig: WalConfig{
+			MaxFileSize: walCacheSize,
+		},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {

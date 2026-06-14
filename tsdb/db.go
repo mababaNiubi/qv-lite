@@ -13,8 +13,8 @@ import (
 )
 
 type WalConfig struct {
-	// MaxCacheSize is the maximum size of the WAL cache in bytes. Default 64M.
-	MaxCacheSize int64 `json:"max_cache_size"`
+	// MaxFileSize is the maximum size of the WAL cache in bytes. Default 64M.
+	MaxFileSize int64 `json:"max_file_size"`
 	// MaxFileNumber is the maximum number of WAL files.
 	MaxFileNumber int `json:"max_file_number"`
 	// CloseBuffer disables the WAL write buffer when true.
@@ -22,6 +22,15 @@ type WalConfig struct {
 	// MaxBufferBatchSize is the maximum number of entries to buffer in memory
 	// before sorting by timestamp and flushing to the WAL file. Default 10000.
 	MaxBufferBatchSize int `json:"max_buffer_batch_size"`
+}
+
+func (config *WalConfig) setDefaultValues() {
+	if config.MaxFileSize <= 0 {
+		config.MaxFileSize = 64 * 1024 * 1024
+	}
+	if config.MaxBufferBatchSize <= 0 {
+		config.MaxBufferBatchSize = 4096
+	}
 }
 
 type Config struct {
@@ -59,10 +68,9 @@ const DefaultTableName = "default"
 type DB struct {
 	tableInfos []TableInfo
 	Config
-	ssTables    container.SyncMap[string, *ssTable]
-	tableNumber uint64
-	ctx         context.Context
-	cancel      context.CancelFunc
+	ssTables container.SyncMap[string, *ssTable]
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func (db *DB) resolveTableName(name string) string {
@@ -88,15 +96,10 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 	if len(config.Path) == 0 {
 		config.Path = "./qvLite-data"
 	}
-	if config.WalConfig.MaxCacheSize <= 0 {
-		config.WalConfig.MaxCacheSize = 64 * 1024 * 1024
-	}
-	if config.WalConfig.MaxBufferBatchSize <= 0 {
-		config.WalConfig.MaxBufferBatchSize = 10000
-	}
 	if config.SecondaryCompressionName == "" {
 		config.SecondaryCompressionName = "zstd"
 	}
+	config.WalConfig.setDefaultValues()
 	db := &DB{
 		Config: config,
 	}
@@ -119,6 +122,16 @@ func (db *DB) BuildTable() error {
 			return err
 		}
 	}
+	config := WalConfig{
+		CloseBuffer:        db.WalConfig.CloseBuffer,
+		MaxFileNumber:      db.WalConfig.MaxFileNumber,
+		MaxBufferBatchSize: db.WalConfig.MaxBufferBatchSize,
+		MaxFileSize:        db.WalConfig.MaxFileSize,
+	}
+	if len(db.tableInfos) > 0 {
+		config.MaxFileSize = db.WalConfig.MaxFileSize / int64(len(db.tableInfos))
+		config.MaxBufferBatchSize = db.WalConfig.MaxBufferBatchSize / len(db.tableInfos)
+	}
 	for i := range db.tableInfos {
 		tableName := db.tableInfos[i].Name
 		table, err := mewSSTable(
@@ -130,12 +143,11 @@ func (db *DB) BuildTable() error {
 			db.DedupWindowMs*int64(time.Millisecond),
 			db.MinIntervalMs*int64(time.Millisecond),
 			db.SecondaryCompressionName,
-			db.WalConfig)
+			config)
 		if err != nil {
 			return err
 		}
 		db.ssTables.Store(tableName, table)
-		db.tableNumber++
 	}
 	return nil
 }
@@ -149,6 +161,16 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 	if tableConfig.FloatPrecision == 0 {
 		tableConfig.FloatPrecision = 4
 	}
+	config := WalConfig{
+		CloseBuffer:        db.WalConfig.CloseBuffer,
+		MaxFileNumber:      db.WalConfig.MaxFileNumber,
+		MaxBufferBatchSize: db.WalConfig.MaxBufferBatchSize,
+		MaxFileSize:        db.WalConfig.MaxFileSize,
+	}
+	if len(db.tableInfos) > 0 {
+		config.MaxFileSize = db.WalConfig.MaxFileSize / int64(len(db.tableInfos))
+		config.MaxBufferBatchSize = db.WalConfig.MaxBufferBatchSize / len(db.tableInfos)
+	}
 	db.tableInfos = append(db.tableInfos, tableConfig)
 	table, err := mewSSTable(
 		tableConfig,
@@ -158,13 +180,15 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.ExpirationMinuteTime*int64(time.Minute),
 		db.DedupWindowMs*int64(time.Millisecond),
 		db.MinIntervalMs*int64(time.Millisecond),
-		db.SecondaryCompressionName, db.WalConfig,
-	)
+		db.SecondaryCompressionName, config)
 	if err != nil {
 		return err
 	}
 	db.ssTables.Store(tableConfig.Name, table)
-	db.tableNumber++
+	db.ssTables.Range(func(k string, v *ssTable) bool {
+		v.walFile.updateWalConfig(config)
+		return true
+	})
 	// Persist table metadata to disk.
 	marshal, err := json.Marshal(&db.tableInfos)
 	if err != nil {
@@ -183,20 +207,16 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 }
 
 func (db *DB) Close() error {
-	var errChan = make(chan error, 1)
-	defer close(errChan)
+	var err error
 	db.ssTables.Range(func(key string, value *ssTable) bool {
-		err := value.Close()
+		err = value.Close()
 		if err != nil {
-			errChan <- err
 			return false
 		}
 		return true
 	})
-	select {
-	case err := <-errChan:
+	if err != nil {
 		return err
-	default:
 	}
 	db.cancel()
 	return nil

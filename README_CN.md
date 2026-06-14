@@ -225,7 +225,7 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `MaxCacheSize` | `int64` | `67108864` (64MB) | WAL 内存缓存最大大小（字节） |
+| `MaxFileSize` | `int64` | `67108864` (64MB) | WAL 内存缓存最大大小（字节） |
 | `MaxFileNumber` | `int` | — | 最大 WAL 文件数量 |
 | `CloseBuffer` | `bool` | `false` | 是否关闭内存 WAL 缓冲 |
 | `MaxBufferBatchSize` | `int` | `10000` | 排序刷盘前的最大缓冲条目数 |
@@ -237,9 +237,9 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | 乱序写入 | 同 key 下禁止乱序时间写入 | `MaxBufferBatchSize` 批处理范围内允许乱序写入 |
 | 写入/查询性能 | 较低 | 较高 |
 | 异常中断 | 数据安全 | 可能丢失部分缓冲数据 |
-| 内存占用 | 通常在 `MaxCacheSize` 范围内 | 约 `MaxCacheSize` 的 3~4 倍 |
+| 内存占用 | 通常在 `MaxFileSize` 范围内 | 约 `MaxFileSize` 的 3~4 倍 |
 
-> 可通过限制 `MaxCacheSize` 大小来控制数据库内存使用。
+> 可通过限制 `MaxFileSize` 大小来控制数据库内存使用。
 
 ## 压缩算法
 

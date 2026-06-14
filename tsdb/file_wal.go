@@ -76,6 +76,7 @@ type walFileEnty struct {
 
 // WalFile is the File-like interface for the write-ahead log cache.
 type WalFile interface {
+	updateWalConfig(walConfig WalConfig)
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
@@ -97,22 +98,19 @@ type walFile struct {
 	writeFile   *os.File
 	writeBuffer *bufio.Writer
 
-	filePath        string
-	maxWalCacheSize int64
-	maxWalCount     int
-	closeBuffer     bool
-	dedupWindowMs   int64
-	minIntervalMs   int64
-	maxWalBatchSize int
+	filePath      string
+	dedupWindowMs int64
+	minIntervalMs int64
+	config        WalConfig
 }
 
-func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalCount int, dedupWindowMs, minIntervalMs int64, maxWalBatchSize int) (WalFile, error) {
+func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig WalConfig) (WalFile, error) {
+	walConfig.setDefaultValues()
 	filePath := filepath.Join(dirPath, "wal")
 	tms, err := GetWalFileTms(filePath)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(tms) == 0 {
 		n := time.Now().UnixNano()
 		tms = []int64{n}
@@ -125,19 +123,19 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 	walFiles := make([]walFileEnty, len(tms))
 	for i, t := range tms {
 		walFiles[i].fileName = filepath.Join(filePath, strconv.FormatInt(t, 10)+".wal")
-		walFiles[i].readBuffer, walFiles[i].length, err = getAllData(walFiles[i].fileName, maxWalBatchSize)
+		walFiles[i].readBuffer, walFiles[i].length, err = getAllData(walFiles[i].fileName, walConfig.MaxBufferBatchSize)
 		if err != nil {
 			err = os.Truncate(walFiles[i].fileName, walFiles[i].length)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if closeBuffer {
-			walFiles[i].readBuffer = newWalReadBuffer(maxWalBatchSize)
+		if walConfig.CloseBuffer {
+			walFiles[i].readBuffer = newWalReadBuffer(walConfig.MaxBufferBatchSize)
 		}
 	}
 	lastRB := walFiles[len(walFiles)-1].readBuffer
-	lastRB.chunks = append(lastRB.chunks, make([]walDataEntry, 0, maxWalBatchSize))
+	lastRB.chunks = append(lastRB.chunks, make([]walDataEntry, 0, walConfig.MaxBufferBatchSize))
 
 	tagMaxTimestamp := make(map[tagCode]int64)
 	tagLastValue := make(map[tagCode]variant.Variant)
@@ -163,14 +161,16 @@ func NewWalFile(dirPath string, closeBuffer bool, maxWalCacheSize int64, maxWalC
 		tagMaxTimestamp: tagMaxTimestamp,
 		tagLastValue:    tagLastValue,
 		filePath:        filePath,
-		closeBuffer:     closeBuffer,
-		maxWalCacheSize: maxWalCacheSize,
-		maxWalCount:     maxWalCount,
 		dedupWindowMs:   dedupWindowMs,
 		minIntervalMs:   minIntervalMs,
-		maxWalBatchSize: maxWalBatchSize,
+		config:          walConfig,
 	}
 	return wls, err
+}
+
+func (s *walFile) updateWalConfig(walConfig WalConfig) {
+	walConfig.setDefaultValues()
+	s.config = walConfig
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
@@ -182,11 +182,11 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 	defer ws.mutex.Unlock()
 
 	fileIndex := len(ws.walFiles) - 1
-	if ws.maxWalCount > 0 && ws.walFiles[fileIndex].length >= ws.maxWalCacheSize && len(ws.walFiles) >= ws.maxWalCount {
+	if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
 		return false, 0, ErrorWALCacheFull
 	}
 
-	if ws.closeBuffer {
+	if ws.config.CloseBuffer {
 		// Immediate write: require monotonic timestamps, write directly to disk.
 		maxTimestamp, ok := ws.tagMaxTimestamp[key]
 		if ok && timestamp < maxTimestamp {
@@ -216,7 +216,7 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 	}
 
 	// Batched mode: buffer in memory, flush when threshold reached.
-	if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.maxWalBatchSize {
+	if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
 		if err := ws.flushPending(); err != nil {
 			return false, 0, err
 		}
@@ -295,10 +295,10 @@ func (ws *walFile) flushPending() error {
 	*batchPtr = batchBuf[:0]
 	batchWritePool.Put(batchPtr)
 
-	if ws.closeBuffer {
+	if ws.config.CloseBuffer {
 		rb.chunks[chunkIdx] = rb.chunks[chunkIdx][:0]
 	} else {
-		rb.chunks = append(rb.chunks, make([]walDataEntry, 0, ws.maxWalBatchSize))
+		rb.chunks = append(rb.chunks, make([]walDataEntry, 0, ws.config.MaxBufferBatchSize))
 	}
 
 	return ws.rotateIfFull()
@@ -349,7 +349,7 @@ func (ws *walFile) skipDedup(key tagCode, ts int64, value variant.Variant) bool 
 // rotateIfFull flushes and rotates the WAL file when the size threshold is reached.
 func (ws *walFile) rotateIfFull() error {
 	fileIndex := len(ws.walFiles) - 1
-	if ws.walFiles[fileIndex].length >= ws.maxWalCacheSize {
+	if ws.walFiles[fileIndex].length >= ws.config.MaxFileSize {
 		if err := ws.writeBuffer.Flush(); err != nil {
 			return err
 		}
@@ -414,7 +414,7 @@ func (ws *walFile) addWalFile() error {
 	ws.walFiles = append(ws.walFiles, walFileEnty{
 		fileName:   fileName,
 		length:     0,
-		readBuffer: newWalReadBuffer(ws.maxWalBatchSize),
+		readBuffer: newWalReadBuffer(ws.config.MaxBufferBatchSize),
 	})
 	ws.writeFile = file
 	ws.writeBuffer.Reset(file)
@@ -426,7 +426,7 @@ func (ws *walFile) NeedFlush() bool {
 }
 
 func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
-	if ws.closeBuffer && len(ws.walFiles) > 0 {
+	if ws.config.CloseBuffer && len(ws.walFiles) > 0 {
 		ws.mutex.Lock()
 		_ = ws.flushPending()
 		if ws.writeBuffer != nil {
@@ -438,7 +438,7 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 	estCap := 512
-	if !ws.closeBuffer {
+	if !ws.config.CloseBuffer {
 		total := 0
 		for i := range ws.walFiles {
 			total += ws.walFiles[i].readBuffer.total
@@ -450,7 +450,7 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 	var err error
 	entries := make([]Point, 0, estCap)
 	for i := range ws.walFiles {
-		if !ws.closeBuffer {
+		if !ws.config.CloseBuffer {
 			ws.walFiles[i].readBuffer.forEach(func(p walDataEntry) bool {
 				if p.Key == tag && p.Timestamp >= starTime && p.Timestamp <= endTime {
 					entries = append(entries, Point{Tms: p.Timestamp, V: p.Value})
@@ -474,7 +474,7 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) error {
 	for i := 0; i < len(ws.walFiles)-1; i++ {
-		if ws.closeBuffer {
+		if ws.config.CloseBuffer {
 			err := forEachWalFile(ws.walFiles[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
 				return fc(i, tag, timestamp, data, offset)
 			})

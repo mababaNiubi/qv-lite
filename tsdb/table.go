@@ -25,9 +25,6 @@ type ssTable struct {
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
 	expirationMinuteTime int64, dedupWindowMs, minIntervalMs int64, compressionName string, walConfig WalConfig) (*ssTable, error) {
-	if walConfig.MaxCacheSize <= 0 {
-		walConfig.MaxCacheSize = 1024 * 1024 * 64
-	}
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -46,7 +43,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	if err != nil {
 		return nil, err
 	}
-	s.walFile, err = NewWalFile(s.dirPath, walConfig.CloseBuffer, walConfig.MaxCacheSize, walConfig.MaxFileNumber, dedupWindowMs, minIntervalMs, walConfig.MaxBufferBatchSize)
+	s.walFile, err = NewWalFile(s.dirPath, dedupWindowMs, minIntervalMs, walConfig)
 	if err != nil {
 		return nil, err
 	}

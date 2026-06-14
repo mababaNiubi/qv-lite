@@ -226,7 +226,7 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `MaxCacheSize` | `int64` | `67108864` (64MB) | Maximum WAL in-memory cache size in bytes |
+| `MaxFileSize` | `int64` | `67108864` (64MB) | Maximum WAL in-memory cache size in bytes |
 | `MaxFileNumber` | `int` | — | Maximum number of WAL files |
 | `CloseBuffer` | `bool` | `false` | Whether to disable in-memory WAL buffering |
 | `MaxBufferBatchSize` | `int` | `10000` | Max entries to buffer before sorting and flushing |
@@ -238,9 +238,9 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | Out-of-order writes | Rejected for the same key | Allowed within `MaxBufferBatchSize` batch window |
 | Write/query performance | Lower | Higher |
 | Crash safety | Data safe | May lose buffered data |
-| Memory usage | Typically within `MaxCacheSize` | ~3–4× `MaxCacheSize` |
+| Memory usage | Typically within `MaxFileSize` | ~3–4× `MaxFileSize` |
 
-> Control database memory usage by tuning `MaxCacheSize`.
+> Control database memory usage by tuning `MaxFileSize`.
 
 ## Compression Algorithms
 

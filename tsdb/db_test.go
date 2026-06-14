@@ -2,11 +2,12 @@ package tsdb
 
 import (
 	"context"
-	"github.com/mababaNiubi/variant"
 	"os"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/mababaNiubi/variant"
 )
 
 func tempDir(t *testing.T) string {
@@ -24,7 +25,7 @@ func tempDir(t *testing.T) string {
 func TestDB_CreateTable(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -56,7 +57,7 @@ func TestDB_CreateTable(t *testing.T) {
 func TestDB_WriteAndQuery(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -103,7 +104,7 @@ func TestDB_WriteAndQuery(t *testing.T) {
 func TestDB_WriteToNonExistentTable(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -120,7 +121,7 @@ func TestDB_WriteToNonExistentTable(t *testing.T) {
 func TestDB_QueryEmpty(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -153,7 +154,7 @@ func TestDB_QueryEmpty(t *testing.T) {
 func TestDB_MultiTagWrite(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -195,7 +196,7 @@ func TestDB_MultiTagWrite(t *testing.T) {
 func TestDB_StructTableWrite(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -249,7 +250,7 @@ func TestDB_StructTableWrite(t *testing.T) {
 func TestDB_QueryWithCondition(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -304,7 +305,7 @@ func TestDB_QueryWithCondition(t *testing.T) {
 func TestDB_Query_WithUnsortedWAL(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -357,7 +358,7 @@ func TestDB_ColumnQuery_WhyNot10000(t *testing.T) {
 	// 写入 20000 条 column 数据，每条带 value 列，然后测试查询为什么不能返回期望条数
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
@@ -458,7 +459,7 @@ func TestDB_ColumnQuery_WhyNot10000(t *testing.T) {
 func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
-		WalConfig:      WalConfig{MaxCacheSize: 64 * 1024 * 1024},
+		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {

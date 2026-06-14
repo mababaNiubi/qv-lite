@@ -1,13 +1,18 @@
 package tsdb
 
 import (
-	"github.com/mababaNiubi/variant"
 	"testing"
+
+	"github.com/mababaNiubi/variant"
 )
 
 func TestReadByTime_OutOfOrderWrite(t *testing.T) {
 	dir := tempDir(t)
-	wf, err := NewWalFile(dir, false, 64*1024*1024, 10, 0, 0, 100)
+	wf, err := NewWalFile(dir, 0, 0, WalConfig{
+		MaxFileSize:        maxSegmentSize,
+		MaxBufferBatchSize: 5,
+		MaxFileNumber:      100,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +52,11 @@ func TestReadByTime_OutOfOrderWrite(t *testing.T) {
 func TestReadByTime_MultipleChunks(t *testing.T) {
 	dir := tempDir(t)
 	// Small batch size so flush triggers quickly.
-	wf, err := NewWalFile(dir, false, 64*1024*1024, 10, 0, 0, 5)
+	wf, err := NewWalFile(dir, 0, 0, WalConfig{
+		MaxFileSize:        maxSegmentSize,
+		MaxBufferBatchSize: 5,
+		MaxFileNumber:      10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +100,11 @@ func TestReadByTime_MultipleChunks(t *testing.T) {
 
 func TestReadByTime_TimeRange(t *testing.T) {
 	dir := tempDir(t)
-	wf, err := NewWalFile(dir, false, 64*1024*1024, 10, 0, 0, 100)
+	wf, err := NewWalFile(dir, 0, 0, WalConfig{
+		MaxFileSize:        maxSegmentSize,
+		MaxBufferBatchSize: 5,
+		MaxFileNumber:      100,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

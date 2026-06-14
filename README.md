@@ -224,12 +224,12 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 
 ### WalConfig
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| Field | Type | Default           | Description |
+|-------|------|-------------------|-------------|
 | `MaxFileSize` | `int64` | `67108864` (64MB) | Maximum WAL in-memory cache size in bytes |
-| `MaxFileNumber` | `int` | — | Maximum number of WAL files |
-| `CloseBuffer` | `bool` | `false` | Whether to disable in-memory WAL buffering |
-| `MaxBufferBatchSize` | `int` | `10000` | Max entries to buffer before sorting and flushing |
+| `MaxFileNumber` | `int` | —                 | Maximum number of WAL files |
+| `CloseBuffer` | `bool` | `false`           | Whether to disable in-memory WAL buffering |
+| `MaxBufferBatchSize` | `int` | `4096`            | Max entries to buffer before sorting and flushing |
 
 **`CloseBuffer` behavior:**
 

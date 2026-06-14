@@ -75,6 +75,7 @@ func (s *ZeroFloatPrecisionEncoder) Bytes() ([]byte, error) {
 	s.ZFloatEncoder.Reset()
 	s.ZFloatEncoder.decimalQuantity = s.decimalQuantity
 	s.scale = math.Pow(10, float64(s.decimalQuantity))
+	s.ZFloatEncoder.scale = s.scale
 	for i := range s.fls {
 		s.ZFloatEncoder.Write(s.fls[i])
 	}
@@ -85,6 +86,7 @@ func (s *ZeroFloatPrecisionEncoder) Reset() {
 	s.ZFloatEncoder.Reset()
 	s.fls = s.fls[:0]
 	s.decimalQuantity = 0
+	s.scale = 0
 }
 
 // decimalPlacesMath computes the number of decimal places mathematically.

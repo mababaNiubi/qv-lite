@@ -228,7 +228,7 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `MaxFileSize` | `int64` | `67108864` (64MB) | WAL 内存缓存最大大小（字节） |
 | `MaxFileNumber` | `int` | — | 最大 WAL 文件数量 |
 | `CloseBuffer` | `bool` | `false` | 是否关闭内存 WAL 缓冲 |
-| `MaxBufferBatchSize` | `int` | `10000` | 排序刷盘前的最大缓冲条目数 |
+| `MaxBufferBatchSize` | `int` | `4096` | 排序刷盘前的最大缓冲条目数 |
 
 **`CloseBuffer` 行为说明：**
 

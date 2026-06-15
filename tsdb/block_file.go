@@ -308,9 +308,17 @@ func (b *BlockFile) Sync() error {
 		if err := b.flushBlock(); err != nil {
 			return err
 		}
-		return b.writeHeader()
+		err := b.writeHeader()
+		if err != nil {
+			return err
+		}
+		return b.file.Sync()
 	}
-	return b.flushBlock()
+	err := b.flushBlock()
+	if err != nil {
+		return err
+	}
+	return b.file.Sync()
 }
 
 // writeIndexLocked writes the block index at the current DataEnd position and
@@ -350,7 +358,11 @@ func (b *BlockFile) Commit() error {
 	if err := b.flushBlock(); err != nil {
 		return err
 	}
-	return b.writeIndexLocked()
+	err := b.writeIndexLocked()
+	if err != nil {
+		return err
+	}
+	return b.file.Sync()
 }
 
 // Close flushes the buffer, writes the index, marks TxDone, and closes the file.
@@ -366,6 +378,10 @@ func (b *BlockFile) Close() error {
 		return err
 	}
 	if err := b.writeIndexLocked(); err != nil {
+		return err
+	}
+	err := b.file.Sync()
+	if err != nil {
 		return err
 	}
 	return b.file.Close()

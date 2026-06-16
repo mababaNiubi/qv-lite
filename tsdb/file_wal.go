@@ -78,6 +78,7 @@ type walFileEnty struct {
 type WalFile interface {
 	updateWalConfig(walConfig WalConfig)
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
+	WriteBatch(entries []walDataEntry) ([]bool, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
@@ -229,6 +230,72 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 	})
 
 	return true, fileIndex, nil
+}
+
+// WriteBatch writes multiple entries under a single mutex lock, reducing lock
+// contention compared to calling Write repeatedly.
+func (ws *walFile) WriteBatch(entries []walDataEntry) ([]bool, error) {
+	if ws.writeFile == nil || ws.writeBuffer == nil {
+		return nil, ErrorWALClose
+	}
+
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+
+	results := make([]bool, len(entries))
+	fileIndex := len(ws.walFiles) - 1
+
+	if ws.config.CloseBuffer {
+		for i := range entries {
+			e := &entries[i]
+			if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
+				return results, ErrorWALCacheFull
+			}
+			maxTimestamp, ok := ws.tagMaxTimestamp[e.Key]
+			if ok && e.Timestamp < maxTimestamp {
+				continue
+			}
+			if ws.skipDedup(e.Key, e.Timestamp, e.Value) {
+				continue
+			}
+			buf, dataLen, err := appendSerialized(nil, e.Key, e.Timestamp, e.Value)
+			if err != nil {
+				return results, err
+			}
+			if _, err = ws.writeBuffer.Write(buf); err != nil {
+				return results, err
+			}
+			ent := &ws.walFiles[fileIndex]
+			ent.length += dataLen
+			ws.tagMaxTimestamp[e.Key] = e.Timestamp
+			ws.tagLastValue[e.Key] = e.Value
+			if err := ws.rotateIfFull(); err != nil {
+				return results, err
+			}
+			results[i] = true
+		}
+		return results, nil
+	}
+
+	// Buffered mode: append all entries, flushing when threshold is reached.
+	for i := range entries {
+		e := &entries[i]
+		if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
+			return results, ErrorWALCacheFull
+		}
+		if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
+			if err := ws.flushPending(); err != nil {
+				return results, err
+			}
+		}
+		ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
+			Key:       e.Key,
+			Timestamp: e.Timestamp,
+			Value:     e.Value,
+		})
+		results[i] = true
+	}
+	return results, nil
 }
 
 // flushPending sorts the last chunk by (Key, Timestamp), batch-writes

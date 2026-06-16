@@ -95,6 +95,53 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 	return ok, nil
 }
 
+// WriteBatch writes multiple data points under a single WAL mutex acquisition,
+// reducing lock contention compared to calling Write repeatedly.
+func (s *ssTable) WriteBatch(points []BatchPoint) ([]bool, error) {
+	if s.walFile == nil {
+		return nil, ErrorWALCacheIsNil
+	}
+
+	// Resolve all tag codes, creating columns for new tags.
+	entries := make([]walDataEntry, len(points))
+	for i, p := range points {
+		code, ok := s.Meta.Load(p.Tag)
+		if !ok {
+			var err error
+			code, err = s.CreateColumn(p.Tag)
+			if err != nil {
+				return nil, err
+			}
+		}
+		entries[i] = walDataEntry{
+			Key:       code,
+			Timestamp: p.Timestamp,
+			Value:     p.Value,
+		}
+	}
+
+	results, err := s.walFile.WriteBatch(entries)
+	if err != nil {
+		return results, err
+	}
+
+	// Check flush once after the batch.
+	if s.walFile.NeedFlush() {
+		if s.flushMute.TryLock() {
+			defer s.flushMute.Unlock()
+			if s.walFile.NeedFlush() {
+				if err = s.flushCache(); err != nil {
+					return results, err
+				}
+				if s.expirationMinuteTime != 0 {
+					s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
+				}
+			}
+		}
+	}
+	return results, nil
+}
+
 func (s *ssTable) flushCache() error {
 	// Flush pending WAL entries so they are visible to forEachCompleteFile.
 	if err := s.walFile.FlushPending(); err != nil {

@@ -201,6 +201,184 @@ func BenchmarkWriteParallel(b *testing.B) {
 		len(all), fileDirSize(dir, tableName))
 }
 
+// ==================== 批量写入性能对比 ====================
+
+// BenchmarkWriteSingle 单点串行写入（基线）
+func BenchmarkWriteSingle(b *testing.B) {
+	const totalPoints = 1_000_000
+	dir := benchDir(b)
+	tableName := "bench_single"
+	db := openBenchDB(b, dir, 64*1024*1024)
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	writeStart := time.Now()
+	baseTime := writeStart.UnixNano()
+	// 只用单tag，聚焦测量单点写入的锁开销
+	for i := 0; i < totalPoints; i++ {
+		_, err := db.Write(tableName, "cpu", baseTime+int64(i)*int64(time.Millisecond),
+			variant.NewFloat64(float64(i)*0.01))
+		if err != nil {
+			b.Fatalf("write %d failed: %v", i, err)
+		}
+	}
+	writeElapsed := time.Since(writeStart)
+
+	_ = db.Close()
+	b.Logf("single write: %v (%.0f pts/s), size: %v",
+		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
+		fileDirSize(dir, tableName))
+}
+
+// BenchmarkWriteBatch_100 批量写入，每批100条
+func BenchmarkWriteBatch_100(b *testing.B) {
+	benchWriteBatch(b, 100)
+}
+
+// BenchmarkWriteBatch_1000 批量写入，每批1000条
+func BenchmarkWriteBatch_1000(b *testing.B) {
+	benchWriteBatch(b, 1000)
+}
+
+// BenchmarkWriteBatch_10000 批量写入，每批10000条
+func BenchmarkWriteBatch_10000(b *testing.B) {
+	benchWriteBatch(b, 10000)
+}
+
+func benchWriteBatch(b *testing.B, batchSize int) {
+	const totalPoints = 24 * 60 * 60 * 1000
+	dir := benchDir(b)
+	tableName := "bench_batch"
+	db := openBenchDB(b, dir, 64*1024*1024)
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	writeStart := time.Now()
+	baseTime := writeStart.UnixNano()
+
+	batches := totalPoints / batchSize
+	for n := 0; n < batches; n++ {
+		points := make([]TagPoint, batchSize)
+		for i := 0; i < batchSize; i++ {
+			idx := n*batchSize + i
+			points[i] = TagPoint{
+				Tag:       "cpu",
+				Timestamp: baseTime + int64(idx)*int64(time.Millisecond),
+				Value:     variant.NewFloat64(float64(idx) * 0.01),
+			}
+		}
+		results, err := db.WriteBatch(tableName, points)
+		if err != nil {
+			b.Fatalf("batch write %d failed: %v", n, err)
+		}
+		if results != batchSize {
+			b.Fatal("expected all writes to succeed")
+		}
+	}
+	writeElapsed := time.Since(writeStart)
+
+	_ = db.Close()
+	b.Logf("batch(%d) write: %v (%.0f pts/s), size: %v",
+		batchSize, writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
+		fileDirSize(dir, tableName))
+}
+
+// BenchmarkWriteBatch_MultiTag 批量写入多tag（模拟真实场景：100个不同tag轮转）
+func BenchmarkWriteBatch_MultiTag(b *testing.B) {
+	const totalPoints = 1_000_000
+	const batchSize = 1000
+	const numTags = 100
+
+	dir := benchDir(b)
+	tableName := "bench_multitag"
+	db := openBenchDB(b, dir, 64*1024*1024)
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	writeStart := time.Now()
+	baseTime := writeStart.UnixNano()
+
+	batches := totalPoints / batchSize
+	for n := 0; n < batches; n++ {
+		points := make([]TagPoint, batchSize)
+		for i := 0; i < batchSize; i++ {
+			idx := n*batchSize + i
+			points[i] = TagPoint{
+				Tag:       fmt.Sprintf("sensor_%d", idx%numTags),
+				Timestamp: baseTime + int64(idx)*int64(time.Millisecond),
+				Value:     variant.NewFloat64(float64(idx) * 0.01),
+			}
+		}
+		results, err := db.WriteBatch(tableName, points)
+		if err != nil {
+			b.Fatalf("batch write %d failed: %v", n, err)
+		}
+		if results != batchSize {
+			b.Fatal("expected all writes to succeed")
+		}
+	}
+	writeElapsed := time.Since(writeStart)
+
+	_ = db.Close()
+	b.Logf("multi-tag batch(%d) write: %v (%.0f pts/s), size: %v",
+		batchSize, writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
+		fileDirSize(dir, tableName))
+}
+
+// BenchmarkWriteSingle_MultiTag 单点串行写入多tag（与BatchMultiTag对比基线）
+func BenchmarkWriteSingle_MultiTag(b *testing.B) {
+	const totalPoints = 1_000_000
+	const numTags = 100
+
+	dir := benchDir(b)
+	tableName := "bench_single_multitag"
+	db := openBenchDB(b, dir, 64*1024*1024)
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	writeStart := time.Now()
+	baseTime := writeStart.UnixNano()
+
+	for i := 0; i < totalPoints; i++ {
+		tag := fmt.Sprintf("sensor_%d", i%numTags)
+		_, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond),
+			variant.NewFloat64(float64(i)*0.01))
+		if err != nil {
+			b.Fatalf("write %d failed: %v", i, err)
+		}
+	}
+	writeElapsed := time.Since(writeStart)
+
+	_ = db.Close()
+	b.Logf("single multi-tag write: %v (%.0f pts/s), size: %v",
+		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
+		fileDirSize(dir, tableName))
+}
+
 func fileDirSize(dir string, tableName string) string {
 	var total int64
 	_ = filepath.WalkDir(filepath.Join(dir, tableName, "data"), func(path string, d fs.DirEntry, err error) error {

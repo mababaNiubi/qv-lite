@@ -19,12 +19,13 @@ type ssTable struct {
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
 	expirationMinuteTime   int64
+	maxStorageTime         int64
 	walFile                WalFile
 	flushMute              sync.Mutex
 }
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
-	expirationMinuteTime int64, dedupWindowMs, minIntervalMs int64, compressionName string, walConfig WalConfig) (*ssTable, error) {
+	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -32,6 +33,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		maxSegmentSize:         maxSegmentSize,
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
+		maxStorageTime:         maxStorageTime,
 	}
 	var err error
 	err = s.BuildColumn()
@@ -61,6 +63,13 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (bool, error) {
 	if s.walFile == nil {
 		return false, ErrorWALCacheIsNil
+	}
+	if value.IsEmpty() {
+		return false, ErrorValueIsEmpty
+	}
+	if s.maxStorageTime != 0 && time.Now().UnixNano()+s.maxStorageTime < timestamp {
+		// Reject data with timestamps too far beyond the current time.
+		return false, ErrorTimeOut
 	}
 	// Look up the column index.
 	code, ok := s.Meta.Load(tag)
@@ -97,11 +106,10 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 
 // WriteBatch writes multiple data points under a single WAL mutex acquisition,
 // reducing lock contention compared to calling Write repeatedly.
-func (s *ssTable) WriteBatch(points []BatchPoint) ([]bool, error) {
+func (s *ssTable) WriteBatch(points []TagPoint) (int, error) {
 	if s.walFile == nil {
-		return nil, ErrorWALCacheIsNil
+		return 0, ErrorWALCacheIsNil
 	}
-
 	// Resolve all tag codes, creating columns for new tags.
 	entries := make([]walDataEntry, len(points))
 	for i, p := range points {
@@ -110,8 +118,15 @@ func (s *ssTable) WriteBatch(points []BatchPoint) ([]bool, error) {
 			var err error
 			code, err = s.CreateColumn(p.Tag)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
+		}
+		if p.Value.IsEmpty() {
+			return 0, ErrorValueIsEmpty
+		}
+		if s.maxStorageTime != 0 && time.Now().UnixNano()+s.maxStorageTime < p.Timestamp {
+			// Reject data with timestamps too far beyond the current time.
+			return 0, ErrorTimeOut
 		}
 		entries[i] = walDataEntry{
 			Key:       code,

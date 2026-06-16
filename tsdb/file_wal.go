@@ -78,7 +78,7 @@ type walFileEnty struct {
 type WalFile interface {
 	updateWalConfig(walConfig WalConfig)
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
-	WriteBatch(entries []walDataEntry) ([]bool, error)
+	WriteBatch(entries []walDataEntry) (int, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
@@ -234,18 +234,24 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 
 // WriteBatch writes multiple entries under a single mutex lock, reducing lock
 // contention compared to calling Write repeatedly.
-func (ws *walFile) WriteBatch(entries []walDataEntry) ([]bool, error) {
+func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
 	if ws.writeFile == nil || ws.writeBuffer == nil {
-		return nil, ErrorWALClose
+		return 0, ErrorWALClose
 	}
 
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 
-	results := make([]bool, len(entries))
+	results := 0
 	fileIndex := len(ws.walFiles) - 1
 
 	if ws.config.CloseBuffer {
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Key != entries[j].Key {
+				return entries[i].Key < entries[j].Key
+			}
+			return entries[i].Timestamp < entries[j].Timestamp
+		})
 		for i := range entries {
 			e := &entries[i]
 			if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
@@ -272,7 +278,7 @@ func (ws *walFile) WriteBatch(entries []walDataEntry) ([]bool, error) {
 			if err := ws.rotateIfFull(); err != nil {
 				return results, err
 			}
-			results[i] = true
+			results++
 		}
 		return results, nil
 	}
@@ -293,7 +299,7 @@ func (ws *walFile) WriteBatch(entries []walDataEntry) ([]bool, error) {
 			Timestamp: e.Timestamp,
 			Value:     e.Value,
 		})
-		results[i] = true
+		results++
 	}
 	return results, nil
 }

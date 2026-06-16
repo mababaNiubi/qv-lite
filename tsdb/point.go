@@ -38,6 +38,13 @@ type TableInfo struct {
 
 const pointChunkSize = 4096
 
+// TagPoint is a single data point in a batch write.
+type TagPoint struct {
+	Tag       string
+	Timestamp int64
+	Value     variant.Variant
+}
+
 type Point struct {
 	Tms int64
 	V   variant.Variant

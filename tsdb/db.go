@@ -142,6 +142,7 @@ func (db *DB) BuildTable() error {
 			db.ExpirationMinuteTime*int64(time.Minute),
 			db.DedupWindowMs*int64(time.Millisecond),
 			db.MinIntervalMs*int64(time.Millisecond),
+			db.MaxStorageTime*int64(time.Second),
 			db.SecondaryCompressionName,
 			config)
 		if err != nil {
@@ -180,6 +181,7 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.ExpirationMinuteTime*int64(time.Minute),
 		db.DedupWindowMs*int64(time.Millisecond),
 		db.MinIntervalMs*int64(time.Millisecond),
+		db.MaxStorageTime*int64(time.Second),
 		db.SecondaryCompressionName, config)
 	if err != nil {
 		return err
@@ -222,60 +224,7 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
-// An empty tableName writes to the default table, which is auto-created on first use.
-func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
-	if value.IsEmpty() {
-		return false, ErrorValueIsEmpty
-	}
-	if db.MaxStorageTime != 0 {
-		// Reject data with timestamps too far beyond the current time.
-		if time.Now().UnixNano()+db.MaxStorageTime*int64(time.Second) < timestamp {
-			return false, ErrorTimeOut
-		}
-	}
-
-	tableName = db.resolveTableName(tableName)
-	table, ok := db.ssTables.Load(tableName)
-	if !ok {
-		if tableName == DefaultTableName {
-			if err := db.ensureDefaultTable(); err != nil {
-				return false, err
-			}
-			table, _ = db.ssTables.Load(tableName)
-		} else {
-			return false, ErrorTableNotExists
-		}
-	}
-	return table.Write(tag, timestamp, value)
-}
-
-// BatchPoint is a single data point in a batch write.
-type BatchPoint struct {
-	Tag       string
-	Timestamp int64
-	Value     variant.Variant
-}
-
-// WriteBatch writes multiple data points to the specified table in a single batch.
-// This acquires the WAL mutex once instead of once per point, reducing lock contention.
-// An empty tableName writes to the default table.
-func (db *DB) WriteBatch(tableName string, points []BatchPoint) ([]bool, error) {
-	if len(points) == 0 {
-		return nil, nil
-	}
-
-	for i := range points {
-		if points[i].Value.IsEmpty() {
-			return nil, ErrorValueIsEmpty
-		}
-		if db.MaxStorageTime != 0 {
-			if time.Now().UnixNano()+db.MaxStorageTime*int64(time.Second) < points[i].Timestamp {
-				return nil, ErrorTimeOut
-			}
-		}
-	}
-
+func (db *DB) getTable(tableName string) (*ssTable, error) {
 	tableName = db.resolveTableName(tableName)
 	table, ok := db.ssTables.Load(tableName)
 	if !ok {
@@ -287,6 +236,30 @@ func (db *DB) WriteBatch(tableName string, points []BatchPoint) ([]bool, error) 
 		} else {
 			return nil, ErrorTableNotExists
 		}
+	}
+	return table, nil
+}
+
+// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
+// An empty tableName writes to the default table, which is auto-created on first use.
+func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
+	table, err := db.getTable(tableName)
+	if err != nil {
+		return false, err
+	}
+	return table.Write(tag, timestamp, value)
+}
+
+// WriteBatch writes multiple data points to the specified table in a single batch.
+// This acquires the WAL mutex once instead of once per point, reducing lock contention.
+// An empty tableName writes to the default table.
+func (db *DB) WriteBatch(tableName string, points []TagPoint) (int, error) {
+	if len(points) == 0 {
+		return 0, nil
+	}
+	table, err := db.getTable(tableName)
+	if err != nil {
+		return 0, err
 	}
 	return table.WriteBatch(points)
 }

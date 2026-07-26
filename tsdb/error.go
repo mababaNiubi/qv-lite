@@ -35,6 +35,7 @@ var (
 // File/block errors
 var (
 	ErrorInvalidFileFormat      = errors.New("invalid file format")
+	ErrorMetaFileFormat         = errors.New("unsupported meta file format")
 	ErrorInvalidSeekMode        = errors.New("invalid seek mode")
 	ErrorNegativePosition       = errors.New("negative position")
 	ErrorInvalidTruncationPoint = errors.New("invalid truncation point")

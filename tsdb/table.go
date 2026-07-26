@@ -269,19 +269,27 @@ func (s *ssTable) BuildColumn() error {
 }
 
 func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
+	s.mute.Lock()
+	defer s.mute.Unlock()
+
+	// Double-check: another goroutine may have created this tag while we waited.
+	if code, ok := s.Meta.Load(tag); ok {
+		return code, nil
+	}
+
 	if s.MaxPointDict == maxColumnTag {
 		return 0, ErrorPointQuantityExceedsLimit
 	}
-	s.mute.Lock()
-	defer s.mute.Unlock()
-	pointDict, err := s.Meta.addTag(tag)
+
+	code, err := s.Meta.addTag(tag)
 	if err != nil {
 		return 0, err
 	}
+
 	s.flushMute.Lock()
-	s.columnMap[s.MaxPointDict] = newSSColumn(s.MaxPointDict, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+	s.columnMap[code] = newSSColumn(code, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
 	s.flushMute.Unlock()
-	return pointDict, nil
+	return code, nil
 }
 
 func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
@@ -573,7 +581,12 @@ func (s *ssTable) Close() error {
 		s.fragmentation.readerCache.closeAll()
 	}
 	if s.walFile != nil {
-		return s.walFile.Close()
+		if err := s.walFile.Close(); err != nil {
+			return err
+		}
+	}
+	if s.Meta != nil {
+		return s.Meta.Close()
 	}
 	return nil
 }

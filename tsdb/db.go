@@ -61,6 +61,20 @@ type Config struct {
 	// SecondaryCompressionName is the block compression algorithm: "zstd", "lz4", "snappy", "gzip", "none".
 	// Default "zstd".
 	SecondaryCompressionName string `json:"secondary_compression_name"`
+
+	// AsyncFlush enables asynchronous flushCache processing. When true, WAL data
+	// is encoded and flushed to disk segments in a background goroutine instead
+	// of blocking the write path. Failed flushes are retried on the next trigger
+	// since the data stays in the WAL until a successful flush. Default false.
+	AsyncFlush bool `json:"async_flush"`
+	// AsyncCleanup enables asynchronous periodic cleanup of expired data files.
+	// When true, expired segments are removed by a background goroutine on a
+	// fixed interval instead of inline during each write. Default false.
+	AsyncCleanup bool `json:"async_cleanup"`
+	// CleanupIntervalSeconds is the interval, in seconds, between periodic
+	// cleanup sweeps when AsyncCleanup is enabled. An initial sweep runs
+	// immediately on startup. Default 60.
+	CleanupIntervalSeconds int64 `json:"cleanup_interval_seconds"`
 }
 
 const DefaultTableName = "default"
@@ -100,6 +114,9 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 		config.SecondaryCompressionName = "zstd"
 	}
 	config.WalConfig.setDefaultValues()
+	if config.CleanupIntervalSeconds <= 0 {
+		config.CleanupIntervalSeconds = 60
+	}
 	db := &DB{
 		Config: config,
 	}
@@ -144,7 +161,11 @@ func (db *DB) BuildTable() error {
 			db.MinIntervalMs*int64(time.Millisecond),
 			db.MaxStorageTime*int64(time.Second),
 			db.SecondaryCompressionName,
-			config)
+			config,
+			db.ctx,
+			db.AsyncFlush,
+			db.AsyncCleanup,
+			time.Duration(db.CleanupIntervalSeconds)*time.Second)
 		if err != nil {
 			return err
 		}
@@ -182,7 +203,11 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.DedupWindowMs*int64(time.Millisecond),
 		db.MinIntervalMs*int64(time.Millisecond),
 		db.MaxStorageTime*int64(time.Second),
-		db.SecondaryCompressionName, config)
+		db.SecondaryCompressionName, config,
+		db.ctx,
+		db.AsyncFlush,
+		db.AsyncCleanup,
+		time.Duration(db.CleanupIntervalSeconds)*time.Second)
 	if err != nil {
 		return err
 	}

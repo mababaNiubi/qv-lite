@@ -220,6 +220,9 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `DedupWindowMs` | `int64` | `0`（禁用） | 去重窗口（毫秒），同一 tag 相同值在此窗口内重复写入时跳过                            |
 | `MinIntervalMs` | `int64` | `0`（禁用） | 最小写入间隔（毫秒），两次写入间隔小于该值时跳过                               |
 | `SecondaryCompressionName` | `string` | `"zstd"` | 块压缩算法：`"zstd"`、`"lz4"`、`"snappy"`、`"gzip"`、`"none"` |
+| `AsyncFlush` | `bool` | `false` | flushCache 编码在后台 goroutine 中执行，不阻塞写入路径 |
+| `AsyncCleanup` | `bool` | `false` | 过期段文件由后台 goroutine 定期清理，而非每次写入时内联清理 |
+| `CleanupIntervalSeconds` | `int64` | `60` | 异步清理的间隔（秒），启动时会立即执行一次初始清理 |
 
 ### WalConfig
 

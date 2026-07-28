@@ -221,6 +221,9 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `DedupWindowMs` | `int64` | `0` (disabled) | Dedup window in ms — skips writes with the same value for the same tag within this window |
 | `MinIntervalMs` | `int64` | `0` (disabled) | Minimum interval between consecutive writes in ms — writes arriving too quickly are skipped |
 | `SecondaryCompressionName` | `string` | `"zstd"` | Block compression: `"zstd"`, `"lz4"`, `"snappy"`, `"gzip"`, `"none"` |
+| `AsyncFlush` | `bool` | `false` | Run `flushCache` encoding in a background goroutine instead of blocking the write path |
+| `AsyncCleanup` | `bool` | `false` | Remove expired segments via a background goroutine on a fixed interval instead of inline during writes |
+| `CleanupIntervalSeconds` | `int64` | `60` | Interval (seconds) between async cleanup sweeps; an initial sweep runs on startup |
 
 ### WalConfig
 

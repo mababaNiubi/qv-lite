@@ -84,9 +84,10 @@ type WalFile interface {
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
-	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) error
+	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
 	retainWalFilePrefix(index int, truncateSize int64) error
-	truncate()
+	truncate(n int)
+	removeOrphanedFiles()
 	Close() error
 }
 
@@ -495,6 +496,8 @@ func (ws *walFile) addWalFile() error {
 }
 
 func (ws *walFile) NeedFlush() bool {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	return len(ws.walFiles) > 1
 }
 
@@ -545,22 +548,35 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 	return entries, err
 }
 
-func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) error {
-	for i := 0; i < len(ws.walFiles)-1; i++ {
+func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
+	// Snapshot the complete (non-active) files under the mutex so that
+	// concurrent writes which rotate the WAL cannot change the file set
+	// mid-iteration. Complete files' read buffers are immutable after
+	// rotation, so iterating the snapshot without the lock is safe.
+	ws.mutex.Lock()
+	complete := make([]walFileEnty, len(ws.walFiles)-1)
+	copy(complete, ws.walFiles[:len(ws.walFiles)-1])
+	totalEntries := 0
+	for i := range complete {
+		totalEntries += complete[i].readBuffer.total
+	}
+	ws.mutex.Unlock()
+
+	for i := 0; i < len(complete); i++ {
 		if ws.config.CloseBuffer {
-			err := forEachWalFile(ws.walFiles[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
+			err := forEachWalFile(complete[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
 				return fc(i, tag, timestamp, data, offset)
 			})
 			if err != nil {
-				return err
+				return i, err
 			}
 		} else {
-			ws.walFiles[i].readBuffer.forEach(func(e walDataEntry) bool {
+			complete[i].readBuffer.forEach(func(e walDataEntry) bool {
 				return fc(i, e.Key, e.Timestamp, e.Value, e.EndPosition)
 			})
 		}
 	}
-	return nil
+	return len(complete), nil
 }
 
 func (ws *walFile) retainWalFilePrefix(index int, truncateSize int64) error {
@@ -584,13 +600,50 @@ func (ws *walFile) retainWalFilePrefix(index int, truncateSize int64) error {
 	return nil
 }
 
-func (ws *walFile) truncate() {
+func (ws *walFile) truncate(n int) {
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
-	for i := 0; i <= len(ws.walFiles)-1; i++ {
+	if n <= 0 {
+		return
+	}
+	if n >= len(ws.walFiles) {
+		n = len(ws.walFiles) - 1
+	}
+	if n <= 0 {
+		return
+	}
+	for i := 0; i < n; i++ {
 		_ = os.Remove(ws.walFiles[i].fileName)
 	}
-	ws.walFiles = ws.walFiles[len(ws.walFiles)-1:]
+	ws.walFiles = ws.walFiles[n:]
+}
+
+// removeOrphanedFiles deletes .wal files from disk that are no longer in the
+// walFiles list. On some platforms (notably Windows) os.Remove inside
+// truncate can fail when a file handle is not yet fully released, leaving
+// consumed files on disk. This is called from Close after all handles are
+// closed, so removal is guaranteed to succeed.
+func (ws *walFile) removeOrphanedFiles() {
+	ws.mutex.Lock()
+	keep := make(map[string]bool, len(ws.walFiles))
+	for i := range ws.walFiles {
+		keep[ws.walFiles[i].fileName] = true
+	}
+	ws.mutex.Unlock()
+
+	entries, err := os.ReadDir(ws.filePath)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".wal") {
+			continue
+		}
+		fullPath := filepath.Join(ws.filePath, entry.Name())
+		if !keep[fullPath] {
+			_ = os.Remove(fullPath)
+		}
+	}
 }
 
 func (ws *walFile) Close() error {

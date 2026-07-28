@@ -1,6 +1,7 @@
 package tsdb
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -22,10 +23,23 @@ type ssTable struct {
 	maxStorageTime         int64
 	walFile                WalFile
 	flushMute              sync.Mutex
+	queryMute              sync.RWMutex // serializes queries with flush commit+truncate
+
+	// Asynchronous processing (enabled via Config).
+	asyncFlush      bool
+	asyncCleanup    bool
+	cleanupInterval time.Duration
+	ctx             context.Context
+	cancel          context.CancelFunc
+	flushWg         sync.WaitGroup // tracks in-flight async flush goroutines
+	cleanupDone     chan struct{}  // closed when the cleanup goroutine exits
+	asyncErrMu      sync.Mutex
+	asyncErr        error // last error from an async flush
 }
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
-	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig) (*ssTable, error) {
+	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig,
+	parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -34,7 +48,18 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
 		maxStorageTime:         maxStorageTime,
+		asyncFlush:             asyncFlush,
+		asyncCleanup:           asyncCleanup,
+		cleanupInterval:        cleanupInterval,
 	}
+	s.ctx, s.cancel = context.WithCancel(parentCtx)
+	// Cancel the derived context if construction fails so it is not leaked.
+	success := false
+	defer func() {
+		if !success {
+			s.cancel()
+		}
+	}()
 	var err error
 	err = s.BuildColumn()
 	if err != nil {
@@ -57,6 +82,12 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	for k, lp := range lastPoints {
 		s.walFile.SetLastPoint(k, lp.Tms, lp.V)
 	}
+	// Start the background cleanup loop when async cleanup is enabled.
+	if s.asyncCleanup {
+		s.cleanupDone = make(chan struct{})
+		go s.runCleanupLoop()
+	}
+	success = true
 	return s, nil
 }
 
@@ -87,18 +118,8 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 	}
 	// Flush to disk when the cache exceeds the size limit.
 	if s.walFile.NeedFlush() {
-		if s.flushMute.TryLock() {
-			defer s.flushMute.Unlock()
-			if s.walFile.NeedFlush() {
-				err = s.flushCache()
-				if err != nil {
-					return ok, err
-				}
-				// Clean up expired data.
-				if s.expirationMinuteTime != 0 {
-					s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
-				}
-			}
+		if err = s.maybeFlush(); err != nil {
+			return ok, err
 		}
 	}
 	return ok, nil
@@ -142,26 +163,14 @@ func (s *ssTable) WriteBatch(points []TagPoint) (int, error) {
 
 	// Check flush once after the batch.
 	if s.walFile.NeedFlush() {
-		if s.flushMute.TryLock() {
-			defer s.flushMute.Unlock()
-			if s.walFile.NeedFlush() {
-				if err = s.flushCache(); err != nil {
-					return results, err
-				}
-				if s.expirationMinuteTime != 0 {
-					s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
-				}
-			}
+		if err = s.maybeFlush(); err != nil {
+			return results, err
 		}
 	}
 	return results, nil
 }
 
 func (s *ssTable) flushCache() error {
-	// Flush pending WAL entries so they are visible to forEachCompleteFile.
-	if err := s.walFile.FlushPending(); err != nil {
-		return err
-	}
 	// Open or create a data segment.
 	var err, readErr error
 	err = s.fragmentation.OpenTransaction()
@@ -172,7 +181,8 @@ func (s *ssTable) flushCache() error {
 	readSize := int64(0)
 	// Track the position of the last successfully read entry for error recovery.
 	errIndex := 0
-	err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
+	var consumed int
+	consumed, err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
 		column, ok := s.columnMap[tag]
 		if !ok {
 			return true
@@ -238,19 +248,124 @@ func (s *ssTable) flushCache() error {
 			}
 		}
 	}
-	// Commit the data segments.
+	// Commit the data segments and truncate the consumed WAL files
+	// atomically (from a query's perspective) so a concurrent query cannot
+	// see the same data in both the WAL cache and the committed segments.
+	s.queryMute.Lock()
 	err = s.fragmentation.CommitTransactionFileSegment()
 	if err != nil {
 		// On commit failure, roll back to protect data integrity.
 		errRollback := s.fragmentation.RollbackLastCommitTransaction()
+		s.queryMute.Unlock()
 		if errRollback != nil {
 			return errRollback
 		}
 		return err
 	}
 	// Truncate WAL after successful flush.
-	s.walFile.truncate()
+	s.walFile.truncate(consumed)
+	s.queryMute.Unlock()
 	return nil
+}
+
+// flushAndCleanup encodes buffered WAL data to disk segments and, when cleanup
+// is handled inline, evicts expired segments. It must be called while holding
+// flushMute.
+func (s *ssTable) flushAndCleanup() error {
+	if err := s.flushCache(); err != nil {
+		return err
+	}
+	// Inline cleanup only when the background cleanup loop is not running.
+	if !s.asyncCleanup && s.expirationMinuteTime != 0 {
+		s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
+	}
+	return nil
+}
+
+// maybeFlush triggers a flush when the WAL cache exceeds the threshold. In
+// async mode the encoding runs in a background goroutine; otherwise it runs
+// inline, blocking the caller. At most one flush runs at a time per table:
+// flushMute serializes access, and the write path uses a non-blocking TryLock
+// so concurrent writers skip when a flush is already in progress.
+func (s *ssTable) maybeFlush() error {
+	if !s.walFile.NeedFlush() {
+		return nil
+	}
+	if !s.flushMute.TryLock() {
+		return nil
+	}
+	if s.asyncFlush {
+		// Re-check under lock: another goroutine may have flushed already.
+		if s.walFile.NeedFlush() {
+			s.flushWg.Add(1)
+			go func() {
+				defer s.flushWg.Done()
+				defer s.flushMute.Unlock()
+				// Drain loop: keep flushing until the WAL is back to a single
+				// file. Concurrent writes may add files between iterations, so
+				// re-check NeedFlush after each successful flush.
+				for {
+					if err := s.flushAndCleanup(); err != nil {
+						s.setAsyncErr(err)
+						return
+					}
+					if !s.walFile.NeedFlush() {
+						return
+					}
+				}
+			}()
+		} else {
+			s.flushMute.Unlock()
+		}
+		return nil
+	}
+	// Synchronous path (default): flush inline.
+	defer s.flushMute.Unlock()
+	if s.walFile.NeedFlush() {
+		return s.flushAndCleanup()
+	}
+	return nil
+}
+
+// runCleanupLoop periodically removes expired data segments in the background.
+// It exits when the table context is cancelled (e.g. on Close).
+func (s *ssTable) runCleanupLoop() {
+	defer close(s.cleanupDone)
+	if s.expirationMinuteTime == 0 {
+		return
+	}
+	interval := s.cleanupInterval
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	// Initial sweep: clean up files that expired while the database was down.
+	s.cleanupExpired()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupExpired()
+		}
+	}
+}
+
+// cleanupExpired removes segments older than the expiration window. It acquires
+// flushMute to avoid racing with a concurrent flushCache: glowWrite reads the
+// segment list via GetLastFragmentation without the segment mutex, so cleanup
+// must not restructure the list at the same time.
+func (s *ssTable) cleanupExpired() {
+	s.flushMute.Lock()
+	defer s.flushMute.Unlock()
+	s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
+}
+
+func (s *ssTable) setAsyncErr(err error) {
+	s.asyncErrMu.Lock()
+	s.asyncErr = err
+	s.asyncErrMu.Unlock()
 }
 
 func (s *ssTable) BuildColumn() error {
@@ -398,11 +513,14 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 		return nil, ErrorTagNotFound
 	}
 	evalCond := CompileCondition(cond)
+	s.queryMute.RLock()
 	cachePoints, err := s.queryCache(code, startTime, endTime, evalCond)
 	if err != nil {
+		s.queryMute.RUnlock()
 		return nil, err
 	}
 	disk, err := s.queryDisk(code, startTime, endTime, evalCond)
+	s.queryMute.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +571,9 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 		endTime = min(endTime, tms)
 	}
 	var interval = (endTime - startTime) / maxNumber
+
+	s.queryMute.RLock()
+	defer s.queryMute.RUnlock()
 
 	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()
@@ -571,6 +692,38 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 }
 
 func (s *ssTable) Close() error {
+	// Stop background goroutines and wait for any in-flight async flush so that
+	// files are not closed mid-transaction.
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.flushWg.Wait()
+	if s.cleanupDone != nil {
+		<-s.cleanupDone
+	}
+	s.flushMute.Lock()
+	// Drain all complete WAL files so their data is encoded to segments.
+	for s.walFile.NeedFlush() {
+		if err := s.flushCache(); err != nil {
+			s.flushMute.Unlock()
+			return err
+		}
+	}
+	// Close the WAL. Its internal flushPending flushes the active chunk and
+	// may rotate the file, creating a new complete file. We must drain again
+	// so that file is also encoded and truncated, otherwise its data would
+	// appear in both segments and the WAL on reopen.
+	var closeErr error
+	if s.walFile != nil {
+		closeErr = s.walFile.Close()
+	}
+	for s.walFile.NeedFlush() {
+		if err := s.flushCache(); err != nil {
+			s.flushMute.Unlock()
+			return err
+		}
+	}
+	s.flushMute.Unlock()
 	// Persist block-level indexes for all segments (including the last one).
 	s.fragmentation.Range(func(fs, _ FileSegment) bool {
 		_ = fs.PersistIndex()
@@ -581,12 +734,18 @@ func (s *ssTable) Close() error {
 		s.fragmentation.readerCache.closeAll()
 	}
 	if s.walFile != nil {
-		if err := s.walFile.Close(); err != nil {
+		s.walFile.removeOrphanedFiles()
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if s.Meta != nil {
+		if err := s.Meta.Close(); err != nil {
 			return err
 		}
 	}
-	if s.Meta != nil {
-		return s.Meta.Close()
-	}
-	return nil
+	// Surface the last asynchronous flush error, if any.
+	s.asyncErrMu.Lock()
+	defer s.asyncErrMu.Unlock()
+	return s.asyncErr
 }

@@ -3,7 +3,9 @@ package tsdb
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,7 +91,7 @@ func TestDB_WriteAndQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(points) != n {
-		t.Fatalf("QueryAll: expected %d points, got %d", n, len(points))
+		t.Fatalf("expected %d points after reopen, got %d", n, len(points))
 	}
 
 	// Verify first and last points
@@ -494,8 +496,8 @@ func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
 		}
 	}
 
-	// Query with maxNumber=5 -- triggers QueryLimitNumber (range > 3.6ms threshold).
-	points, err := db.Query("limit_unsorted", "tag1", baseTime, baseTime+20*int64(time.Second), 5, 1, nil)
+	// Query with maxNumber=5 over a range > 1 hour to trigger QueryLimitNumber.
+	points, err := db.Query("limit_unsorted", "tag1", baseTime, baseTime+2*int64(time.Hour), 5, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,5 +512,206 @@ func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
 			t.Errorf("points not sorted: points[%d].Tms=%d > points[%d].Tms=%d",
 				i-1, points[i-1].Tms, i, points[i].Tms)
 		}
+	}
+}
+
+
+// countDataFiles returns the number of .tsb segment files in a table's data dir.
+func countDataFiles(t *testing.T, dir, tableName string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, tableName, "data"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), dataSuffix) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestDB_AsyncFlush_Persistence(t *testing.T) {
+	dir := tempDir(t)
+	cfg := Config{
+		Path:           dir,
+		MaxStorageTime: 24 * 60 * 60 * 365,
+		WalConfig: WalConfig{
+			MaxFileSize:        4 * 1024,
+			MaxBufferBatchSize: 50,
+		},
+		AsyncFlush: true,
+	}
+	db, err := Open(cfg, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: "af", Type: ColumnTypeInt},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now().UnixNano()
+	const n = 5000
+	for i := 0; i < n; i++ {
+		_, err := db.Write("af", "tag1", baseTime+int64(i), variant.NewInt(i))
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	// Close waits for any in-flight async flush to finish.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen and verify every point survived.
+	db2, err := Open(cfg, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	points, err := db2.QueryAll("af", "tag1", baseTime-1, baseTime+int64(n)+1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != n {
+		t.Fatalf("expected %d points after reopen, got %d", n, len(points))
+	}
+}
+
+func TestDB_AsyncFlush_RunsInBackground(t *testing.T) {
+	dir := tempDir(t)
+	db, err := Open(Config{
+		Path:           dir,
+		MaxStorageTime: 24 * 60 * 60 * 365,
+		WalConfig: WalConfig{
+			MaxFileSize:        4 * 1024,
+			MaxBufferBatchSize: 50,
+		},
+		AsyncFlush: true,
+	}, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: "af2", Type: ColumnTypeInt},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now().UnixNano()
+	// Write enough to trigger several WAL rotations (NeedFlush becomes true),
+	// then let the background goroutine drain the WAL back to a single file.
+	for i := 0; i < 3000; i++ {
+		_, err := db.Write("af2", "tag1", baseTime+int64(i), variant.NewInt(i))
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	table, ok := db.ssTables.Load("af2")
+	if !ok {
+		t.Fatal("table not found")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !table.walFile.NeedFlush() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if table.walFile.NeedFlush() {
+		t.Fatal("async flush did not drain the WAL within timeout")
+	}
+
+	// The background flush must have encoded data to segment files on disk.
+	if got := countDataFiles(t, dir, "af2"); got == 0 {
+		t.Fatal("expected segment files on disk after async flush, found none")
+	}
+
+	// All data must still be queryable (segments + remaining WAL cache).
+	points, err := db.QueryAll("af2", "tag1", baseTime-1, baseTime+3001, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 3000 {
+		t.Fatalf("expected 3000 points, got %d", len(points))
+	}
+}
+
+func TestDB_AsyncCleanup_RemovesExpiredSegments(t *testing.T) {
+	dir := tempDir(t)
+	tableName := "ac"
+	dataDir := filepath.Join(dir, tableName, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-seed old empty segment files that are well past a 1-minute expiry.
+	now := time.Now().UnixNano()
+	oldTs := []int64{
+		now - 2 * int64(time.Hour),
+		now - int64(90 * time.Minute),
+		now - int64(80 * time.Minute),
+	}
+	for _, ts := range oldTs {
+		p := filepath.Join(dataDir, strconv.FormatInt(ts, 10)+dataSuffix)
+		if err := os.WriteFile(p, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := countDataFiles(t, dir, tableName); got != 3 {
+		t.Fatalf("expected 3 pre-seeded files, got %d", got)
+	}
+
+	db, err := Open(Config{
+		Path:                   dir,
+		MaxStorageTime:         24 * 60 * 60 * 365,
+		ExpirationMinuteTime:   1,
+		AsyncCleanup:           true,
+		CleanupIntervalSeconds: 1,
+	}, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// CreateTable loads the pre-seeded segments and starts the cleanup goroutine,
+	// whose initial sweep should remove the expired ones.
+	if err := db.CreateTable(TableInfo{
+		ColumnAttribute: ColumnAttribute{Name: tableName, Type: ColumnTypeInt},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if countDataFiles(t, dir, tableName) < 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := countDataFiles(t, dir, tableName); got >= 3 {
+		t.Fatalf("async cleanup did not remove expired segments, still %d files", got)
+	}
+
+	// The table must remain usable after cleanup.
+	baseTime := time.Now().UnixNano()
+	if _, err := db.Write(tableName, "tag1", baseTime, variant.NewInt(42)); err != nil {
+		t.Fatalf("write after cleanup: %v", err)
+	}
+	points, err := db.QueryAll(tableName, "tag1", baseTime-1, baseTime+1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("expected 1 point after cleanup, got %d", len(points))
 	}
 }

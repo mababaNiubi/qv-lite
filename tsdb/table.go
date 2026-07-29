@@ -3,6 +3,7 @@ package tsdb
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mababaNiubi/variant"
@@ -11,7 +12,6 @@ import (
 type tagCode uint32
 
 type ssTable struct {
-	mute      sync.RWMutex
 	tableInfo TableInfo
 	dirPath   string // Table directory path.
 	*Meta
@@ -33,8 +33,7 @@ type ssTable struct {
 	cancel          context.CancelFunc
 	flushWg         sync.WaitGroup // tracks in-flight async flush goroutines
 	cleanupDone     chan struct{}  // closed when the cleanup goroutine exits
-	asyncErrMu      sync.Mutex
-	asyncErr        error // last error from an async flush
+	asyncErr        atomic.Value // stores error from async flush
 }
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
@@ -364,14 +363,12 @@ func (s *ssTable) cleanupExpired() {
 }
 
 func (s *ssTable) setAsyncErr(err error) {
-	s.asyncErrMu.Lock()
-	s.asyncErr = err
-	s.asyncErrMu.Unlock()
+	s.asyncErr.Store(err)
 }
 
 func (s *ssTable) BuildColumn() error {
-	s.mute.Lock()
-	defer s.mute.Unlock()
+	s.flushMute.Lock()
+	defer s.flushMute.Unlock()
 	meta, err := NewMeta(s.dirPath)
 	if err != nil {
 		return err
@@ -385,8 +382,8 @@ func (s *ssTable) BuildColumn() error {
 }
 
 func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
-	s.mute.Lock()
-	defer s.mute.Unlock()
+	s.flushMute.Lock()
+	defer s.flushMute.Unlock()
 
 	// Double-check: another goroutine may have created this tag while we waited.
 	if code, ok := s.Meta.Load(tag); ok {
@@ -402,9 +399,7 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 		return 0, err
 	}
 
-	s.flushMute.Lock()
 	s.columnMap[code] = newSSColumn(code, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
-	s.flushMute.Unlock()
 	return code, nil
 }
 
@@ -507,9 +502,7 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCo
 }
 
 func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([]Point, error) {
-	s.mute.RLock()
 	code, ok := s.Meta.Load(tag)
-	s.mute.RUnlock()
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
@@ -746,7 +739,8 @@ func (s *ssTable) Close() error {
 		}
 	}
 	// Surface the last asynchronous flush error, if any.
-	s.asyncErrMu.Lock()
-	defer s.asyncErrMu.Unlock()
-	return s.asyncErr
+	if v := s.asyncErr.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
 }

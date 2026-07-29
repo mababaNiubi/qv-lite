@@ -115,6 +115,13 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 	// Write to WAL cache.
 	ok, _, err := s.walFile.Write(code, timestamp, value)
 	if err != nil {
+		if err == ErrorWALCacheFull {
+			// Backpressure: flush synchronously, then retry.
+			if flushErr := s.flushBlocking(); flushErr != nil {
+				return ok, flushErr
+			}
+			ok, _, err = s.walFile.Write(code, timestamp, value)
+		}
 		return ok, err
 	}
 	// Flush to disk when the cache exceeds the size limit.
@@ -159,6 +166,13 @@ func (s *ssTable) WriteBatch(points []TagPoint) (int, error) {
 
 	results, err := s.walFile.WriteBatch(entries)
 	if err != nil {
+		if err == ErrorWALCacheFull {
+			// Backpressure: flush synchronously, then retry.
+			if flushErr := s.flushBlocking(); flushErr != nil {
+				return results, flushErr
+			}
+			results, err = s.walFile.WriteBatch(entries)
+		}
 		return results, err
 	}
 
@@ -280,6 +294,25 @@ func (s *ssTable) flushAndCleanup() error {
 	// Inline cleanup only when the background cleanup loop is not running.
 	if !s.asyncCleanup && s.expirationMinuteTime != 0 {
 		s.fragmentation.Remove(time.Now().UnixNano() - s.expirationMinuteTime)
+	}
+	return nil
+}
+
+
+// flushBlocking acquires flushMute with a blocking lock and drains all
+// complete WAL files. Used as backpressure when the WAL is full instead
+// of returning ErrorWALCacheFull to the caller.
+func (s *ssTable) flushBlocking() error {
+	// Surface any prior async flush error before waiting.
+	if v := s.asyncErr.Load(); v != nil {
+		return v.(error)
+	}
+	s.flushMute.Lock()
+	defer s.flushMute.Unlock()
+	for s.walFile.NeedFlush() {
+		if err := s.flushAndCleanup(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

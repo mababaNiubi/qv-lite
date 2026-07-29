@@ -171,6 +171,12 @@ func (s *ssTable) WriteBatch(points []TagPoint) (int, error) {
 }
 
 func (s *ssTable) flushCache() error {
+	// Hold queryMute for the entire flush so a concurrent query cannot open
+	// a segment that is mid-transaction (TxActive). The reader's crash
+	// recovery would truncate such a file, corrupting the flush.
+	s.queryMute.Lock()
+	defer s.queryMute.Unlock()
+
 	// Open or create a data segment.
 	var err, readErr error
 	err = s.fragmentation.OpenTransaction()
@@ -248,15 +254,11 @@ func (s *ssTable) flushCache() error {
 			}
 		}
 	}
-	// Commit the data segments and truncate the consumed WAL files
-	// atomically (from a query's perspective) so a concurrent query cannot
-	// see the same data in both the WAL cache and the committed segments.
-	s.queryMute.Lock()
+	// Commit the data segments and truncate the consumed WAL files.
 	err = s.fragmentation.CommitTransactionFileSegment()
 	if err != nil {
 		// On commit failure, roll back to protect data integrity.
 		errRollback := s.fragmentation.RollbackLastCommitTransaction()
-		s.queryMute.Unlock()
 		if errRollback != nil {
 			return errRollback
 		}
@@ -264,7 +266,6 @@ func (s *ssTable) flushCache() error {
 	}
 	// Truncate WAL after successful flush.
 	s.walFile.truncate(consumed)
-	s.queryMute.Unlock()
 	return nil
 }
 

@@ -32,6 +32,7 @@ func openBenchDB(b *testing.B, dir string, walCacheSize int64) *DB {
 		WalConfig: WalConfig{
 			MaxFileSize: walCacheSize,
 		},
+		//AsyncFlush:     true,
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {

@@ -217,18 +217,17 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 		return true, fileIndex, nil
 	}
 
+	ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
+		Key:       key,
+		Timestamp: timestamp,
+		Value:     value,
+	})
 	// Batched mode: buffer in memory, flush when threshold reached.
 	if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
 		if err := ws.flushPending(); err != nil {
 			return false, 0, err
 		}
 	}
-
-	ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
-		Key:       key,
-		Timestamp: timestamp,
-		Value:     value,
-	})
 
 	return true, fileIndex, nil
 }
@@ -290,16 +289,16 @@ func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
 		if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
 			return results, ErrorWALCacheFull
 		}
-		if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
-			if err := ws.flushPending(); err != nil {
-				return results, err
-			}
-		}
 		ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
 			Key:       e.Key,
 			Timestamp: e.Timestamp,
 			Value:     e.Value,
 		})
+		if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
+			if err := ws.flushPending(); err != nil {
+				return results, err
+			}
+		}
 		results++
 	}
 	return results, nil
@@ -496,8 +495,6 @@ func (ws *walFile) addWalFile() error {
 }
 
 func (ws *walFile) NeedFlush() bool {
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
 	return len(ws.walFiles) > 1
 }
 
@@ -549,12 +546,6 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 }
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
-	// Copy only the slice header (3 words, stack-allocated) under the mutex.
-	// No heap allocation: the backing array is shared with ws.walFiles, and
-	// entries at indices [0, len-2] are immutable after rotation:
-	//   - addWalFile appends at the end (beyond our snapshot length).
-	//   - truncate reassigns the slice header but never mutates entries.
-	//   - Complete files' read buffers are frozen once the file is rotated.
 	ws.mutex.Lock()
 	snapshot := ws.walFiles[:len(ws.walFiles)-1]
 	ws.mutex.Unlock()

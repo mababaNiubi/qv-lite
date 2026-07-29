@@ -324,6 +324,20 @@ func TestDB_AsyncFlush_WriteBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(points) != totalPoints {
+		//s := 0
+		//for i := range points {
+		//	asInt, err := points[i].V.AsInt()
+		//	if err != nil {
+		//		return
+		//	}
+		//	if asInt != i {
+		//		t.Log(i, points[i])
+		//		s++
+		//		if s > 5 {
+		//			break
+		//		}
+		//	}
+		//}
 		t.Fatalf("expected %d points after reopen, got %d", totalPoints, len(points))
 	}
 }

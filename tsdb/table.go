@@ -298,7 +298,6 @@ func (s *ssTable) flushAndCleanup() error {
 	return nil
 }
 
-
 // flushBlocking acquires flushMute with a blocking lock and drains all
 // complete WAL files. Used as backpressure when the WAL is full instead
 // of returning ErrorWALCacheFull to the caller.
@@ -730,14 +729,6 @@ func (s *ssTable) Close() error {
 	if s.cleanupDone != nil {
 		<-s.cleanupDone
 	}
-	s.flushMute.Lock()
-	// Drain all complete WAL files so their data is encoded to segments.
-	for s.walFile.NeedFlush() {
-		if err := s.flushCache(); err != nil {
-			s.flushMute.Unlock()
-			return err
-		}
-	}
 	// Close the WAL. Its internal flushPending flushes the active chunk and
 	// may rotate the file, creating a new complete file. We must drain again
 	// so that file is also encoded and truncated, otherwise its data would
@@ -746,13 +737,6 @@ func (s *ssTable) Close() error {
 	if s.walFile != nil {
 		closeErr = s.walFile.Close()
 	}
-	for s.walFile.NeedFlush() {
-		if err := s.flushCache(); err != nil {
-			s.flushMute.Unlock()
-			return err
-		}
-	}
-	s.flushMute.Unlock()
 	// Persist block-level indexes for all segments (including the last one).
 	s.fragmentation.Range(func(fs, _ FileSegment) bool {
 		_ = fs.PersistIndex()

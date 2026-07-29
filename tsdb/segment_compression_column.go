@@ -30,9 +30,10 @@ type ColumnEncoder struct {
 	isNotStruct   bool
 	columnEncoder []Encoder
 	columnIndex   []string
+	batchSize     int
 }
 
-func NewColumnEncoder(attribute []ColumnAttribute) *ColumnEncoder {
+func NewColumnEncoder(attribute []ColumnAttribute, batchSize ...int) *ColumnEncoder {
 	// Create a default structure when none is provided.
 	defaultAttribute := []ColumnAttribute{
 		{
@@ -52,19 +53,19 @@ func NewColumnEncoder(attribute []ColumnAttribute) *ColumnEncoder {
 		me.columnIndex[i] = columnAttribute.Name
 		switch columnAttribute.Type {
 		case ColumnTypeInt:
-			me.columnEncoder[i] = NewIntegerEncoder()
+			me.columnEncoder[i] = NewIntegerEncoder(me.batchSize)
 		case ColumnTypeFloat:
-			me.columnEncoder[i] = NewFloatEncoder(columnAttribute.FloatPrecision)
+			me.columnEncoder[i] = NewFloatEncoder(columnAttribute.FloatPrecision, me.batchSize)
 		case ColumnTypeString:
-			me.columnEncoder[i] = NewStringEncoder()
+			me.columnEncoder[i] = NewStringEncoder(me.batchSize)
 		case ColumnTypeBool:
-			me.columnEncoder[i] = NewBooleanEncoder()
+			me.columnEncoder[i] = NewBooleanEncoder(me.batchSize)
 		case ColumnTypeJson:
 			me.columnEncoder[i] = NewJsonEncoder()
 		case ColumnTypeStructure:
-			me.columnEncoder[i] = NewColumnEncoder(columnAttribute.Structure)
+			me.columnEncoder[i] = NewColumnEncoder(columnAttribute.Structure, me.batchSize)
 		case ColumnTypeUnknown:
-			me.columnEncoder[i] = NewUnknownEncoder(columnAttribute.FloatPrecision)
+			me.columnEncoder[i] = NewUnknownEncoder(columnAttribute.FloatPrecision, me.batchSize)
 		default:
 		}
 	}

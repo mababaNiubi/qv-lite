@@ -34,9 +34,9 @@ type StringEncoder struct {
 }
 
 // NewStringEncoder returns a new StringEncoder with an initial buffer ready to hold sz bytes.
-func NewStringEncoder() *StringEncoder {
+func NewStringEncoder(batchSize ...int) *StringEncoder {
 	return &StringEncoder{
-		bytes: make([]byte, 0, 256),
+		bytes: make([]byte, 0, encoderCap(batchSize...)*16),
 	}
 }
 

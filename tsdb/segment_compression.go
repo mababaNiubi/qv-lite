@@ -8,11 +8,11 @@
 //	  [8:16]  MaxTime: int64 BE
 //	  [16:20] Attribute: tagCode BE (column identifier)
 //	  [20:28] DataSize: int64 BE (value + time byte length; +8 for non-struct)
-//	  [28:32] Crc: uint32 BE — CRC32 of the value data
+//	  [28:32] Crc: uint32 BE ??? CRC32 of the value data
 //
 //	Block payload:
 //	  For non-struct columns:
-//	    [0:8]   valueLen: uint64 BE — byte length of compressed value data
+//	    [0:8]   valueLen: uint64 BE ??? byte length of compressed value data
 //	    [8..]   compressed value data (marker byte + sub-encoder payload)
 //	    [..]    compressed time data (TimeEncoder output)
 //
@@ -79,5 +79,17 @@ const (
 	columnCompressed                  // 9: fixed-schema column encoding
 	adaptColumnCompressed             // 10: self-describing adaptive column encoding
 )
+
+// encoderCap extracts the batch size from a variadic argument.
+// Returns at least 64 to avoid tiny allocations; defaults to 256 when unset.
+func encoderCap(batchSize ...int) int {
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		if batchSize[0] < 64 {
+			return 64
+		}
+		return batchSize[0]
+	}
+	return 256
+}
 
 var emptyVariant = variant.NewEmpty()

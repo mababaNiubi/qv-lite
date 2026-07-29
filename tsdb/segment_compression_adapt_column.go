@@ -42,6 +42,7 @@ type AdaptColumnEncoder struct {
 	isNotStruct    bool
 	length         int
 	floatPrecision uint8
+	batchSize      int
 
 	// Struct mode: parallel arrays indexed by column position.
 	columnOrder    []string
@@ -67,7 +68,7 @@ func (m *AdaptColumnEncoder) colIdx(name string) int {
 	return -1
 }
 
-func NewAdaptColumnEncoder(floatPrecision uint8) *AdaptColumnEncoder {
+func NewAdaptColumnEncoder(floatPrecision uint8, batchSize ...int) *AdaptColumnEncoder {
 	return &AdaptColumnEncoder{
 		columnOrder:    make([]string, 0, 4),
 		columnEncoders: make([]Encoder, 0, 4),
@@ -75,6 +76,7 @@ func NewAdaptColumnEncoder(floatPrecision uint8) *AdaptColumnEncoder {
 		writePairs:     make([]kv, 0, 8),
 		seenColumns:    make([]bool, 0, 4),
 		floatPrecision: floatPrecision,
+		batchSize:      encoderCap(batchSize...),
 	}
 }
 
@@ -184,15 +186,15 @@ func (m *AdaptColumnEncoder) writeStruct(v variant.Variant) bool {
 func (m *AdaptColumnEncoder) findColumnEncoder(vt variant.Type) Encoder {
 	switch vt {
 	case variant.TypeMap:
-		return NewAdaptColumnEncoder(m.floatPrecision)
+		return NewAdaptColumnEncoder(m.floatPrecision, m.batchSize)
 	case variant.TypeString:
-		return NewStringEncoder()
+		return NewStringEncoder(m.batchSize)
 	case variant.TypeUInt64, variant.TypeInt64:
-		return NewIntegerEncoder()
+		return NewIntegerEncoder(m.batchSize)
 	case variant.TypeFloat64:
-		return NewFloatEncoder(m.floatPrecision)
+		return NewFloatEncoder(m.floatPrecision, m.batchSize)
 	case variant.TypeBool:
-		return NewBooleanEncoder()
+		return NewBooleanEncoder(m.batchSize)
 	default:
 		return NewJsonEncoder()
 	}

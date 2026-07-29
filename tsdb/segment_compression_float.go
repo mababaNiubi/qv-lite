@@ -35,14 +35,15 @@ var precision = [20]int{
 	0, 4, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40, 44, 47, 50, 54, 57, 60, 64,
 }
 
-func NewFloatEncoder(decimalQuantity uint8) Encoder {
+func NewFloatEncoder(decimalQuantity uint8, batchSize ...int) Encoder {
+	bc := encoderCap(batchSize...)
 	if decimalQuantity == 0 {
 		return &ZeroFloatPrecisionEncoder{
 			ZFloatEncoder: &ZFloatEncoder{
 				decimalQuantity: decimalQuantity,
 			},
 			decimalQuantity: 0,
-			fls:             make([]variant.Variant, 0, 256),
+			fls:             make([]variant.Variant, 0, bc),
 		}
 	}
 	return &ZFloatEncoder{

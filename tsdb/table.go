@@ -23,6 +23,7 @@ type ssTable struct {
 	maxStorageTime         int64
 	walFile                WalFile
 	flushMute              sync.Mutex
+	batchSize              int          // encoder pre-allocation size (from WalConfig.MaxBufferBatchSize)
 	queryMute              sync.RWMutex // serializes queries with flush commit+truncate
 
 	// Asynchronous processing (enabled via Config).
@@ -33,7 +34,7 @@ type ssTable struct {
 	cancel          context.CancelFunc
 	flushWg         sync.WaitGroup // tracks in-flight async flush goroutines
 	cleanupDone     chan struct{}  // closed when the cleanup goroutine exits
-	asyncErr        atomic.Value // stores error from async flush
+	asyncErr        atomic.Value   // stores error from async flush
 }
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
@@ -49,6 +50,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		maxStorageTime:         maxStorageTime,
 		asyncFlush:             asyncFlush,
 		asyncCleanup:           asyncCleanup,
+		batchSize:              walConfig.MaxBufferBatchSize,
 		cleanupInterval:        cleanupInterval,
 	}
 	s.ctx, s.cancel = context.WithCancel(parentCtx)
@@ -375,7 +377,7 @@ func (s *ssTable) BuildColumn() error {
 	}
 	s.Meta = meta
 	s.Meta.Range(func(k string, u tagCode) bool {
-		s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+		s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval, s.batchSize)
 		return true
 	})
 	return nil
@@ -399,7 +401,7 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 		return 0, err
 	}
 
-	s.columnMap[code] = newSSColumn(code, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+	s.columnMap[code] = newSSColumn(code, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval, s.batchSize)
 	return code, nil
 }
 

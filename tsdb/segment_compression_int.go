@@ -45,10 +45,10 @@ type IntegerEncoder struct {
 }
 
 // NewIntegerEncoder returns a new integer TimeEncoder with an initial buffer of values sized at sz.
-func NewIntegerEncoder() *IntegerEncoder {
+func NewIntegerEncoder(batchSize ...int) *IntegerEncoder {
 	return &IntegerEncoder{
 		rle:    true,
-		values: make([]uint64, 0, 256),
+		values: make([]uint64, 0, encoderCap(batchSize...)),
 	}
 }
 

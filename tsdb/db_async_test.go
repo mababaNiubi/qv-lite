@@ -142,9 +142,9 @@ func TestDB_AsyncCleanup_RemovesExpiredSegments(t *testing.T) {
 
 	now := time.Now().UnixNano()
 	oldTs := []int64{
-		now - 2 * int64(time.Hour),
-		now - int64(90 * time.Minute),
-		now - int64(80 * time.Minute),
+		now - 2*int64(time.Hour),
+		now - int64(90*time.Minute),
+		now - int64(80*time.Minute),
 	}
 	for _, ts := range oldTs {
 		p := filepath.Join(dataDir, strconv.FormatInt(ts, 10)+dataSuffix)
@@ -422,7 +422,7 @@ func TestDB_AsyncFlush_MultipleDataTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		db.Write("dt_float", "t", baseTime+int64(i), variant.NewFloat64(float64(i) * 1.5))
+		db.Write("dt_float", "t", baseTime+int64(i), variant.NewFloat64(float64(i)*1.5))
 	}
 
 	// String table

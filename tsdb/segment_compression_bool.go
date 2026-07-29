@@ -40,9 +40,10 @@ type BooleanEncoder struct {
 	err      error
 }
 
-func NewBooleanEncoder() *BooleanEncoder {
+func NewBooleanEncoder(batchSize ...int) *BooleanEncoder {
+	c := encoderCap(batchSize...)/8 + 1
 	return &BooleanEncoder{
-		bytes: make([]byte, 0, 64),
+		bytes: make([]byte, 0, c),
 	}
 }
 

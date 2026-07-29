@@ -76,9 +76,9 @@ type TimeEncoder struct {
 }
 
 // NewTimeEncoder returns a TimeEncoder with an initial buffer ready to hold sz bytes.
-func NewTimeEncoder(sz int) *TimeEncoder {
+func NewTimeEncoder(batchSize ...int) *TimeEncoder {
 	return &TimeEncoder{
-		ts:      make([]uint64, 0, 256),
+		ts:      make([]uint64, 0, encoderCap(batchSize...)),
 		enc:     simple8b.NewEncoder(),
 		minTime: math.MaxInt64,
 	}

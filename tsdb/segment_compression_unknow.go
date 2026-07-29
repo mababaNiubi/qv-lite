@@ -4,26 +4,20 @@ import (
 	"github.com/mababaNiubi/variant"
 )
 
-// UnknownEncoder adaptively selects a sub-encoder based on the type of the
-// first value written. Once a type is chosen, subsequent values with incompatible
-// types cause Write() to return false (signalling the caller to restructure/glow).
-//
-// Type compatibility (see incompatibleType):
-//
-//	Float64 accepts Int64, UInt64, and Bool (via AsFloat64 conversion).
-//	All other type switches are rejected.
-//
-// Binary layout: delegates entirely to the chosen sub-encoder.
-// No additional framing — the sub-encoder's Bytes() is returned as-is.
+// UnknownEncoder defers encoder selection until the first value is written.
+// Once a type is chosen, subsequent values with incompatible types cause Write
+// to return false so the caller can flush and restructure.
 type UnknownEncoder struct {
 	floatPrecision uint8
+	batchSize      int
 	vt             variant.Type
 	Encoder
 }
 
-func NewUnknownEncoder(floatPrecision uint8) *UnknownEncoder {
+func NewUnknownEncoder(floatPrecision uint8, batchSize ...int) *UnknownEncoder {
 	return &UnknownEncoder{
 		floatPrecision: floatPrecision,
+		batchSize:      encoderCap(batchSize...),
 	}
 }
 
@@ -34,7 +28,6 @@ func (m *UnknownEncoder) Write(v variant.Variant) bool {
 		return m.Encoder.Write(v)
 	}
 	if incompatibleType(m.vt, v.Type()) {
-		// Type mismatch; this encoder's lifetime is over.
 		return false
 	}
 	return m.Encoder.Write(v)
@@ -57,15 +50,15 @@ func (m *UnknownEncoder) Reset() {
 func (m *UnknownEncoder) adaptiveEncoder(variantType variant.Type) Encoder {
 	switch variantType {
 	case variant.TypeFloat64:
-		return NewFloatEncoder(m.floatPrecision)
+		return NewFloatEncoder(m.floatPrecision, m.batchSize)
 	case variant.TypeUInt64, variant.TypeInt64:
-		return NewIntegerEncoder()
+		return NewIntegerEncoder(m.batchSize)
 	case variant.TypeString:
-		return NewStringEncoder()
+		return NewStringEncoder(m.batchSize)
 	case variant.TypeBool:
-		return NewBooleanEncoder()
+		return NewBooleanEncoder(m.batchSize)
 	default:
-		return NewJsonEncoder() //Each write requires comparing the data key structure, which leads to poor write performance, so ColumnEncoder is not used
+		return NewJsonEncoder()
 	}
 }
 
@@ -73,7 +66,6 @@ func incompatibleType(old variant.Type, new variant.Type) bool {
 	if old == new {
 		return false
 	}
-	// Float encoder also accepts int and bool values.
 	if old == variant.TypeFloat64 && (new == variant.TypeUInt64 || new == variant.TypeInt64 || new == variant.TypeBool) {
 		return false
 	}

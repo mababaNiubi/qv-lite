@@ -549,34 +549,31 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 }
 
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
-	// Snapshot the complete (non-active) files under the mutex so that
-	// concurrent writes which rotate the WAL cannot change the file set
-	// mid-iteration. Complete files' read buffers are immutable after
-	// rotation, so iterating the snapshot without the lock is safe.
+	// Copy only the slice header (3 words, stack-allocated) under the mutex.
+	// No heap allocation: the backing array is shared with ws.walFiles, and
+	// entries at indices [0, len-2] are immutable after rotation:
+	//   - addWalFile appends at the end (beyond our snapshot length).
+	//   - truncate reassigns the slice header but never mutates entries.
+	//   - Complete files' read buffers are frozen once the file is rotated.
 	ws.mutex.Lock()
-	complete := make([]walFileEnty, len(ws.walFiles)-1)
-	copy(complete, ws.walFiles[:len(ws.walFiles)-1])
-	totalEntries := 0
-	for i := range complete {
-		totalEntries += complete[i].readBuffer.total
-	}
+	snapshot := ws.walFiles[:len(ws.walFiles)-1]
 	ws.mutex.Unlock()
 
-	for i := 0; i < len(complete); i++ {
+	for i := 0; i < len(snapshot); i++ {
 		if ws.config.CloseBuffer {
-			err := forEachWalFile(complete[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
+			err := forEachWalFile(snapshot[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
 				return fc(i, tag, timestamp, data, offset)
 			})
 			if err != nil {
 				return i, err
 			}
 		} else {
-			complete[i].readBuffer.forEach(func(e walDataEntry) bool {
+			snapshot[i].readBuffer.forEach(func(e walDataEntry) bool {
 				return fc(i, e.Key, e.Timestamp, e.Value, e.EndPosition)
 			})
 		}
 	}
-	return len(complete), nil
+	return len(snapshot), nil
 }
 
 func (ws *walFile) retainWalFilePrefix(index int, truncateSize int64) error {

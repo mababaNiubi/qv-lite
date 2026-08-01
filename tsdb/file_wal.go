@@ -227,6 +227,7 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 		if err := ws.flushPending(); err != nil {
 			return false, 0, err
 		}
+		fileIndex = len(ws.walFiles) - 1
 	}
 
 	return true, fileIndex, nil
@@ -278,6 +279,7 @@ func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
 			if err := ws.rotateIfFull(); err != nil {
 				return results, err
 			}
+			fileIndex = len(ws.walFiles) - 1
 			results++
 		}
 		return results, nil
@@ -298,6 +300,7 @@ func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
 			if err := ws.flushPending(); err != nil {
 				return results, err
 			}
+			fileIndex = len(ws.walFiles) - 1
 		}
 		results++
 	}
@@ -476,6 +479,16 @@ func (ws *walFile) SetLastPoint(key tagCode, ts int64, value variant.Variant) {
 func (ws *walFile) addWalFile() error {
 	tm := time.Now().UnixNano()
 	fileName := filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
+	//// Ensure unique filename: on Windows rapid successive calls
+	//// may get the same timestamp. Increment until unused.
+	//var fileName string
+	//for {
+	//	fileName = filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
+	//	if _, err := os.Stat(fileName); os.IsNotExist(err) {
+	//		break
+	//	}
+	//	tm++
+	//}
 	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		return err
@@ -601,7 +614,9 @@ func (ws *walFile) truncate(n int) {
 		return
 	}
 	for i := 0; i < n; i++ {
-		_ = os.Remove(ws.walFiles[i].fileName)
+		if err := os.Remove(ws.walFiles[i].fileName); err != nil {
+			_ = os.Rename(ws.walFiles[i].fileName, ws.walFiles[i].fileName+".deleted")
+		}
 	}
 	ws.walFiles = ws.walFiles[n:]
 }

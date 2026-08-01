@@ -192,6 +192,12 @@ func (s *ssTable) flushCache() error {
 	s.queryMute.Lock()
 	defer s.queryMute.Unlock()
 
+	// Flush the active WAL file's unflushed chunk first so that
+	// complete files only contain flushed data during encoding.
+	if s.walFile != nil {
+		_ = s.walFile.FlushPending()
+	}
+
 	// Open or create a data segment.
 	var err, readErr error
 	err = s.fragmentation.OpenTransaction()

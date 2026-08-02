@@ -49,6 +49,7 @@ var (
 // Condition errors
 var (
 	ErrorEmptyLogicalCondition = errors.New("logical condition has no sub-conditions")
+	ErrorColumnNotFound        = errors.New("condition column not found")
 )
 
 // Errorf helpers for format-string errors that are used in multiple places.

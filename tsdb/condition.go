@@ -49,7 +49,7 @@ func EvalCondition(cond Condition, data variant.Variant) (bool, error) {
 		// Resolve column value from data by traversing nested keys.
 		columnValue, exists := data.MapGet(columnAttributeNames[i])
 		if !exists {
-			return false, nil
+			return false, fmt.Errorf("%w: %q", ErrorColumnNotFound, columnAttributeNames[i])
 		}
 		if columnValue.Type() == variant.TypeMap {
 			data = columnValue
@@ -133,7 +133,7 @@ func CompileCondition(cond any) ConditionFilter {
 				if v.Type() != variant.TypeMap {
 					return CompareValue(c, v)
 				}
-				return false, nil
+				return false, fmt.Errorf("%w: %q", ErrorColumnNotFound, parts[0])
 			}
 		}
 		return func(v variant.Variant) (bool, error) {
@@ -191,7 +191,7 @@ func evalCompiledCondition(cond Condition, parts []string, data variant.Variant)
 	for i := range parts {
 		columnValue, exists := data.MapGet(parts[i])
 		if !exists {
-			return false, nil
+			return false, fmt.Errorf("%w: %q", ErrorColumnNotFound, parts[i])
 		}
 		if columnValue.Type() == variant.TypeMap {
 			data = columnValue

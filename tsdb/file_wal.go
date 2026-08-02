@@ -478,17 +478,16 @@ func (ws *walFile) SetLastPoint(key tagCode, ts int64, value variant.Variant) {
 
 func (ws *walFile) addWalFile() error {
 	tm := time.Now().UnixNano()
-	fileName := filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
-	//// Ensure unique filename: on Windows rapid successive calls
-	//// may get the same timestamp. Increment until unused.
-	//var fileName string
-	//for {
-	//	fileName = filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
-	//	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-	//		break
-	//	}
-	//	tm++
-	//}
+	// Ensure unique filename: on Windows rapid successive calls
+	// may get the same timestamp. Increment until unused.
+	var fileName string
+	for {
+		fileName = filepath.Join(ws.filePath, strconv.FormatInt(tm, 10)+".wal")
+		if _, err := os.Stat(fileName); os.IsNotExist(err) {
+			break
+		}
+		tm++
+	}
 	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		return err

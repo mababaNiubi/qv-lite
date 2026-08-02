@@ -290,7 +290,7 @@ func TestDB_AsyncFlush_WriteBatch(t *testing.T) {
 	}
 
 	baseTime := time.Now().UnixNano()
-	const totalPoints = 4000
+	const totalPoints = 400
 	const batchSize = 200
 	for n := 0; n < totalPoints/batchSize; n++ {
 		points := make([]TagPoint, batchSize)

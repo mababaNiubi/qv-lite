@@ -185,12 +185,12 @@ static void test_query_range(qv_handle db, char* tag,
 // Test 5: Aggregated query
 // ---------------------------------------------------------------------------
 static void test_query_aggregated(qv_handle db, char* tag,
-                                  int64_t start, int64_t end, int64_t max_n) {
-    printf("\n=== Test 5: Aggregated query (%s, %d buckets) ===\n",
-           tag, (int)max_n);
+                                  int64_t start, int64_t end, int64_t window_ns) {
+    printf("\n=== Test 5: Aggregated query (%s, window=%.3fs) ===\n",
+           tag, (double)window_ns / 1e9);
 
     double t0 = now_ms();
-    qv_result_t* r = qv_query(db, "", tag, start, end, max_n, 0 /* avg */);
+    qv_result_t* r = qv_query(db, "", tag, start, end, window_ns, 0 /* avg */);
     double elapsed = now_ms() - t0;
 
     if (r->error) {
@@ -274,7 +274,7 @@ int main(void) {
            (double)(query_end - t0_base) / 1e9);
 
     test_query_range(db, "tag_00042", query_start, query_end);
-    test_query_aggregated(db, "tag_00042", query_start, query_end, 500);
+    test_query_aggregated(db, "tag_00042", query_start, query_end, 12000000000LL /* 12s window */);
     test_read_structured(db, query_start, query_end);
 
     // --- Cleanup ---

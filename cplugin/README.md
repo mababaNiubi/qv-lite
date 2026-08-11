@@ -82,7 +82,7 @@ Float64 is stored via union bit-cast (`union { double d; int64_t i; }`), not poi
 | | `qv_create_table(handle, info)` | `char*` error or NULL |
 | Write | `qv_write(h, table, tag, ts, value)` | `char*` error or NULL |
 | | `qv_write_batch(h, table, points, n)` | `char*` error or NULL |
-| Query | `qv_query(h, table, tag, from, to, n, fusion)` | `qv_result_t*` |
+| Query | `qv_query(h, table, tag, from, to, windowSize, fusion)` | `qv_result_t*` |
 | | `qv_query_all(h, table, tag, from, to)` | `qv_result_t*` |
 | | `qv_query_latest(h, table, tag)` | `qv_result_t*` |
 | Memory | `qv_free_result(r)` | — |

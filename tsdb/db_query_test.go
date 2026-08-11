@@ -175,15 +175,12 @@ func TestDB_QueryLimitNumber_WithUnsortedWAL(t *testing.T) {
 		}
 	}
 
-	points, err := db.Query("limit_unsorted", "tag1", baseTime, baseTime+2*int64(time.Hour), 5, 1, nil)
+	points, err := db.Query("limit_unsorted", "tag1", baseTime, baseTime+2*int64(time.Hour), 5*int64(time.Second), 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(points) == 0 {
 		t.Fatal("expected at least 1 point, got 0")
-	}
-	if len(points) > 5 {
-		t.Errorf("expected at most 5 points, got %d", len(points))
 	}
 	for i := 1; i < len(points); i++ {
 		if points[i].Tms < points[i-1].Tms {

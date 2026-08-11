@@ -93,11 +93,11 @@ written, err := db.Write("metrics", "cpu_usage", time.Now().UnixNano(), variant.
 ### 查询
 
 ```go
-// 范围查询 + 降采样 — 适用于长时间范围
+// 范围查询 + 降采样 — 按固定时间窗口聚合
 points, err := db.Query("default", "sensor_temp",
     time.Now().Add(-1*time.Hour).UnixNano(), // startTime (ns)
     time.Now().UnixNano(),                   // endTime (ns)
-    1000,                                    // maxNumber 返回最大点数
+    int64(time.Minute),                      // windowSize — 聚合窗口大小 (ns)，0 = 原始数据
     tsdb.AvgFusion,                          // 聚合模式
     nil,                                     // 条件过滤（nil = 无过滤）
 )

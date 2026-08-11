@@ -593,37 +593,29 @@ func isNumericType(v variant.Variant) bool {
 	}
 }
 
-// QueryLimitNumber queries data for a tag within a time range, limited to maxNumber points.
-// fusion controls aggregation: 0=avg, 1=min, 2=max.
-func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, maxNumber int64, fusion uint8, cond any) ([]Point, error) {
+// QueryWindow queries data for a tag within a time range, aggregating within fixed-size windows.
+// windowSize is the aggregation window in nanoseconds. fusion controls aggregation: 0=avg, 1=min, 2=max.
+func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, windowSize int64, fusion uint8, cond any) ([]Point, error) {
 	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	tms, _, ok := s.walFile.GetTagMaxTimestamp(code)
-	if ok {
-		endTime = min(endTime, tms)
-	}
-	var interval = (endTime - startTime) / maxNumber
+	var interval = windowSize
 
 	s.queryMute.RLock()
 	defer s.queryMute.RUnlock()
 
 	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()
-	var targetTms, count, lastTms, pointsLen int64
+	var targetTms, varCount, lastTms int64
 	var windowNumeric bool
 	// resetWindow begins a new aggregation window at the given point.
 	resetWindow := func(tms int64, v variant.Variant) {
 		lastTms = tms
 		targetTms = tms
 		targetValue = v
-		count = 1
+		varCount = 1
 		windowNumeric = isNumericType(v)
-		n := maxNumber - pointsLen
-		if n > 0 {
-			interval = (endTime - lastTms) / n
-		}
 	}
 
 	slideFunc := func(pack PointPack) ([]Point, error) {
@@ -644,10 +636,6 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 			if tms-lastTms >= interval {
 				fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
 				resetWindow(tms, v)
-				pointsLen++
-				if pointsLen >= maxNumber-1 {
-					return fgPoints, nil
-				}
 				continue
 			}
 			// If the window started with a non-numeric value, skip all aggregation
@@ -667,13 +655,13 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 					targetTms = tms
 				}
 			default:
-				count++
-				targetTms = targetTms + (tms-targetTms)/count
+				varCount++
+				targetTms = targetTms + (tms-targetTms)/varCount
 				reduceVariant, err := v.Reduce(targetValue)
 				if err != nil {
 					return nil, err
 				}
-				divideValue, err := reduceVariant.Divide(variant.NewInt64(count))
+				divideValue, err := reduceVariant.Divide(variant.NewInt64(varCount))
 				if err != nil {
 					return nil, err
 				}
@@ -689,7 +677,7 @@ func (s *ssTable) QueryLimitNumber(tag string, startTime int64, endTime int64, m
 
 	var err error
 	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
-	points := make([]Point, 0, maxNumber)
+	points := make([]Point, 0)
 	err = s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
 		pack.Reset()
 		if e := pack.AddSegment(compressedTimeData, compressedValueData); e != nil {

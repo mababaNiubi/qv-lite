@@ -169,12 +169,12 @@ char* qv_write_batch(qv_handle h, char* table, const qv_batch_point_t* points, i
 
 // Query data within [startTime, endTime] (nanoseconds, inclusive).
 //
-//  qv_query        — at most maxNumber points, aggregated (0=avg 1=min 2=max).
+//  qv_query        — aggregated into fixed windowSize-nanosecond windows (0=avg 1=min 2=max). windowSize<=0 returns raw data.
 //  qv_query_all    — all matching points, no aggregation.
 //  qv_query_latest — the most recent point for this tag.
 //
 // Free the result with qv_free_result. On error, result->error is non-NULL.
-qv_result_t* qv_query       (qv_handle h, char* table, char* tag, int64_t startTime, int64_t endTime, int64_t maxNumber, uint8_t fusion);
+qv_result_t* qv_query       (qv_handle h, char* table, char* tag, int64_t startTime, int64_t endTime, int64_t windowSize, uint8_t fusion);
 qv_result_t* qv_query_all   (qv_handle h, char* table, char* tag, int64_t startTime, int64_t endTime);
 qv_result_t* qv_query_latest(qv_handle h, char* table, char* tag);
 

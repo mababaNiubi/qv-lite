@@ -93,11 +93,11 @@ written, err := db.Write("metrics", "cpu_usage", time.Now().UnixNano(), variant.
 ### Query
 
 ```go
-// Range query with downsampling — best for long time ranges
+// Range query with downsampling — aggregation into fixed-size time windows
 points, err := db.Query("default", "sensor_temp",
     time.Now().Add(-1*time.Hour).UnixNano(), // startTime (ns)
     time.Now().UnixNano(),                   // endTime (ns)
-    1000,                                    // maxNumber of returned points
+    int64(time.Minute),                      // windowSize — aggregation window (ns), 0 = raw data
     tsdb.AvgFusion,                          // aggregation mode
     nil,                                     // condition filter (nil = no filter)
 )

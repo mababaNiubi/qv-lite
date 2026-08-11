@@ -289,7 +289,7 @@ func (db *DB) WriteBatch(tableName string, points []TagPoint) (int, error) {
 	return table.WriteBatch(points)
 }
 
-func (db *DB) Query(tableName string, tag string, startTime int64, endTime int64, maxNumber int64, polymerization uint8, cond any) ([]Point, error) {
+func (db *DB) Query(tableName string, tag string, startTime int64, endTime int64, windowSize int64, polymerization uint8, cond any) ([]Point, error) {
 	tableName = db.resolveTableName(tableName)
 	// Clamp query range to the expiration time window.
 	if db.ExpirationMinuteTime != 0 {
@@ -300,14 +300,11 @@ func (db *DB) Query(tableName string, tag string, startTime int64, endTime int64
 	if !ok {
 		return nil, nil
 	}
-	if maxNumber == 0 {
-		maxNumber = 10000
+	// windowSize <= 0 means return all raw data without aggregation.
+	if windowSize <= 0 {
+		return table.Query(tag, startTime, endTime, cond)
 	}
-	// For queries spanning less than 1 hour, read all data directly.
-	if endTime-startTime > int64(time.Hour) {
-		return table.QueryLimitNumber(tag, startTime, endTime, maxNumber, polymerization, cond)
-	}
-	return table.Query(tag, startTime, endTime, cond)
+	return table.QueryWindow(tag, startTime, endTime, windowSize, polymerization, cond)
 }
 
 func (db *DB) QueryAll(tableName string, tag string, startTime int64, endTime int64, cond any) ([]Point, error) {

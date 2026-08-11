@@ -125,7 +125,7 @@ func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
 	writeElapsed := time.Since(writeStart)
 	// 查询阶段
 	queryStart := time.Now()
-	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, LogicalCondition{
+	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, int64(time.Second), 1, LogicalCondition{
 		Op: LogicalAnd,
 		Cond: []any{
 			Condition{

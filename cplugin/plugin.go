@@ -410,7 +410,7 @@ func fillResult(r *C.qv_result_t, points []tsdb.Point) {
 // ---------------------------------------------------------------------------
 
 //export qv_query
-func qv_query(h C.uintptr_t, table *C.char, tag *C.char, startTime C.int64_t, endTime C.int64_t, maxNumber C.int64_t, fusion C.uint8_t) *C.qv_result_t {
+func qv_query(h C.uintptr_t, table *C.char, tag *C.char, startTime C.int64_t, endTime C.int64_t, windowSize C.int64_t, fusion C.uint8_t) *C.qv_result_t {
 	hd := loadHandle(uintptr(h))
 	if hd == nil {
 		r := allocResult()
@@ -419,7 +419,7 @@ func qv_query(h C.uintptr_t, table *C.char, tag *C.char, startTime C.int64_t, en
 	}
 	hd.mu.Lock()
 	defer hd.mu.Unlock()
-	points, err := hd.db.Query(C.GoString(table), C.GoString(tag), int64(startTime), int64(endTime), int64(maxNumber), uint8(fusion), nil)
+	points, err := hd.db.Query(C.GoString(table), C.GoString(tag), int64(startTime), int64(endTime), int64(windowSize), uint8(fusion), nil)
 	r := allocResult()
 	if err != nil {
 		r.error = C.CString(err.Error())

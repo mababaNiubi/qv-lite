@@ -73,3 +73,10 @@ func (c *readerCache) closeAll() {
 		delete(c.readers, path)
 	}
 }
+
+// size returns the number of cached open readers.
+func (c *readerCache) size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.readers)
+}

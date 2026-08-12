@@ -189,6 +189,28 @@ func (s *fileSegmentList) InspectLastBlockIndex(tableInfo *TableInfo) (map[tagCo
 	}
 	return f.InspectBlockIndex(tableInfo)
 }
+
+// catalogBytes returns the estimated in-memory size of the per-segment block
+// indexes (the read-side "catalog"). Each BlockIndexEntry is ~40 bytes.
+func (s *fileSegmentList) catalogBytes() int64 {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	var n int64
+	for i := range s.segments {
+		if idx := s.segments[i].GetIndex(); idx != nil {
+			n += int64(len(idx.Blocks)) * 40
+		}
+	}
+	return n
+}
+
+// readerCacheSize returns the number of open file handles cached for reads.
+func (s *fileSegmentList) readerCacheSize() int {
+	if s.readerCache == nil {
+		return 0
+	}
+	return s.readerCache.size()
+}
 func (s *fileSegmentList) PersistLastIndex() error {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()

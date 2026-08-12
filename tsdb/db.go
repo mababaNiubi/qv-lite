@@ -75,6 +75,10 @@ type Config struct {
 	// cleanup sweeps when AsyncCleanup is enabled. An initial sweep runs
 	// immediately on startup. Default 60.
 	CleanupIntervalSeconds int64 `json:"cleanup_interval_seconds"`
+	// MaxOpenReaders caps the number of segment file handles kept open for
+	// reads (each handle buffers ~64KB). Default 64. Lower it on
+	// memory-constrained devices to bound read-side memory.
+	MaxOpenReaders int `json:"max_open_readers"`
 }
 
 const DefaultTableName = "default"
@@ -165,7 +169,8 @@ func (db *DB) BuildTable() error {
 			db.ctx,
 			db.AsyncFlush,
 			db.AsyncCleanup,
-			time.Duration(db.CleanupIntervalSeconds)*time.Second)
+			time.Duration(db.CleanupIntervalSeconds)*time.Second,
+			db.MaxOpenReaders)
 		if err != nil {
 			return err
 		}
@@ -207,7 +212,8 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.ctx,
 		db.AsyncFlush,
 		db.AsyncCleanup,
-		time.Duration(db.CleanupIntervalSeconds)*time.Second)
+		time.Duration(db.CleanupIntervalSeconds)*time.Second,
+		db.MaxOpenReaders)
 	if err != nil {
 		return err
 	}
@@ -329,4 +335,40 @@ func (db *DB) QueryLatest(tableName string, tag string) (*Point, error) {
 		return nil, ErrorTableNotExists
 	}
 	return table.QueryLatest(tag)
+}
+
+// MemoryStats is a point-in-time estimate of the DB's memory usage, split into
+// read side (segment catalog indexes, open reader handles) and write side
+// (in-memory WAL entries/bytes, column encoders). WAL/encoder bytes are
+// documented approximations (the WAL holds decoded variant objects, ~5x the
+// serialized size), not precise measurements.
+type MemoryStats struct {
+	Tables int `json:"tables"`
+
+	// Read side
+	CatalogBytes int64 `json:"catalog_bytes"`   // in-memory segment block indexes
+	ReaderCache  int   `json:"reader_cache_open"` // open file handles for reads
+
+	// Write side
+	WalEntries   int64 `json:"wal_entries"`     // in-memory WAL point count
+	WalBytes     int64 `json:"wal_bytes_est"`   // estimated in-memory WAL bytes
+	EncoderBytes int64 `json:"encoder_bytes_est"` // estimated column encoder bytes
+
+	TotalEst int64 `json:"total_bytes_est"` // CatalogBytes + WalBytes + EncoderBytes
+}
+
+// MemoryStats returns an estimate of the DB's current memory usage.
+func (db *DB) MemoryStats() MemoryStats {
+	ms := MemoryStats{Tables: len(db.tableInfos)}
+	db.ssTables.Range(func(_ string, table *ssTable) bool {
+		c, we, wb, eb, rc := table.memoryStats()
+		ms.CatalogBytes += c
+		ms.ReaderCache += rc
+		ms.WalEntries += we
+		ms.WalBytes += wb
+		ms.EncoderBytes += eb
+		return true
+	})
+	ms.TotalEst = ms.CatalogBytes + ms.WalBytes + ms.EncoderBytes
+	return ms
 }

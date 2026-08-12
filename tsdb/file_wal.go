@@ -119,6 +119,9 @@ type WalFile interface {
 	// the OS. It is used to persist tag metadata ahead of the points that
 	// reference those tags (durability ordering: codes before data).
 	SetPreFlush(fn func() error)
+	// memoryEstimate returns the in-memory WAL entry count and an estimated
+	// byte footprint (used by DB.MemoryStats).
+	memoryEstimate() (entries int64, bytes int64)
 	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
 	retainWalFilePrefix(index int, truncateSize int64) error
 	truncate(n int)
@@ -556,6 +559,37 @@ func (ws *walFile) addWalFile() error {
 
 func (ws *walFile) NeedFlush() bool {
 	return len(ws.walFiles) > 1
+}
+
+// memoryEstimate returns the number of in-memory WAL entries and an estimated
+// byte footprint (struct + variant payload). The WAL holds decoded variant
+// objects (not serialized bytes), so this is ~5x the on-disk serialized size;
+// the estimate is a documented approximation, not a precise count.
+func (ws *walFile) memoryEstimate() (entries int64, bytes int64) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+	for i := range ws.walFiles {
+		rb := ws.walFiles[i].readBuffer
+		entries += int64(rb.total)
+		rb.forEach(func(e walDataEntry) bool {
+			bytes += entryMemEstimate(e.Value)
+			return true
+		})
+	}
+	return entries, bytes
+}
+
+// entryMemEstimate approximates the in-memory cost of one WAL entry: the
+// walDataEntry struct plus the variant's payload (heap for string/list/map).
+func entryMemEstimate(v variant.Variant) int64 {
+	switch v.Type() {
+	case variant.TypeString:
+		return 48 + 16 + int64(len(v.AsString()))
+	case variant.TypeMap, variant.TypeList:
+		return 48 + 32 + int64(len(v.AppendBinary(nil)))
+	default:
+		return 48 // scalar (bool/int/uint/float) is stored inline in the variant
+	}
 }
 
 func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {

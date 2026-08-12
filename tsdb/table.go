@@ -38,7 +38,7 @@ type ssTable struct {
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
 	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig,
-	parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration) (*ssTable, error) {
+	parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration, maxOpenReaders int) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -64,7 +64,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	if err != nil {
 		return nil, err
 	}
-	s.fragmentation.readerCache = newReaderCache(defaultMaxOpenReaders)
+	s.fragmentation.readerCache = newReaderCache(maxOpenReaders)
 	err = s.fragmentation.BuildFragmentation(s.dirPath, CompressorByName(compressionName))
 	if err != nil {
 		return nil, err
@@ -405,6 +405,21 @@ func (s *ssTable) cleanupExpired() {
 
 func (s *ssTable) setAsyncErr(err error) {
 	s.asyncErr.Store(err)
+}
+
+// memoryStats returns the table's memory breakdown: read side (catalog
+// indexes, open reader handles) and write side (WAL entries/bytes, column
+// encoders). WAL and encoder figures are documented estimates, not precise.
+func (s *ssTable) memoryStats() (catalog, walEntries, walBytes, encoderBytes int64, readerCache int) {
+	catalog = s.fragmentation.catalogBytes()
+	readerCache = s.fragmentation.readerCacheSize()
+	if s.walFile != nil {
+		walEntries, walBytes = s.walFile.memoryEstimate()
+	}
+	for _, col := range s.columnMap {
+		encoderBytes += col.encoderEstimate()
+	}
+	return
 }
 
 func (s *ssTable) BuildColumn() error {

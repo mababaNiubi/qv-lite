@@ -57,6 +57,13 @@ type RunReport struct {
 	TotalAlloc  uint64 `json:"total_alloc_bytes"`
 	NumGC       uint32 `json:"num_gc"`
 
+	// Estimated memory breakdown (point-in-time after write, via DB.MemoryStats)
+	MemCatalogBytes int64 `json:"mem_catalog_bytes"`
+	MemWalEntries   int64 `json:"mem_wal_entries"`
+	MemWalBytes     int64 `json:"mem_wal_bytes_est"`
+	MemEncoderBytes int64 `json:"mem_encoder_bytes_est"`
+	MemReaderCache  int   `json:"mem_reader_cache_open"`
+
 	// Compression / disk
 	RawInputBytes int64   `json:"raw_input_bytes"`
 	OnDiskBytes   int64   `json:"on_disk_bytes"`
@@ -184,6 +191,15 @@ func RunScenario(s Scenario, hc HarnessConfig) (*RunReport, error) {
 	// rotation) apart from a disk stall. Stalls are detected cross-run in
 	// MedianReports, where a run whose write/read rate is far below the batch
 	// median is marked and dropped.
+
+	// ── Memory breakdown (WAL still populated, before Close) ──
+	if ms := db.MemoryStats(); ms.Tables > 0 {
+		r.MemCatalogBytes = ms.CatalogBytes
+		r.MemWalEntries = ms.WalEntries
+		r.MemWalBytes = ms.WalBytes
+		r.MemEncoderBytes = ms.EncoderBytes
+		r.MemReaderCache = ms.ReaderCache
+	}
 
 	// ── Close (flushes all WAL to segments) then measure disk ──
 	if err := db.Close(); err != nil {

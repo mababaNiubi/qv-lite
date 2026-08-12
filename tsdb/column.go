@@ -193,3 +193,13 @@ func (s *ssColumn) Reset() {
 	s.tmsCompressor.Reset()
 	s.valueCompressor.Reset()
 }
+
+// encoderEstimate approximates the column encoder's in-memory cost: the
+// timestamp buffer (8B/point) plus a rough fixed base for the value encoder.
+// Encoders are reset per flush, so this tracks the current flush window.
+func (s *ssColumn) encoderEstimate() int64 {
+	if s.tmsCompressor == nil {
+		return 0
+	}
+	return int64(s.tmsCompressor.Length())*8 + 2048
+}

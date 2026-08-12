@@ -186,7 +186,7 @@ func (p *PointDiskPack) AddSegment(tmsData []byte, valueData []byte) error {
 		valueDecoder = jsonDecoderPool.Get().(*JsonDecoder)
 	case floatCompressedXDMI:
 		valueDecoder = floatDecoderPool.Get().(*FloatDecoder)
-	case stringCompressedSnappy:
+	case stringCompressedSnappy, stringCompressedDict:
 		valueDecoder = strDecoderPool.Get().(*StringDecoder)
 	case booleanCompressedRLEFalse, booleanCompressedRLETrue, booleanCompressedBitPacked:
 		valueDecoder = boolDecoderPool.Get().(*BooleanDecoder)

@@ -80,6 +80,10 @@ const (
 	adaptColumnCompressed             // 10: self-describing adaptive column encoding
 )
 
+// stringCompressedDict is emitted by the adaptive StringEncoder when a per-block
+// dictionary encoding is smaller than the snappy fallback.
+const stringCompressedDict = 11
+
 // encoderCap extracts the batch size from a variadic argument.
 // Returns at least 64 to avoid tiny allocations; defaults to 256 when unset.
 func encoderCap(batchSize ...int) int {

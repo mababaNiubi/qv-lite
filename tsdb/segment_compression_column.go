@@ -167,7 +167,7 @@ func (m *ColumnDecoder) SetBytes(compressedData []byte) {
 			m.columnDecoder[i] = &JsonDecoder{}
 		case floatCompressedXDMI:
 			m.columnDecoder[i] = &FloatDecoder{}
-		case stringCompressedSnappy:
+		case stringCompressedSnappy, stringCompressedDict:
 			m.columnDecoder[i] = &StringDecoder{}
 		case booleanCompressedRLEFalse, booleanCompressedRLETrue, booleanCompressedBitPacked:
 			m.columnDecoder[i] = &BooleanDecoder{}

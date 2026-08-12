@@ -398,7 +398,7 @@ func decoderForMarker(marker byte) Decoder {
 		return &IntegerDecoder{}
 	case floatCompressedXDMI:
 		return &FloatDecoder{}
-	case stringCompressedSnappy:
+	case stringCompressedSnappy, stringCompressedDict:
 		return &StringDecoder{}
 	case booleanCompressedBitPacked, booleanCompressedRLETrue, booleanCompressedRLEFalse:
 		return &BooleanDecoder{}

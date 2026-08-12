@@ -84,6 +84,10 @@ type WalFile interface {
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
+	// SetPreFlush registers a hook invoked before any WAL bytes are written to
+	// the OS. It is used to persist tag metadata ahead of the points that
+	// reference those tags (durability ordering: codes before data).
+	SetPreFlush(fn func() error)
 	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
 	retainWalFilePrefix(index int, truncateSize int64) error
 	truncate(n int)
@@ -104,6 +108,7 @@ type walFile struct {
 	dedupWindowMs int64
 	minIntervalMs int64
 	config        WalConfig
+	preFlush      func() error // durability hook: persist tag metadata before WAL bytes reach the OS
 }
 
 func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig WalConfig) (WalFile, error) {
@@ -173,6 +178,14 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 func (s *walFile) updateWalConfig(walConfig WalConfig) {
 	walConfig.setDefaultValues()
 	s.config = walConfig
+}
+
+// SetPreFlush registers the durability hook invoked before WAL bytes reach the
+// OS (see flushPending).
+func (s *walFile) SetPreFlush(fn func() error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.preFlush = fn
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
@@ -319,6 +332,15 @@ func (ws *walFile) flushPending() error {
 
 	if len(chunk) == 0 {
 		return nil
+	}
+
+	// Durability ordering: persist tag metadata before this batch's bytes can
+	// reach the OS. Tag codes must be durable ahead of the points referencing
+	// them so a crash can never orphan a code and have it reused for another tag.
+	if ws.preFlush != nil {
+		if err := ws.preFlush(); err != nil {
+			return err
+		}
 	}
 
 	// Skip sort if already ordered by (Key, Timestamp).

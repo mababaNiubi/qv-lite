@@ -73,6 +73,9 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	if err != nil {
 		return nil, err
 	}
+	// Persist tag metadata before any WAL bytes reach the OS, so tag codes are
+	// always durable ahead of the points referencing them.
+	s.walFile.SetPreFlush(s.Meta.FlushPending)
 	// Handle file corruption caused by an abnormal interruption during writes.
 	lastPoints, err := s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
 	if err != nil {

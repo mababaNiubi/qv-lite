@@ -39,8 +39,13 @@ type Meta struct {
 	Path         string
 	container.SyncMap[string, tagCode]
 
-	mu   sync.Mutex
-	file *os.File
+	mu      sync.Mutex
+	file    *os.File
+	// pending buffers tag entries written by addTag. They are flushed to the
+	// file (and fsynced) by flushPendingLocked, which the WAL calls before any
+	// WAL bytes reach the OS. This turns per-tag fsync (~3ms/tag) into one
+	// fsync per WAL batch, which is what makes high-cardinality writes viable.
+	pending []byte
 }
 
 func (s *Meta) addTag(tag string) (tagCode, error) {
@@ -61,22 +66,48 @@ func (s *Meta) addTag(tag string) (tagCode, error) {
 	crc := crc32.ChecksumIEEE(entry[:dataLen])
 	binary.BigEndian.PutUint32(entry[dataLen:], crc)
 
-	if _, err := s.file.Write(entry); err != nil {
-		return 0, err
-	}
-	if err := s.file.Sync(); err != nil {
-		return 0, err
-	}
+	// Buffer the entry; it reaches the file only when the WAL asks to persist
+	// (flushPendingLocked), so creating a tag costs no fsync. The in-memory
+	// map is updated immediately so the code is usable right away.
+	s.pending = append(s.pending, entry...)
 	s.Store(tag, s.MaxPointDict)
 	return s.MaxPointDict, nil
 }
 
-// Close flushes and closes the underlying file. Call on table shutdown.
+// FlushPending writes and fsyncs any buffered tag entries. The WAL calls it
+// before writing WAL bytes to the OS, guaranteeing tag codes are durable
+// before the points that reference them can be. Idempotent and safe to call
+// when nothing is pending.
+func (s *Meta) FlushPending() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushPendingLocked()
+}
+
+func (s *Meta) flushPendingLocked() error {
+	if len(s.pending) == 0 {
+		return nil
+	}
+	if _, err := s.file.Write(s.pending); err != nil {
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		return err
+	}
+	s.pending = s.pending[:0]
+	return nil
+}
+
+// Close flushes any buffered tag entries, fsyncs, and closes the file.
+// Call on table shutdown.
 func (s *Meta) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.file != nil {
-		err := s.file.Sync()
+		err := s.flushPendingLocked()
+		if syncErr := s.file.Sync(); syncErr != nil && err == nil {
+			err = syncErr
+		}
 		if closeErr := s.file.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
@@ -88,7 +119,8 @@ func (s *Meta) Close() error {
 
 func NewMeta(path string) (*Meta, error) {
 	m := &Meta{
-		Path: filepath.Join(path, metaFile),
+		Path:    filepath.Join(path, metaFile),
+		pending: make([]byte, 0, 1024),
 	}
 
 	f, err := os.OpenFile(m.Path, os.O_RDONLY, 0644)

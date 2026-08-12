@@ -68,6 +68,37 @@ func (b *walReadBuffer) unflushedCount() int {
 	return len(b.chunks[len(b.chunks)-1])
 }
 
+// sortedChunk reports whether chunk is already ordered by (Key, Timestamp).
+// Cheap adjacent check; the common single-tag stream short-circuits here.
+func sortedChunk(chunk []walDataEntry) bool {
+	for i := 1; i < len(chunk); i++ {
+		ci, pi := &chunk[i], &chunk[i-1]
+		if ci.Key < pi.Key || (ci.Key == pi.Key && ci.Timestamp < pi.Timestamp) {
+			return false
+		}
+	}
+	return true
+}
+
+// perTagMonotonic reports whether every tag's timestamps in chunk are
+// non-decreasing (i.e. the data is in-order per tag, even if interleaved).
+// This is the invariant that matters for encoding correctness and for keeping
+// out-of-order points: a full reorder is unnecessary when it holds.
+func perTagMonotonic(chunk []walDataEntry) bool {
+	if len(chunk) < 2 {
+		return true
+	}
+	lastTs := make(map[tagCode]int64, 8)
+	for i := range chunk {
+		e := &chunk[i]
+		if prev, ok := lastTs[e.Key]; ok && e.Timestamp < prev {
+			return false
+		}
+		lastTs[e.Key] = e.Timestamp
+	}
+	return true
+}
+
 type walFileEnty struct {
 	fileName   string
 	length     int64
@@ -343,16 +374,13 @@ func (ws *walFile) flushPending() error {
 		}
 	}
 
-	// Skip sort if already ordered by (Key, Timestamp).
-	sorted := true
-	for i := 1; i < len(chunk); i++ {
-		ci, pi := &chunk[i], &chunk[i-1]
-		if ci.Key < pi.Key || (ci.Key == pi.Key && ci.Timestamp < pi.Timestamp) {
-			sorted = false
-			break
-		}
-	}
-	if !sorted {
+	// Ordering. A full (Key, Timestamp) reorder is only needed to retain
+	// genuinely out-of-order points (they would otherwise be dropped by
+	// dedup). The WAL file does not need per-tag grouping: columns accumulate
+	// independently during segment flush, and ReadByTime sorts its results.
+	// So when every tag's timestamps are already monotonic - the common
+	// in-order case - the expensive sort is skipped entirely.
+	if !sortedChunk(chunk) && !perTagMonotonic(chunk) {
 		sort.Slice(chunk, func(i, j int) bool {
 			if chunk[i].Key != chunk[j].Key {
 				return chunk[i].Key < chunk[j].Key

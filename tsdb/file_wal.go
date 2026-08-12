@@ -404,22 +404,20 @@ func (ws *walFile) flushPending() error {
 
 // appendSerialized serializes (key, timestamp, value) and appends to dst.
 // Returns the updated slice and the byte length of the appended record.
+//
+// Record layout (big-endian): [4B totalLen][4B key][8B ts][value binary].
+// The value is appended directly via Variant.AppendBinary (which appends to dst
+// and never allocates when capacity allows) and the length header is backfilled,
+// avoiding a per-entry allocation in the hot flushPending loop.
 func appendSerialized(dst []byte, key tagCode, timestamp int64, value variant.Variant) ([]byte, int64, error) {
-	binaryValue, err := value.MarshalBinary()
-	if err != nil {
-		return dst, 0, err
-	}
-	totalDataLen := 12 + len(binaryValue)
-
-	var dataArr [12]byte
-	binary.BigEndian.PutUint32(dataArr[0:4], uint32(key))
-	binary.BigEndian.PutUint64(dataArr[4:], uint64(timestamp))
-	var lenArr [4]byte
-	binary.BigEndian.PutUint32(lenArr[:], uint32(totalDataLen))
-
-	dst = append(dst, lenArr[:]...)
-	dst = append(dst, dataArr[:]...)
-	dst = append(dst, binaryValue...)
+	start := len(dst)
+	// Reserve the 16-byte header (4 len + 4 key + 8 ts).
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(dst[start+4:start+8], uint32(key))
+	binary.BigEndian.PutUint64(dst[start+8:start+16], uint64(timestamp))
+	dst = value.AppendBinary(dst)
+	totalDataLen := len(dst) - start - 4
+	binary.BigEndian.PutUint32(dst[start:start+4], uint32(totalDataLen))
 	return dst, int64(4 + totalDataLen), nil
 }
 

@@ -1,0 +1,6 @@
+# JetBrains IDE
+.idea/
+
+# Go profiling output (go test -cpuprofile/-memprofile, pprof)
+*.out
+*.prof

@@ -80,6 +80,10 @@ const (
 	adaptColumnCompressed             // 10: self-describing adaptive column encoding
 )
 
+// stringCompressedDict is emitted by the adaptive StringEncoder when a per-block
+// dictionary encoding is smaller than the snappy fallback.
+const stringCompressedDict = 11
+
 // encoderCap extracts the batch size from a variadic argument.
 // Returns at least 64 to avoid tiny allocations; defaults to 256 when unset.
 func encoderCap(batchSize ...int) int {
@@ -91,5 +95,14 @@ func encoderCap(batchSize ...int) int {
 	}
 	return 256
 }
+
+// encoderInitCap is the initial capacity used when creating column encoders.
+// It is deliberately small (256) rather than tied to the WAL batch size so
+// that high-cardinality tables do not pre-allocate ~96KB per tag up front
+// (TimeEncoder 32KB + value encoder 32-64KB at MaxBufferBatchSize=4096).
+// Encoders grow via append as points accumulate, and Reset retains the grown
+// capacity, so only sparse/never-written tags stay small. Flush cadence is
+// driven by the WAL threshold, not encoder capacity.
+const encoderInitCap = 256
 
 var emptyVariant = variant.NewEmpty()

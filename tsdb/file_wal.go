@@ -68,6 +68,37 @@ func (b *walReadBuffer) unflushedCount() int {
 	return len(b.chunks[len(b.chunks)-1])
 }
 
+// sortedChunk reports whether chunk is already ordered by (Key, Timestamp).
+// Cheap adjacent check; the common single-tag stream short-circuits here.
+func sortedChunk(chunk []walDataEntry) bool {
+	for i := 1; i < len(chunk); i++ {
+		ci, pi := &chunk[i], &chunk[i-1]
+		if ci.Key < pi.Key || (ci.Key == pi.Key && ci.Timestamp < pi.Timestamp) {
+			return false
+		}
+	}
+	return true
+}
+
+// perTagMonotonic reports whether every tag's timestamps in chunk are
+// non-decreasing (i.e. the data is in-order per tag, even if interleaved).
+// This is the invariant that matters for encoding correctness and for keeping
+// out-of-order points: a full reorder is unnecessary when it holds.
+func perTagMonotonic(chunk []walDataEntry) bool {
+	if len(chunk) < 2 {
+		return true
+	}
+	lastTs := make(map[tagCode]int64, 8)
+	for i := range chunk {
+		e := &chunk[i]
+		if prev, ok := lastTs[e.Key]; ok && e.Timestamp < prev {
+			return false
+		}
+		lastTs[e.Key] = e.Timestamp
+	}
+	return true
+}
+
 type walFileEnty struct {
 	fileName   string
 	length     int64
@@ -84,6 +115,10 @@ type WalFile interface {
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
+	// SetPreFlush registers a hook invoked before any WAL bytes are written to
+	// the OS. It is used to persist tag metadata ahead of the points that
+	// reference those tags (durability ordering: codes before data).
+	SetPreFlush(fn func() error)
 	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
 	retainWalFilePrefix(index int, truncateSize int64) error
 	truncate(n int)
@@ -104,6 +139,7 @@ type walFile struct {
 	dedupWindowMs int64
 	minIntervalMs int64
 	config        WalConfig
+	preFlush      func() error // durability hook: persist tag metadata before WAL bytes reach the OS
 }
 
 func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig WalConfig) (WalFile, error) {
@@ -173,6 +209,14 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 func (s *walFile) updateWalConfig(walConfig WalConfig) {
 	walConfig.setDefaultValues()
 	s.config = walConfig
+}
+
+// SetPreFlush registers the durability hook invoked before WAL bytes reach the
+// OS (see flushPending).
+func (s *walFile) SetPreFlush(fn func() error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.preFlush = fn
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
@@ -321,16 +365,22 @@ func (ws *walFile) flushPending() error {
 		return nil
 	}
 
-	// Skip sort if already ordered by (Key, Timestamp).
-	sorted := true
-	for i := 1; i < len(chunk); i++ {
-		ci, pi := &chunk[i], &chunk[i-1]
-		if ci.Key < pi.Key || (ci.Key == pi.Key && ci.Timestamp < pi.Timestamp) {
-			sorted = false
-			break
+	// Durability ordering: persist tag metadata before this batch's bytes can
+	// reach the OS. Tag codes must be durable ahead of the points referencing
+	// them so a crash can never orphan a code and have it reused for another tag.
+	if ws.preFlush != nil {
+		if err := ws.preFlush(); err != nil {
+			return err
 		}
 	}
-	if !sorted {
+
+	// Ordering. A full (Key, Timestamp) reorder is only needed to retain
+	// genuinely out-of-order points (they would otherwise be dropped by
+	// dedup). The WAL file does not need per-tag grouping: columns accumulate
+	// independently during segment flush, and ReadByTime sorts its results.
+	// So when every tag's timestamps are already monotonic - the common
+	// in-order case - the expensive sort is skipped entirely.
+	if !sortedChunk(chunk) && !perTagMonotonic(chunk) {
 		sort.Slice(chunk, func(i, j int) bool {
 			if chunk[i].Key != chunk[j].Key {
 				return chunk[i].Key < chunk[j].Key
@@ -382,22 +432,20 @@ func (ws *walFile) flushPending() error {
 
 // appendSerialized serializes (key, timestamp, value) and appends to dst.
 // Returns the updated slice and the byte length of the appended record.
+//
+// Record layout (big-endian): [4B totalLen][4B key][8B ts][value binary].
+// The value is appended directly via Variant.AppendBinary (which appends to dst
+// and never allocates when capacity allows) and the length header is backfilled,
+// avoiding a per-entry allocation in the hot flushPending loop.
 func appendSerialized(dst []byte, key tagCode, timestamp int64, value variant.Variant) ([]byte, int64, error) {
-	binaryValue, err := value.MarshalBinary()
-	if err != nil {
-		return dst, 0, err
-	}
-	totalDataLen := 12 + len(binaryValue)
-
-	var dataArr [12]byte
-	binary.BigEndian.PutUint32(dataArr[0:4], uint32(key))
-	binary.BigEndian.PutUint64(dataArr[4:], uint64(timestamp))
-	var lenArr [4]byte
-	binary.BigEndian.PutUint32(lenArr[:], uint32(totalDataLen))
-
-	dst = append(dst, lenArr[:]...)
-	dst = append(dst, dataArr[:]...)
-	dst = append(dst, binaryValue...)
+	start := len(dst)
+	// Reserve the 16-byte header (4 len + 4 key + 8 ts).
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(dst[start+4:start+8], uint32(key))
+	binary.BigEndian.PutUint64(dst[start+8:start+16], uint64(timestamp))
+	dst = value.AppendBinary(dst)
+	totalDataLen := len(dst) - start - 4
+	binary.BigEndian.PutUint32(dst[start:start+4], uint32(totalDataLen))
 	return dst, int64(4 + totalDataLen), nil
 }
 

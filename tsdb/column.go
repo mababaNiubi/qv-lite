@@ -7,7 +7,7 @@ import (
 	"github.com/mababaNiubi/variant"
 )
 
-func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentTimeInterval int64, batchSize int) *ssColumn {
+func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentTimeInterval int64) *ssColumn {
 	if tableInfo == nil {
 		tableInfo = &TableInfo{
 			ColumnAttribute: ColumnAttribute{
@@ -28,22 +28,22 @@ func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentT
 		tableInfo:              tableInfo,
 		maxSegmentSize:         maxSize,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
-		tmsCompressor:          NewTimeEncoder(batchSize),
+		tmsCompressor:          NewTimeEncoder(encoderInitCap),
 	}
 	switch tableInfo.Type {
 	case ColumnTypeUnknown:
-		sc.valueCompressor = NewAdaptColumnEncoder(tableInfo.FloatPrecision, batchSize)
+		sc.valueCompressor = NewAdaptColumnEncoder(tableInfo.FloatPrecision, encoderInitCap)
 		//sc.valueCompressor = NewUnknownEncoder(tableInfo.FloatPrecision, batchSize)
 	case ColumnTypeBool:
-		sc.valueCompressor = NewBooleanEncoder(batchSize)
+		sc.valueCompressor = NewBooleanEncoder(encoderInitCap)
 	case ColumnTypeFloat:
-		sc.valueCompressor = NewFloatEncoder(tableInfo.FloatPrecision, batchSize)
+		sc.valueCompressor = NewFloatEncoder(tableInfo.FloatPrecision, encoderInitCap)
 	case ColumnTypeInt:
-		sc.valueCompressor = NewIntegerEncoder(batchSize)
+		sc.valueCompressor = NewIntegerEncoder(encoderInitCap)
 	case ColumnTypeString:
-		sc.valueCompressor = NewStringEncoder(batchSize)
+		sc.valueCompressor = NewStringEncoder(encoderInitCap)
 	case ColumnTypeStructure:
-		sc.valueCompressor = NewColumnEncoder(tableInfo.Structure, batchSize)
+		sc.valueCompressor = NewColumnEncoder(tableInfo.Structure, encoderInitCap)
 	default:
 		sc.valueCompressor = &JsonEncoder{}
 

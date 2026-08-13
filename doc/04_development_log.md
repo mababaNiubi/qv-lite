@@ -8,26 +8,23 @@
 
 **背景**：WAL 内存里存 variant 对象（恒定 32B/个，float 序列化才 10B）。与用户讨论后确认：variant 拆壳（AsInt64 等）与字节拆壳（BigEndian.Uint64）都是 ~1ns 零分配，性能差可忽略；之前 3 次 byte-memtable 失败的真正原因是**每点 `AppendBinary(nil)` 分配**（GC 压力），不是拆壳开销。
 
-**改动**（实验分支 879cc62，基于本分支 903e6ba）：
-- `walDataEntry` 去掉 variant，改 `{off, length}` 引用 chunk 共享字节缓冲（flat buffer）。
-- `walChunk{data []byte, entries []walDataEntry}`；Write 时 `value.AppendBinary(chunk.data)` 直接 append 进共享缓冲——**零每点分配**（这是之前失败版没做对的关键）。
-- 读/刷盘边界 `decodeValue()` 按需解码（标量 ~1ns 重解释）。
-- `WriteBatch` 输入改独立类型 `walBatchEntry`。
-- `memoryEstimate` 从估算变**精确**（数据字节 + 元数据）。
+**改动**（实验分支两个提交，基于本分支 903e6ba）：
+- `879cc62` flat-buffer：`walDataEntry` 去掉 variant，改 `{off, length}` 引用 chunk 共享字节缓冲；Write 时 `value.AppendBinary(chunk.data)` 直接 append——**零每点分配**（之前 3 次失败版没做对的关键）。`memoryEstimate` 从估算变**精确**。
+- `df4b7d7` WriteBytes：**用户实测发现第一版在刷盘时仍有一次 variant 装箱**（`decodeValue → variant → 编码器.AsFloat64`），正确诊断。修复：`Encoder` 接口加 `WriteBytes([]byte)`，标量编码器（int/float/string/bool）直接解析字节（~1ns 重解释，语义与 AsXxx 一致），容器编码器（json/column/adapt/unknown）回退 decode+Write；`ssColumn.WriteBytes` + `forEachCompleteFile` 全链路字节直通。
 
 **实测**（默认 WAL，1M 点，repeat 3，同机）：
 
-| 场景 | 旧（variant WAL） | 新（flat-buffer） |
+| 场景 | 旧（variant WAL） | 新（flat-buffer + WriteBytes） |
 |---|---|---|
-| single-float-1tag 写 | ~1.35M pts/s | **2.09M pts/s（+55%）** |
-| batch-float-10tag 写 | ~890k pts/s | 875k（持平） |
+| single-float-1tag 写 | ~1.35M pts/s | **2.23M pts/s（+65%）** |
+| batch-float-10tag 写 | ~890k pts/s | **1.0M pts/s（+13%）** |
 | single peakHeap | 136~176MB | **128.7MB** |
-| batch peakHeap | 105~145MB | **92.8MB** |
+| batch peakHeap | 105~145MB | **96.8MB** |
 | WAL 内存（1M 点） | 48MB（估算） | **34.0MB（精确：10B 值 + 24B 元数据/条）** |
 
-**诚实修正**：单条内存实际省 ~1.4×（元数据 ~24-28B 两种设计都有，不是之前说的 3-10× 纯结构体对比）。但**写吞吐 +55%（单 tag）**是意外之喜——零分配 + 少 GC 的收益超过了预期。
+**诚实修正**：单条内存实际省 ~1.4×（元数据 ~24-28B 两种设计都有，不是之前说的 3-10× 纯结构体对比）。写吞吐提升来自「零每点分配 + 无装箱 + 少 GC」。
 
-**结论**：flat-buffer 是**双赢**（写更快 + 内存更省 + 估算变精确），`go test ./tsdb/` 与 benchmark 全绿。**保留在实验分支供审阅，后续可合入主线。** 剩余相关工作：方案 B 列式 memtable（彻底消除序列化）、compaction（M2）。
+**结论**：flat-buffer + WriteBytes 是**双赢**（写更快 + 内存更省 + 估算变精确），`go test ./tsdb/` 与 benchmark 全绿。**保留在实验分支供审阅，后续可合入主线。** 剩余相关工作：方案 B 列式 memtable（彻底消除序列化）、compaction（M2）。
 
 ---
 

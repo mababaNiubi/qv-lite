@@ -83,8 +83,11 @@ type DB struct {
 	tableInfos []TableInfo
 	Config
 	ssTables container.SyncMap[string, *ssTable]
-	ctx      context.Context
-	cancel   context.CancelFunc
+	// tableCache resolves recent (tableName → table) hits without touching
+	// ssTables' map on every Write. Table mappings are permanent once created.
+	tableCache container.StringKeyCache[*ssTable]
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func (db *DB) resolveTableName(name string) string {
@@ -118,7 +121,8 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 		config.CleanupIntervalSeconds = 60
 	}
 	db := &DB{
-		Config: config,
+		Config:     config,
+		tableCache: *container.NewStringKeyCache[*ssTable](tableCacheSlots),
 	}
 	db.ctx, db.cancel = context.WithCancel(ctx)
 	err := db.BuildTable()
@@ -251,6 +255,9 @@ func (db *DB) Close() error {
 
 func (db *DB) getTable(tableName string) (*ssTable, error) {
 	tableName = db.resolveTableName(tableName)
+	if table, ok := db.tableCache.Lookup(tableName); ok {
+		return table, nil
+	}
 	table, ok := db.ssTables.Load(tableName)
 	if !ok {
 		if tableName == DefaultTableName {
@@ -262,6 +269,7 @@ func (db *DB) getTable(tableName string) (*ssTable, error) {
 			return nil, ErrorTableNotExists
 		}
 	}
+	db.tableCache.Store(tableName, table)
 	return table, nil
 }
 

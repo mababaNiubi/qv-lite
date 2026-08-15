@@ -4,3 +4,6 @@
 # Go profiling output (go test -cpuprofile/-memprofile, pprof)
 *.out
 *.prof
+
+# Build artifact
+qv-lite.exe

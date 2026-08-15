@@ -39,13 +39,31 @@ type Meta struct {
 	Path         string
 	container.SyncMap[string, tagCode]
 
-	mu      sync.Mutex
-	file    *os.File
+	mu   sync.Mutex
+	file *os.File
 	// pending buffers tag entries written by addTag. They are flushed to the
 	// file (and fsynced) by flushPendingLocked, which the WAL calls before any
 	// WAL bytes reach the OS. This turns per-tag fsync (~3ms/tag) into one
 	// fsync per WAL batch, which is what makes high-cardinality writes viable.
 	pending []byte
+
+	// tagCache is a direct-mapped hot-tag cache in front of the embedded map.
+	// tag→code is immutable once assigned, so entries never need invalidation;
+	// a miss just falls through to the map (read-through).
+	tagCache container.StringKeyCache[tagCode]
+}
+
+// Load resolves a tag to its code, using the hot-tag cache to skip the map on
+// the write hot loop. Identical semantics to the embedded map's Load.
+func (s *Meta) Load(tag string) (tagCode, bool) {
+	if code, ok := s.tagCache.Lookup(tag); ok {
+		return code, true
+	}
+	code, ok := s.SyncMap.Load(tag)
+	if ok {
+		s.tagCache.Store(tag, code)
+	}
+	return code, ok
 }
 
 func (s *Meta) addTag(tag string) (tagCode, error) {
@@ -119,8 +137,9 @@ func (s *Meta) Close() error {
 
 func NewMeta(path string) (*Meta, error) {
 	m := &Meta{
-		Path:    filepath.Join(path, metaFile),
-		pending: make([]byte, 0, 1024),
+		Path:     filepath.Join(path, metaFile),
+		pending:  make([]byte, 0, 1024),
+		tagCache: *container.NewStringKeyCache[tagCode](tagCacheSlots),
 	}
 
 	f, err := os.OpenFile(m.Path, os.O_RDONLY, 0644)

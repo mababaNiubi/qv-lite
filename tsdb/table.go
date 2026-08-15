@@ -104,7 +104,7 @@ func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (boo
 		// Reject data with timestamps too far beyond the current time.
 		return false, ErrorTimeOut
 	}
-	// Look up the column index.
+	// Look up the column index. Meta.Load serves hot tags from its cache.
 	code, ok := s.Meta.Load(tag)
 	if !ok {
 		var err error

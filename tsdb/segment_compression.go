@@ -49,6 +49,9 @@ const (
 	indexMagic      = 0x49445801 // "IDX" + version 1
 	maxSegmentSize  = 64 * 1024 * 1024
 	maxColumnTag    = 255 * 255 * 255 * 255
+
+	tagCacheSlots   = 256
+	tableCacheSlots = 32
 )
 
 type Encoder interface {

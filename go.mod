@@ -9,3 +9,5 @@ require (
 	github.com/mababaNiubi/variant v1.2.1
 	github.com/pierrec/lz4/v4 v4.1.26
 )
+
+replace github.com/mababaNiubi/variant => C:/soft/work/variant

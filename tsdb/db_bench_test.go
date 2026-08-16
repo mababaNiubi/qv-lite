@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mababaNiubi/variant"
 )
+
+// ==================== 辅助 ====================
 
 func benchDir(b *testing.B) string {
 	dir, err := os.MkdirTemp("", "tsdb_bench_*")
@@ -26,365 +27,366 @@ func benchDir(b *testing.B) string {
 	return dir
 }
 
-func openBenchDB(b *testing.B, dir string, walCacheSize int64) *DB {
+// benchOpen 打开一个可配置的 DB。walSize 越大越少触发段刷新,可隔离"纯 WAL 写路径"
+// 与"含段编码压缩的完整写路径"两个场景。
+// 返回 (db, dir):dir 是该 DB 的数据目录,调用方(如 E2E 测 size)必须用它而不是自建目录。
+func benchOpen(b *testing.B, tableName string, walSize int64) (*DB, string) {
+	dir := benchDir(b)
 	db, err := Open(Config{
-		Path: dir,
-		WalConfig: WalConfig{
-			MaxFileSize: walCacheSize,
-		},
+		Path:           dir,
+		WalConfig:      WalConfig{MaxFileSize: walSize},
 		AsyncFlush:     true,
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() {
-		db.Close()
-	})
-	return db
-}
-
-// ==================== E2E: 写后即查 ====================
-
-// BenchmarkE2E_WriteAndQuery 模拟 main.go 的完整流程：
-// 写入 86400 秒 * 1000 点/秒 = 86,400,000 个数据点，然后全量查询。
-// 使用 -benchtime=1x 确保只运行一次。
-func BenchmarkE2E_WriteAndQuery(b *testing.B) {
-	go func() {
-		http.ListenAndServe(":6060", nil)
-	}()
-	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
-	dir := benchDir(b)
-	tableName := "eu12"
-	tag := "CPU"
-	db := openBenchDB(b, dir, 256*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
+	b.Cleanup(func() { db.Close() })
+	if err := db.CreateTable(TableInfo{ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2}}); err != nil {
 		b.Fatal(err)
 	}
+	return db, dir
+}
 
-	b.ResetTimer()
-	b.ReportAllocs()
+// prebuiltTags 预生成 numTags 个 tag 字符串,避免计时循环里做 fmt。
+func prebuiltTags(numTags int) []string {
+	tags := make([]string, numTags)
+	for i := range tags {
+		tags[i] = fmt.Sprintf("tag_%d", i)
+	}
+	return tags
+}
 
-	// 写入阶段
+// ==================== 写场景 ====================
+
+// BenchmarkWritePoint 隔离单点写路径(锁/缓存/tag解析/去重/追加)。
+// 轴:值类型 × tag基数。大 WAL(不触发段刷新)聚焦 WAL 本身。
+func BenchmarkWritePoint(b *testing.B) {
+	// 字符串值池:low-card 循环 8 个(走 dict),high-card 循环 100000 个(超过
+	// 字典阈值 4096 → 走 snappy)。预生成以隔离调用方 fmt 成本。
+	lowCardStrings := make([]string, 8)
+	highCardStrings := make([]string, 100000)
+	for i := range lowCardStrings {
+		lowCardStrings[i] = fmt.Sprintf("st_%d", i)
+	}
+	for i := range highCardStrings {
+		highCardStrings[i] = fmt.Sprintf("st_%06d", i)
+	}
+
+	scenarios := []struct {
+		name  string
+		value func(i int) variant.Variant
+	}{
+		{"float", func(i int) variant.Variant { return variant.NewFloat64(float64(i) * 0.01) }},
+		{"int", func(i int) variant.Variant { return variant.NewInt(i) }},
+		{"string_lowcard", func(i int) variant.Variant { return variant.NewString(lowCardStrings[i%len(lowCardStrings)]) }},
+		{"string_highcard", func(i int) variant.Variant { return variant.NewString(highCardStrings[i%len(highCardStrings)]) }},
+	}
+	for _, sc := range scenarios {
+		for _, numTags := range []int{1, 100, 10000} {
+			b.Run(fmt.Sprintf("%s/card%d", sc.name, numTags), func(b *testing.B) {
+				db, _ := benchOpen(b, "t", 256<<20)
+				tags := prebuiltTags(numTags)
+				base := time.Now().UnixNano()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := db.Write("t", tags[i%numTags], base+int64(i)*1e6, sc.value(i)); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkWriteWithFlush 用小 WAL 强制段刷新,隔离"完整写路径(追加+压缩编码)"。
+// 与 BenchmarkWritePoint(大 WAL)对比即可看出压缩编码的成本。
+func BenchmarkWriteWithFlush(b *testing.B) {
+	for _, numTags := range []int{1, 100} {
+		b.Run(fmt.Sprintf("card%d", numTags), func(b *testing.B) {
+			db, _ := benchOpen(b, "t", 1<<20) // 1MB WAL,频繁刷新
+			tags := prebuiltTags(numTags)
+			base := time.Now().UnixNano()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := db.Write("t", tags[i%numTags], base+int64(i)*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkWriteBatch 隔离批量写的锁摊薄效果。轴:批大小 × tag基数。
+func BenchmarkWriteBatch(b *testing.B) {
+	for _, batchSize := range []int{100, 1000, 10000} {
+		for _, numTags := range []int{1, 100} {
+			b.Run(fmt.Sprintf("batch%d/card%d", batchSize, numTags), func(b *testing.B) {
+				db, _ := benchOpen(b, "t", 256<<20)
+				tags := prebuiltTags(numTags)
+				base := time.Now().UnixNano()
+				points := make([]TagPoint, batchSize)
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					off := n * batchSize
+					for i := range points {
+						points[i] = TagPoint{
+							Tag:       tags[(off+i)%numTags],
+							Timestamp: base + int64(off+i)*1e6,
+							Value:     variant.NewFloat64(float64(off+i) * 0.01),
+						}
+					}
+					if _, err := db.WriteBatch("t", points); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkWriteParallel 隔离锁竞争。轴:goroutine 数。
+// 用全局原子序号保证时间戳唯一,避免并发写同 tag 被去重扭曲吞吐。
+func BenchmarkWriteParallel(b *testing.B) {
+	for _, goroutines := range []int{1, 4, 16} {
+		b.Run(fmt.Sprintf("g%d", goroutines), func(b *testing.B) {
+			db, _ := benchOpen(b, "t", 256<<20)
+			base := time.Now().UnixNano()
+			var seq atomic.Int64
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					i := seq.Add(1) - 1
+					if _, err := db.Write("t", "CPU", base+i*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkWriteStructure 隔离结构值写入:复用 map vs 每点新建 map。
+// 两者差值 = 调用方建 map 的成本;reuse 项本身 = 库结构编码成本。
+func BenchmarkWriteStructure(b *testing.B) {
+	// 预生成 tag 字段字符串(低基数,走 dict),隔离 fmt。
+	fieldStrings := make([]string, 1000)
+	for i := range fieldStrings {
+		fieldStrings[i] = fmt.Sprintf("AX%d", i)
+	}
+	for _, tc := range []struct {
+		name  string
+		fresh bool
+	}{
+		{"reuse_map", false},
+		{"fresh_map", true},
+	} {
+		for _, numTags := range []int{1, 100} {
+			b.Run(fmt.Sprintf("%s/card%d", tc.name, numTags), func(b *testing.B) {
+				db, _ := benchOpen(b, "t", 256<<20)
+				tags := prebuiltTags(numTags)
+				base := time.Now().UnixNano()
+				mp := make(map[string]any)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if tc.fresh {
+						mp = make(map[string]any)
+					}
+					mp["value"] = float64(i) * 0.01
+					mp["tag"] = fieldStrings[i%len(fieldStrings)]
+					if _, err := db.Write("t", tags[i%numTags], base+int64(i)*1e6, variant.New(mp)); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// ==================== 读场景 ====================
+
+// writeAndReopen 写 points 个点并 close+reopen,得到"纯磁盘段"的读视图(不含
+// WAL 缓存),用于隔离读路径。返回新 DB 和 time 基址。
+func writeAndReopen(b *testing.B, points int, walSize int64) (*DB, int64) {
+	dir := benchDir(b)
+	openCfg := func() Config {
+		return Config{
+			Path:           dir,
+			WalConfig:      WalConfig{MaxFileSize: walSize},
+			AsyncFlush:     true,
+			MaxStorageTime: 24 * 60 * 60 * 365,
+		}
+	}
+	db, err := Open(openCfg(), context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := db.CreateTable(TableInfo{ColumnAttribute: ColumnAttribute{Name: "t", FloatPrecision: 2}}); err != nil {
+		b.Fatal(err)
+	}
+	base := time.Now().UnixNano()
+	for i := 0; i < points; i++ {
+		if _, err := db.Write("t", "CPU", base+int64(i)*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	db2, err := Open(openCfg(), context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db2.Close() })
+	return db2, base
+}
+
+// BenchmarkReadScan 全量顺序扫描读(QueryAll)。
+func BenchmarkReadScan(b *testing.B) {
+	for _, points := range []int{100_000, 1_000_000} {
+		b.Run(fmt.Sprintf("points%d", points), func(b *testing.B) {
+			db, base := writeAndReopen(b, points, 16<<20)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				all, err := db.QueryAll("t", "CPU", base-1, base+int64(points)*1e6+1, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(all) != points {
+					b.Fatalf("scan: got %d want %d", len(all), points)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkReadWindow 固定窗口聚合读(Query + windowSize)。
+func BenchmarkReadWindow(b *testing.B) {
+	for _, points := range []int{100_000, 1_000_000} {
+		b.Run(fmt.Sprintf("points%d", points), func(b *testing.B) {
+			db, base := writeAndReopen(b, points, 16<<20)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// 1 秒窗口,均值聚合
+				_, err := db.Query("t", "CPU", base-1, base+int64(points)*1e6+1, int64(time.Second), AvgFusion, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkReadCondition 条件过滤读(Query + 数值区间条件)。
+func BenchmarkReadCondition(b *testing.B) {
+	for _, points := range []int{100_000, 1_000_000} {
+		b.Run(fmt.Sprintf("points%d", points), func(b *testing.B) {
+			db, base := writeAndReopen(b, points, 16<<20)
+			// 命中约 10% 的区间。
+			lo := float64(points) * 0.45
+			hi := float64(points) * 0.55
+			cond := LogicalCondition{
+				Op: LogicalAnd,
+				Cond: []any{
+					Condition{ColumnAttributeName: "", Operator: OpGreaterThan, Value: variant.NewFloat64(lo)},
+					Condition{ColumnAttributeName: "", Operator: OpLessThan, Value: variant.NewFloat64(hi)},
+				},
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := db.QueryAll("t", "CPU", base-1, base+int64(points)*1e6+1, cond); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// ==================== E2E: 写后即查(真实形态) ====================
+
+// BenchmarkE2E_WriteAndQuery 标量写入 8640 万点 + 全量查询。单点逐写,大 WAL。
+// 用 -benchtime=1x 确保只跑一轮。
+func BenchmarkE2E_WriteAndQuery(b *testing.B) {
+	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
+	tableName := "eu12"
+	tag := "CPU"
+	db, dir := benchOpen(b, tableName, 256*1024*1024)
+
 	writeStart := time.Now()
 	baseTime := writeStart.UnixNano()
 	for i := 0; i < totalPoints; i++ {
-		_, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond), variant.NewFloat64(123+float64(i)*0.01))
-		if err != nil {
+		if _, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond), variant.NewFloat64(123+float64(i)*0.01)); err != nil {
 			b.Fatalf("write %d failed: %v", i, err)
 		}
 	}
 	writeElapsed := time.Since(writeStart)
-	// 查询阶段
+
 	queryStart := time.Now()
-	//all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, 0, 1, nil)
 	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
-	if len(all) >= 2 {
-		b.Log(all[0], all[len(all)-1], all[len(all)-2])
-	}
 	queryElapsed := time.Since(queryStart)
-	_ = db.Close()
-	b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d,size: %v",
+	// 显式 Close 排空 async flush 未落的段,再量 size,得到真实落盘大小。
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d, size: %v",
 		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
 		queryElapsed, float64(len(all))/queryElapsed.Seconds(),
 		len(all), fileDirSize(dir, tableName))
 }
 
+// BenchmarkE2E_WriteAndColumnQuery 结构写入(复用 map,隔离调用方建 map 成本)
+// + 条件窗口查询。用 -benchtime=1x 确保只跑一轮。
 func BenchmarkE2E_WriteAndColumnQuery(b *testing.B) {
-	const totalPoints = 12 * 60 * 60 * 1000 // 86,400,000
-	dir := benchDir(b)
+	const totalPoints = 12 * 60 * 60 * 1000 // 43,200,000
 	tableName := "eu12"
 	tag := "CPU"
-	db := openBenchDB(b, dir, 256*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
+	db, dir := benchOpen(b, tableName, 256*1024*1024)
+
+	fieldStrings := make([]string, 100000)
+	for i := range fieldStrings {
+		fieldStrings[i] = fmt.Sprintf("AX%v", i)
 	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	// 写入阶段
 	writeStart := time.Now()
 	baseTime := writeStart.UnixNano()
+	mp := make(map[string]any)
 	for i := 0; i < totalPoints; i++ {
-		mp := make(map[string]any)
 		mp["value"] = float64(i) * 0.01
-		mp["tag"] = fmt.Sprintf("AX%v", i)
-		_, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond), variant.New(mp))
-		if err != nil {
+		mp["tag"] = fieldStrings[i%len(fieldStrings)]
+		if _, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond), variant.New(mp)); err != nil {
 			b.Fatalf("write %d failed: %v", i, err)
 		}
 	}
 	writeElapsed := time.Since(writeStart)
-	// 查询阶段
+
 	queryStart := time.Now()
 	all, err := db.Query(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, int64(time.Second), 1, LogicalCondition{
 		Op: LogicalAnd,
 		Cond: []any{
-			Condition{
-				ColumnAttributeName: "value",
-				Operator:            OpGreaterThan,
-				Value:               variant.NewFloat64(60 * 60 * 10),
-			},
-			Condition{
-				ColumnAttributeName: "value",
-				Operator:            OpLessThan,
-				Value:               variant.NewFloat64(60 * 60 * 10 * 2),
-			},
+			Condition{ColumnAttributeName: "value", Operator: OpGreaterThan, Value: variant.NewFloat64(60 * 60 * 10)},
+			Condition{ColumnAttributeName: "value", Operator: OpLessThan, Value: variant.NewFloat64(60 * 60 * 10 * 2)},
 		},
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
-	if len(all) >= 2 {
-		b.Log(all[0], all[1], all[len(all)-1], all[len(all)-2])
-	}
 	queryElapsed := time.Since(queryStart)
-	_ = db.Close()
-	b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d,size: %v",
+	// 显式 Close 排空 async flush 未落的段,再量 size,得到真实落盘大小。
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d, size: %v",
 		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
 		queryElapsed, float64(len(all))/queryElapsed.Seconds(),
 		len(all), fileDirSize(dir, tableName))
-}
-
-func BenchmarkWriteParallel(b *testing.B) {
-	const totalPoints = 24 * 60 * 60 * 1000 // 86,400,000
-	dir := benchDir(b)
-	tableName := "eu12"
-	tag := "CPU"
-	db := openBenchDB(b, dir, 256*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	// 写入阶段
-	writeStart := time.Now()
-	baseTime := writeStart.UnixNano()
-	for i := 0; i < totalPoints/1000; i++ {
-		var wg sync.WaitGroup
-		for j := 0; j < 1000; j++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, err := db.Write(tableName, tag, baseTime+int64(i*j)*int64(time.Millisecond), variant.NewFloat64(float64(123)+float64(i*j)*0.01))
-				if err != nil {
-					b.Fatalf("write %d failed: %v", i, err)
-					return
-				}
-			}()
-		}
-		wg.Wait()
-	}
-	writeElapsed := time.Since(writeStart)
-	// 查询阶段
-	queryStart := time.Now()
-	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	queryElapsed := time.Since(queryStart)
-	_ = db.Close()
-	b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d,size: %v",
-		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
-		queryElapsed, float64(len(all))/queryElapsed.Seconds(),
-		len(all), fileDirSize(dir, tableName))
-}
-
-// ==================== 批量写入性能对比 ====================
-
-// BenchmarkWriteSingle 单点串行写入（基线）
-func BenchmarkWriteSingle(b *testing.B) {
-	const totalPoints = 1_000_000
-	dir := benchDir(b)
-	tableName := "bench_single"
-	db := openBenchDB(b, dir, 64*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	writeStart := time.Now()
-	baseTime := writeStart.UnixNano()
-	// 只用单tag，聚焦测量单点写入的锁开销
-	for i := 0; i < totalPoints; i++ {
-		_, err := db.Write(tableName, "cpu", baseTime+int64(i)*int64(time.Millisecond),
-			variant.NewFloat64(float64(i)*0.01))
-		if err != nil {
-			b.Fatalf("write %d failed: %v", i, err)
-		}
-	}
-	writeElapsed := time.Since(writeStart)
-
-	_ = db.Close()
-	b.Logf("single write: %v (%.0f pts/s), size: %v",
-		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
-		fileDirSize(dir, tableName))
-}
-
-// BenchmarkWriteBatch_100 批量写入，每批100条
-func BenchmarkWriteBatch_100(b *testing.B) {
-	benchWriteBatch(b, 100)
-}
-
-// BenchmarkWriteBatch_1000 批量写入，每批1000条
-func BenchmarkWriteBatch_1000(b *testing.B) {
-	benchWriteBatch(b, 1000)
-}
-
-// BenchmarkWriteBatch_10000 批量写入，每批10000条
-func BenchmarkWriteBatch_10000(b *testing.B) {
-	benchWriteBatch(b, 10000)
-}
-
-func benchWriteBatch(b *testing.B, batchSize int) {
-	const totalPoints = 24 * 60 * 60 * 1000
-	dir := benchDir(b)
-	tableName := "bench_batch"
-	db := openBenchDB(b, dir, 64*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	writeStart := time.Now()
-	baseTime := writeStart.UnixNano()
-
-	batches := totalPoints / batchSize
-	for n := 0; n < batches; n++ {
-		points := make([]TagPoint, batchSize)
-		for i := 0; i < batchSize; i++ {
-			idx := n*batchSize + i
-			points[i] = TagPoint{
-				Tag:       "cpu",
-				Timestamp: baseTime + int64(idx)*int64(time.Millisecond),
-				Value:     variant.NewFloat64(float64(idx) * 0.01),
-			}
-		}
-		results, err := db.WriteBatch(tableName, points)
-		if err != nil {
-			b.Fatalf("batch write %d failed: %v", n, err)
-		}
-		if results != batchSize {
-			b.Fatal("expected all writes to succeed")
-		}
-	}
-	writeElapsed := time.Since(writeStart)
-
-	_ = db.Close()
-	b.Logf("batch(%d) write: %v (%.0f pts/s), size: %v",
-		batchSize, writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
-		fileDirSize(dir, tableName))
-}
-
-// BenchmarkWriteBatch_MultiTag 批量写入多tag（模拟真实场景：100个不同tag轮转）
-func BenchmarkWriteBatch_MultiTag(b *testing.B) {
-	const totalPoints = 1_000_000
-	const batchSize = 1000
-	const numTags = 100
-
-	dir := benchDir(b)
-	tableName := "bench_multitag"
-	db := openBenchDB(b, dir, 64*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	writeStart := time.Now()
-	baseTime := writeStart.UnixNano()
-
-	batches := totalPoints / batchSize
-	for n := 0; n < batches; n++ {
-		points := make([]TagPoint, batchSize)
-		for i := 0; i < batchSize; i++ {
-			idx := n*batchSize + i
-			points[i] = TagPoint{
-				Tag:       fmt.Sprintf("sensor_%d", idx%numTags),
-				Timestamp: baseTime + int64(idx)*int64(time.Millisecond),
-				Value:     variant.NewFloat64(float64(idx) * 0.01),
-			}
-		}
-		results, err := db.WriteBatch(tableName, points)
-		if err != nil {
-			b.Fatalf("batch write %d failed: %v", n, err)
-		}
-		if results != batchSize {
-			b.Fatal("expected all writes to succeed")
-		}
-	}
-	writeElapsed := time.Since(writeStart)
-
-	_ = db.Close()
-	b.Logf("multi-tag batch(%d) write: %v (%.0f pts/s), size: %v",
-		batchSize, writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
-		fileDirSize(dir, tableName))
-}
-
-// BenchmarkWriteSingle_MultiTag 单点串行写入多tag（与BatchMultiTag对比基线）
-func BenchmarkWriteSingle_MultiTag(b *testing.B) {
-	const totalPoints = 1_000_000
-	const numTags = 100
-
-	dir := benchDir(b)
-	tableName := "bench_single_multitag"
-	db := openBenchDB(b, dir, 64*1024*1024)
-	if err := db.CreateTable(TableInfo{
-		ColumnAttribute: ColumnAttribute{Name: tableName, FloatPrecision: 2},
-	}); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	writeStart := time.Now()
-	baseTime := writeStart.UnixNano()
-
-	for i := 0; i < totalPoints; i++ {
-		tag := fmt.Sprintf("sensor_%d", i%numTags)
-		_, err := db.Write(tableName, tag, baseTime+int64(i)*int64(time.Millisecond),
-			variant.NewFloat64(float64(i)*0.01))
-		if err != nil {
-			b.Fatalf("write %d failed: %v", i, err)
-		}
-	}
-	writeElapsed := time.Since(writeStart)
-
-	_ = db.Close()
-	b.Logf("single multi-tag write: %v (%.0f pts/s), size: %v",
-		writeElapsed, float64(totalPoints)/writeElapsed.Seconds(),
-		fileDirSize(dir, tableName))
 }
 
 func fileDirSize(dir string, tableName string) string {
 	var total int64
 	_ = filepath.WalkDir(filepath.Join(dir, tableName, "data"), func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// 遇到权限错误等问题时，打印错误但继续执行
 			fmt.Fprintf(os.Stderr, "访问 %s 出错: %v\n", path, err)
 			return nil
 		}

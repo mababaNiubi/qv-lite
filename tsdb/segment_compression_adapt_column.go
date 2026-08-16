@@ -33,6 +33,7 @@ import (
 type kv struct {
 	key   string
 	value variant.Variant
+	vt    variant.Type // precomputed column type
 }
 
 // AdaptColumnEncoder adaptively encodes variant values column-by-column.
@@ -128,23 +129,22 @@ func (m *AdaptColumnEncoder) writeStruct(v variant.Variant) bool {
 		return false
 	}
 
-	// Collect key-value pairs into reusable slice.
+	// Collect key-value pairs into reusable slice (compact structPairs backing).
 	m.writePairs = m.writePairs[:0]
 	v.Range(func(key string, value variant.Variant) bool {
-		m.writePairs = append(m.writePairs, kv{key, value})
+		m.writePairs = append(m.writePairs, kv{key: key, value: value, vt: value.Type()})
 		return true
 	})
 
 	for _, p := range m.writePairs {
-		cVt := p.value.Type()
-		if idx := m.colIdx(p.key); idx >= 0 && incompatibleType(m.columnTypes[idx], cVt) {
+		if idx := m.colIdx(p.key); idx >= 0 && incompatibleType(m.columnTypes[idx], p.vt) {
 			return false
 		}
 	}
 
 	//write all columns.
 	for _, p := range m.writePairs {
-		cVt := p.value.Type()
+		cVt := p.vt
 		idx := m.colIdx(p.key)
 		if idx >= 0 {
 			if !m.columnEncoders[idx].Write(p.value) {
@@ -161,7 +161,9 @@ func (m *AdaptColumnEncoder) writeStruct(v variant.Variant) bool {
 			for range m.length {
 				encoder.Write(emptyVariant)
 			}
-			encoder.Write(p.value)
+			if !encoder.Write(p.value) {
+				return false
+			}
 		}
 		if idx >= 0 {
 			m.seenColumns[idx] = true
@@ -446,13 +448,17 @@ func (d *AdaptColumnDecoder) Read() variant.Variant {
 		}
 		return emptyVariant
 	}
-	v := variant.NewValueMap(make(map[string]variant.Variant))
+	// Build the compact structure. The keys alias this decoder's columnOrder,
+	// which is a fresh slice per decoded block (setBytesStruct allocates a new
+	// one), so every structure in the block safely shares the field names —
+	// only the per-point values slice is allocated here.
+	vals := make([]variant.Variant, 0, len(d.columnOrder))
 	for _, name := range d.columnOrder {
 		if dec, ok := d.columnDecoder[name]; ok {
-			v.MapSet(name, dec.Read())
+			vals = append(vals, dec.Read())
 		}
 	}
-	return v
+	return variant.NewStruct(d.columnOrder, vals)
 }
 
 // Error returns the first error encountered during decoding.

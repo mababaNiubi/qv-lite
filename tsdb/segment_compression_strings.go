@@ -11,6 +11,13 @@ import (
 	"github.com/golang/snappy"
 )
 
+// maxDictEntries bounds the dictionary size. Beyond this, the dictionary would
+// be larger than the raw stream for any realistic block, so tracking is
+// disabled and the encoder falls back to the snappy path. Without this bound, a
+// high-cardinality string column (e.g. millions of distinct values) would grow
+// the dict map without bound, dominating memory and GC.
+const maxDictEntries = 4096
+
 // StringEncoder encodes strings adaptively: when a block has few distinct
 // values, a dictionary encoding (stringCompressedDict) is emitted; otherwise
 // it falls back to the snappy-compressed len-prefixed stream
@@ -22,6 +29,9 @@ type StringEncoder struct {
 	dict  map[string]int
 	order []string
 	idx   []int
+	// dictFull is set once the dict reaches maxDictEntries; from then on the
+	// encoder tracks nothing and Bytes() emits the snappy encoding.
+	dictFull bool
 }
 
 // NewStringEncoder returns a new StringEncoder with an initial buffer ready to hold sz bytes.
@@ -40,24 +50,35 @@ func (e *StringEncoder) Reset() {
 	e.bytes = e.bytes[:0]
 	e.order = e.order[:0]
 	e.idx = e.idx[:0]
+	e.dictFull = false
 	clear(e.dict)
 }
 
 // Write encodes s to the underlying buffers (both the raw stream and the dict).
 func (e *StringEncoder) Write(str variant.Variant) bool {
-	s := str.AsString()
+	return e.WriteString(str.AsString())
+}
+
+// WriteString appends a raw string without wrapping it in a Variant first.
+// The columnar structure write path uses this to avoid the string→interface
+// boxing allocation that NewString incurs per value.
+func (e *StringEncoder) WriteString(s string) bool {
 	var b [binary.MaxVarintLen64]byte
 	i := binary.PutUvarint(b[:], uint64(len(s)))
 	e.bytes = append(e.bytes, b[:i]...)
 	e.bytes = append(e.bytes, s...)
 
-	if idx, ok := e.dict[s]; ok {
-		e.idx = append(e.idx, idx)
-	} else {
-		idx = len(e.order)
-		e.dict[s] = idx
-		e.order = append(e.order, s)
-		e.idx = append(e.idx, idx)
+	if !e.dictFull {
+		if idx, ok := e.dict[s]; ok {
+			e.idx = append(e.idx, idx)
+		} else if len(e.order) < maxDictEntries {
+			idx = len(e.order)
+			e.dict[s] = idx
+			e.order = append(e.order, s)
+			e.idx = append(e.idx, idx)
+		} else {
+			e.dictFull = true
+		}
 	}
 	return true
 }
@@ -65,8 +86,10 @@ func (e *StringEncoder) Write(str variant.Variant) bool {
 // Bytes returns the smaller of the dictionary or snappy encoding.
 func (e *StringEncoder) Bytes() ([]byte, error) {
 	snappyData := snappy.Encode(nil, e.bytes)
-	if dictLen := e.dictEncodedLen(); dictLen < len(snappyData)+1 {
-		return e.encodeDict(), nil
+	if !e.dictFull {
+		if dictLen := e.dictEncodedLen(); dictLen < len(snappyData)+1 {
+			return e.encodeDict(), nil
+		}
 	}
 	return append([]byte{stringCompressedSnappy}, snappyData...), nil
 }

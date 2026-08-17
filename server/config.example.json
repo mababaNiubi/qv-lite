@@ -1,0 +1,27 @@
+{
+  "listen": ":8686",
+  "max_body_bytes": 67108864,
+  "read_timeout": "30s",
+  "write_timeout": "60s",
+  "enable_pprof": false,
+  "token": "",
+  "db": {
+    "path": "./qvLite-data",
+    "max_segment_size": 67108864,
+    "max_segment_time_interval": 0,
+    "max_storage_time": 0,
+    "data_expiration_time": 0,
+    "dedup_window_ms": 0,
+    "min_interval_ms": 0,
+    "secondary_compression_name": "zstd",
+    "async_flush": true,
+    "async_cleanup": true,
+    "cleanup_interval_seconds": 60,
+    "wal_config": {
+      "max_file_size": 67108864,
+      "max_file_number": 0,
+      "close_buffer": false,
+      "max_buffer_batch_size": 4096
+    }
+  }
+}

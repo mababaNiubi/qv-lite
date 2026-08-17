@@ -159,9 +159,9 @@ func fromCConfig(c *C.qv_config_t) tsdb.Config {
 		AsyncCleanup:             c.async_cleanup != 0,
 		CleanupIntervalSeconds:   int64(c.cleanup_interval_seconds),
 		WalConfig: tsdb.WalConfig{
-			MaxFileSize:       int64(c.max_file_size),
-			MaxFileNumber:     int(c.max_file_number),
-			CloseBuffer:       c.close_buffer != 0,
+			MaxFileSize:        int64(c.max_file_size),
+			MaxFileNumber:      int(c.max_file_number),
+			CloseBuffer:        c.close_buffer != 0,
 			MaxBufferBatchSize: int(c.max_buffer_batch_size),
 		},
 	}

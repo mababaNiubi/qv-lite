@@ -338,3 +338,20 @@ func (db *DB) QueryLatest(tableName string, tag string) (*Point, error) {
 	}
 	return table.QueryLatest(tag)
 }
+
+// TableNames returns the names of all tables currently managed by the DB,
+// in creation order. The default table is included once created.
+func (db *DB) TableNames() []string {
+	names := make([]string, 0, len(db.tableInfos))
+	for i := range db.tableInfos {
+		names = append(names, db.tableInfos[i].Name)
+	}
+	return names
+}
+
+// TableInfos returns a copy of the metadata for all tables.
+func (db *DB) TableInfos() []TableInfo {
+	out := make([]TableInfo, len(db.tableInfos))
+	copy(out, db.tableInfos)
+	return out
+}

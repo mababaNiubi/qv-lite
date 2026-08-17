@@ -5,9 +5,7 @@ go 1.24
 require (
 	github.com/golang/snappy v1.0.0
 	github.com/jwilder/encoding v0.0.0-20170811194829-b4e1701a28ef
-	github.com/klauspost/compress v1.18.5
-	github.com/mababaNiubi/variant v1.2.1
-	github.com/pierrec/lz4/v4 v4.1.26
+	github.com/klauspost/compress v1.19.2
+	github.com/mababaNiubi/variant v1.2.3
+	github.com/pierrec/lz4/v4 v4.1.28
 )
-
-replace github.com/mababaNiubi/variant => C:/soft/work/variant

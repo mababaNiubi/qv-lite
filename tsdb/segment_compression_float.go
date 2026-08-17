@@ -398,6 +398,14 @@ func (it *FloatDecoder) roundBits(x uint64) uint64 {
 	if math.IsInf(product, 0) {
 		return x
 	}
+	if v < 0 {
+		// Negative values: mantissa truncation drifts the reconstructed value
+		// toward zero (|v'| < |v|), so Ceil (which rounds toward +∞, i.e. also
+		// toward zero for negatives) cannot recover the truncated fraction.
+		// Use Floor to round away from zero, matching the encoder's Ceil
+		// semantics on the original value. See round().
+		return math.Float64bits(math.Floor(product+1e-9) / it.scale)
+	}
 	return math.Float64bits(math.Ceil(product-1e-9) / it.scale)
 }
 

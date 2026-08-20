@@ -16,7 +16,7 @@ type ssTable struct {
 	dirPath   string // Table directory path.
 	*Meta
 	fragmentation          fileSegmentList
-	columnMap              map[tagCode]*ssColumn
+	columns                []*ssColumn
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
 	expirationMinuteTime   int64
@@ -42,7 +42,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
-		columnMap:              make(map[tagCode]*ssColumn),
+		columns:                make([]*ssColumn, 0),
 		maxSegmentSize:         maxSegmentSize,
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
@@ -211,10 +211,7 @@ func (s *ssTable) flushCache() error {
 	errIndex := 0
 	var consumed int
 	consumed, err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
-		column, ok := s.columnMap[tag]
-		if !ok {
-			return true
-		}
+		column := s.columns[tag-1]
 		// Find the column for this tag and write the data point.
 		glowNot := true
 		glowNot, readErr = column.Write(timestamp, value)
@@ -243,7 +240,7 @@ func (s *ssTable) flushCache() error {
 	})
 	if err != nil || readErr != nil {
 		// Reset all encoder state.
-		for _, column := range s.columnMap {
+		for _, column := range s.columns {
 			column.Reset()
 		}
 		// Roll back all data segments.
@@ -262,7 +259,7 @@ func (s *ssTable) flushCache() error {
 		return err
 	}
 	// Flush remaining encoder data to disk.
-	for _, column := range s.columnMap {
+	for _, column := range s.columns {
 		var needNewFile bool
 		needNewFile, err = column.glowWrite(&s.fragmentation)
 		if err != nil {
@@ -415,8 +412,9 @@ func (s *ssTable) BuildColumn() error {
 		return err
 	}
 	s.Meta = meta
+	s.columns = make([]*ssColumn, s.MaxPointDict)
 	s.Meta.Range(func(k string, u tagCode) bool {
-		s.columnMap[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+		s.columns[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
 		return true
 	})
 	return nil
@@ -439,8 +437,9 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	if err != nil {
 		return 0, err
 	}
-
-	s.columnMap[code] = newSSColumn(code, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+	for i := tagCode(len(s.columns)); i < code; i++ {
+		s.columns = append(s.columns, newSSColumn(i, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
+	}
 	return code, nil
 }
 

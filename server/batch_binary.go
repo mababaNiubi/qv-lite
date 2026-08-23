@@ -73,9 +73,11 @@ func (s *Server) handleBatchBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g := s.newStreamIngestor()
+	g.firstHint = min(count, streamBatchSize) // 头部已知点数：预分配首个表缓冲
+	blk := newBlockReader(br)                 // 批量读缓冲：每点不再单独 ReadFull
+	var p tsdb.TagPoint
 	for i := 0; i < count; i++ {
-		p, err := readBinaryPoint(br, vt)
-		if err != nil {
+		if err := parseBinaryPoint(blk, vt, g, &p); err != nil {
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("batch: point %d: %w", i, err))
 			return
 		}
@@ -121,80 +123,140 @@ func readBatchHeader(br *bufio.Reader) (string, byte, int, error) {
 	return string(tb), vt, count, nil
 }
 
-// readBinaryPoint 流式读取一个点（tag / 时间戳 / 值）。
-func readBinaryPoint(br *bufio.Reader, vt byte) (tsdb.TagPoint, error) {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-		return tsdb.TagPoint{}, errors.New("truncated tag length")
-	}
-	tl := int(binary.BigEndian.Uint16(lenBuf[:]))
-	tb := make([]byte, tl)
-	if _, err := io.ReadFull(br, tb); err != nil {
-		return tsdb.TagPoint{}, errors.New("truncated tag")
-	}
-	var ts [8]byte
-	if _, err := io.ReadFull(br, ts[:]); err != nil {
-		return tsdb.TagPoint{}, errors.New("truncated timestamp")
-	}
+// binaryBlockSize 是二进制批量路径的块读缓冲初始大小。逐块读入 + 内存内
+// 切片解析，把每点 4 次 io.ReadFull（接口分发/系统调用）摊薄到每块 1 次。
+const binaryBlockSize = 64 * 1024
 
-	var v variant.Variant
+// blockReader 从底层 bufio.Reader 批量读入复用缓冲，take(n) 保证连续 n
+// 字节可用并推进游标。跨块边界自动搬移剩余数据；超大点（超长 tag/string/
+// json）按需扩容。
+type blockReader struct {
+	br  *bufio.Reader
+	buf []byte
+	pos int // 已消费位置
+	end int // 有效数据末尾
+}
+
+func newBlockReader(br *bufio.Reader) *blockReader {
+	return &blockReader{br: br, buf: make([]byte, binaryBlockSize)}
+}
+
+// take 返回并消费接下来的 n 字节（必要时触发批量读）。
+func (r *blockReader) take(n int) ([]byte, error) {
+	if r.end-r.pos < n {
+		if err := r.refill(n); err != nil {
+			return nil, err
+		}
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b, nil
+}
+
+// refill 把剩余数据搬到缓冲头部并尽量读满 need 字节。
+func (r *blockReader) refill(need int) error {
+	left := r.end - r.pos
+	if need > len(r.buf) {
+		// 罕见超大点（超长 tag/string/json）：按需扩容。
+		nb := make([]byte, need)
+		copy(nb, r.buf[r.pos:r.end])
+		r.buf = nb
+	} else {
+		copy(r.buf, r.buf[r.pos:r.end])
+	}
+	r.end = left
+	r.pos = 0
+	for r.end < need {
+		m, err := r.br.Read(r.buf[r.end:])
+		r.end += m
+		if err != nil {
+			// TCP 末段常把剩余数据与 io.EOF 一起返回：先看数据是否已够，
+			// 够则视为正常结束，否则才是真的截断。
+			if errors.Is(err, io.EOF) && r.end >= need {
+				return nil
+			}
+			if errors.Is(err, io.EOF) {
+				return errors.New("truncated binary point")
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// parseBinaryPoint 从块缓冲解析一个点并填充到 *out。
+// 值类型 vt 在头部声明，同批同型。tag 走零拷贝驻留（命中不分配）。
+func parseBinaryPoint(r *blockReader, vt byte, g *StreamIngestor, out *tsdb.TagPoint) error {
+	h, err := r.take(2)
+	if err != nil {
+		return err
+	}
+	tl := int(binary.BigEndian.Uint16(h))
+	tb, err := r.take(tl)
+	if err != nil {
+		return err
+	}
+	out.Tag = g.internBytes(tb) // 零拷贝驻留：重复 tag 不再每点分配字符串
+
+	h, err = r.take(8)
+	if err != nil {
+		return err
+	}
+	out.Timestamp = int64(binary.BigEndian.Uint64(h))
+
 	switch vt {
 	case batchValueFloat:
-		var buf [8]byte
-		if _, err := io.ReadFull(br, buf[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated float value")
+		h, err := r.take(8)
+		if err != nil {
+			return err
 		}
-		v = variant.NewFloat64(math.Float64frombits(binary.BigEndian.Uint64(buf[:])))
+		out.Value = variant.NewFloat64(math.Float64frombits(binary.BigEndian.Uint64(h)))
 	case batchValueInt:
-		var buf [8]byte
-		if _, err := io.ReadFull(br, buf[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated int value")
+		h, err := r.take(8)
+		if err != nil {
+			return err
 		}
-		v = variant.NewInt64(int64(binary.BigEndian.Uint64(buf[:])))
+		out.Value = variant.NewInt64(int64(binary.BigEndian.Uint64(h)))
 	case batchValueUint:
-		var buf [8]byte
-		if _, err := io.ReadFull(br, buf[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated uint value")
+		h, err := r.take(8)
+		if err != nil {
+			return err
 		}
-		v = variant.NewUInt64(binary.BigEndian.Uint64(buf[:]))
+		out.Value = variant.NewUInt64(binary.BigEndian.Uint64(h))
 	case batchValueBool:
-		var b [1]byte
-		if _, err := io.ReadFull(br, b[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated bool value")
+		h, err := r.take(1)
+		if err != nil {
+			return err
 		}
-		v = variant.NewBool(b[0] != 0)
+		out.Value = variant.NewBool(h[0] != 0)
 	case batchValueString:
-		var lenBuf [2]byte
-		if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated string length")
+		h, err := r.take(2)
+		if err != nil {
+			return err
 		}
-		slen := int(binary.BigEndian.Uint16(lenBuf[:]))
-		sb := make([]byte, slen)
-		if _, err := io.ReadFull(br, sb); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated string value")
+		slen := int(binary.BigEndian.Uint16(h))
+		sb, err := r.take(slen)
+		if err != nil {
+			return err
 		}
-		v = variant.NewString(string(sb))
+		out.Value = variant.NewString(string(sb))
 	case batchValueJSON:
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated json length")
+		h, err := r.take(4)
+		if err != nil {
+			return err
 		}
-		jlen := int(binary.BigEndian.Uint32(lenBuf[:]))
-		jb := make([]byte, jlen)
-		if _, err := io.ReadFull(br, jb); err != nil {
-			return tsdb.TagPoint{}, errors.New("truncated json value")
+		jlen := int(binary.BigEndian.Uint32(h))
+		jb, err := r.take(jlen)
+		if err != nil {
+			return err
 		}
 		vv, err := nativeToVariant(jb)
 		if err != nil {
-			return tsdb.TagPoint{}, err
+			return err
 		}
-		v = vv
+		out.Value = vv
 	default:
-		return tsdb.TagPoint{}, fmt.Errorf("unsupported value type %d", vt)
+		return fmt.Errorf("unsupported value type %d", vt)
 	}
-	return tsdb.TagPoint{
-		Tag:       string(tb),
-		Timestamp: int64(binary.BigEndian.Uint64(ts[:])),
-		Value:     v,
-	}, nil
+	return nil
 }

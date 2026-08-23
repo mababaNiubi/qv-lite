@@ -39,11 +39,18 @@ type PipelinedWriter struct {
 	done    chan struct{}
 	closeCh sync.Once  // 保证 quitCh 只关闭一次（Close 幂等）
 	writeMu sync.Mutex // 串行化所有引擎写入
+
+	// chunkPool 复用 Submit 的池化缓冲。Submit 必须把数据复制进写入器自有
+	// 缓冲：调用方（如 StreamIngestor）在 Submit 返回后会复用传入切片的底层
+	// 数组，若按引用入队，后台尚未消费时数据即被覆写（数据错乱）。复制进
+	// 池化缓冲后由 writeChunks 在写完后 clear 并归还，稳态零分配。
+	chunkPool sync.Pool
 }
 
 type batchChunk struct {
 	table  string
 	points []tsdb.TagPoint
+	pooled bool // points 来自 chunkPool，写完后需 clear 并归还
 }
 
 // NewPipelinedWriter 启动流水线写入器。
@@ -63,36 +70,47 @@ func NewPipelinedWriter(db *tsdb.DB, intervalMs int, batchSize int) *PipelinedWr
 		quitCh:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	// 池化缓冲容量按流式分批大小（streamBatchSize）预分配；超过时按需扩容。
+	w.chunkPool.New = func() any { return make([]tsdb.TagPoint, 0, streamBatchSize) }
 	w.cond = sync.NewCond(&w.mu)
 	go w.run()
 	return w
 }
 
-// Submit 把一批已解码的点送入缓冲并立即返回，返回入队点数。
+// Submit 把一批已解码的点复制进池化缓冲后入队并立即返回，返回入队点数。
+// 复制是必须的：调用方（StreamIngestor 等）在 Submit 返回后会复用传入切片的
+// 底层数组，若按引用入队，后台写入器尚未消费时数据即被覆写。
 // 缓冲达到背压上限时降级为同步直接写入（既不无限积压，也不阻塞请求，
 // 保证吞吐）。
 func (w *PipelinedWriter) Submit(table string, points []tsdb.TagPoint) int {
 	if len(points) == 0 {
 		return 0
 	}
+	// 复制进写入器自有池化缓冲。
+	pts := w.chunkPool.Get().([]tsdb.TagPoint)
+	if cap(pts) < len(points) {
+		pts = make([]tsdb.TagPoint, 0, len(points))
+	}
+	pts = append(pts[:0], points...)
+
 	// 队列上限：batchSize 的 32 倍，防止无限积压。
 	maxQueue := w.batchSize * 32
 	w.mu.Lock()
 	if w.quit || w.count >= maxQueue {
-		n := len(points)
+		n := len(pts)
 		w.mu.Unlock()
 		// 已关闭或缓冲打满：直接同步写，避免积压与阻塞。
-		_ = w.writeChunks([]batchChunk{{table: table, points: points}})
+		_ = w.writeChunks([]batchChunk{{table: table, points: pts, pooled: true}})
 		return n
 	}
-	w.buf = append(w.buf, batchChunk{table: table, points: points})
-	w.count += len(points)
+	w.buf = append(w.buf, batchChunk{table: table, points: pts, pooled: true})
+	w.count += len(pts)
 	notify := w.count >= w.batchSize
 	w.mu.Unlock()
 	if notify {
 		w.signalWork()
 	}
-	return len(points)
+	return len(pts)
 }
 
 // Flush 同步等待所有已提交数据入库（含后台进行中的写批），随后返回。
@@ -177,14 +195,77 @@ func (w *PipelinedWriter) flush() {
 	w.cond.Broadcast()
 }
 
-// writeChunks 按表分组调用引擎 WriteBatch（串行化）。
+// writeChunks 按表合并后调用引擎 WriteBatch（串行化）。
+//
+// 同一张表的多个 chunk 先拼接成大批再调用引擎：减少引擎 WAL 锁获取次数，
+// 引擎单锁下大批明显快于小批。每批点数以 batchSize 为上限分批写出，避免
+// 单次 WriteBatch 过长持锁阻塞其他写入。写完后归还池化缓冲。
 func (w *PipelinedWriter) writeChunks(chunks []batchChunk) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
+	defer w.releaseChunks(chunks)
+
+	// 按表聚合，保持每个表内 chunk 的到达顺序。
+	type tableChunks struct {
+		table string
+		chunk []batchChunk
+		total int
+	}
+	var groups []tableChunks
+	idx := make(map[string]int, 8)
 	for _, c := range chunks {
-		if _, err := w.db.WriteBatch(c.table, c.points); err != nil {
-			return err
+		if i, ok := idx[c.table]; ok {
+			g := &groups[i]
+			g.chunk = append(g.chunk, c)
+			g.total += len(c.points)
+		} else {
+			idx[c.table] = len(groups)
+			groups = append(groups, tableChunks{table: c.table, chunk: []batchChunk{c}, total: len(c.points)})
+		}
+	}
+
+	for i := range groups {
+		g := &groups[i]
+		if len(g.chunk) == 1 && len(g.chunk[0].points) <= w.batchSize {
+			// 单 chunk 且不超上限：直接写，避免合并拷贝。
+			if _, err := w.db.WriteBatch(g.table, g.chunk[0].points); err != nil {
+				return err
+			}
+			continue
+		}
+		// 多 chunk（或单 chunk 超上限）：合并成 ≤ batchSize 的批次。
+		merged := make([]tsdb.TagPoint, 0, min(w.batchSize, g.total))
+		for _, c := range g.chunk {
+			for len(c.points) > 0 {
+				room := w.batchSize - len(merged)
+				if room == 0 {
+					if _, err := w.db.WriteBatch(g.table, merged); err != nil {
+						return err
+					}
+					merged = merged[:0]
+					room = w.batchSize
+				}
+				n := min(room, len(c.points))
+				merged = append(merged, c.points[:n]...)
+				c.points = c.points[n:]
+			}
+		}
+		if len(merged) > 0 {
+			if _, err := w.db.WriteBatch(g.table, merged); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// releaseChunks 清空并归还池化缓冲。先 clear 置零（避免 GC 扫描残留的
+// variant 指针导致对象无法回收），再以 len=0 放回池中复用。
+func (w *PipelinedWriter) releaseChunks(chunks []batchChunk) {
+	for _, c := range chunks {
+		if c.pooled {
+			clear(c.points)
+			w.chunkPool.Put(c.points[:0])
+		}
+	}
 }

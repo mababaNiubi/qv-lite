@@ -145,3 +145,150 @@ func TestPipelineServerConsistency(t *testing.T) {
 		t.Fatalf("read back %d points, want 20", n)
 	}
 }
+
+// TestStreamingPipelineNoAliasing 回归：流式分批 + 流水线时 Submit 必须复制
+// 数据。旧实现把 StreamIngestor 的缓冲按引用入队，而 StreamIngestor 在
+// flush 后复用底层数组，导致后台尚未消费的第一批被第二批覆写（数据错乱）。
+//
+// interval/batchSize 取极大值，使写入器只在显式 Flush 时消费——稳定复现
+// 旧实现的错乱：两批都写完后，第一批的内容已被第二批覆写。
+func TestStreamingPipelineNoAliasing(t *testing.T) {
+	db := newTestDB(t)
+	w := NewPipelinedWriter(db, 60_000, 1<<30)
+	defer w.Close()
+
+	g := &StreamIngestor{
+		ingest:  func(table string, points []tsdb.TagPoint) (int, error) { return w.Submit(table, points), nil },
+		size:    streamBatchSize,
+		pending: make(map[string][]tsdb.TagPoint),
+	}
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	// 两批各 streamBatchSize 点，时间戳唯一、值唯一。
+	for batch := 0; batch < 2; batch++ {
+		for i := 0; i < streamBatchSize; i++ {
+			idx := batch*streamBatchSize + i
+			if err := g.Add("t", tsdb.TagPoint{
+				Tag:       "cpu",
+				Timestamp: base + int64(idx),
+				Value:     variant.NewFloat64(float64(idx) * 0.5),
+			}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+	}
+	if _, err := g.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	// 唤醒后台写入器消费缓冲（interval 取极大值，不依赖定时器）。
+	w.signalWork()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	pts, err := db.QueryAll("t", "cpu", 0, time.Now().Add(time.Hour).UnixMilli(), nil)
+	if err != nil {
+		t.Fatalf("QueryAll: %v", err)
+	}
+	if len(pts) != 2*streamBatchSize {
+		t.Fatalf("rows = %d, want %d", len(pts), 2*streamBatchSize)
+	}
+	byTs := make(map[int64]float64, len(pts))
+	for _, p := range pts {
+		f, _ := p.V.AsFloat64()
+		byTs[p.Tms] = f
+	}
+	for i := 0; i < 2*streamBatchSize; i++ {
+		want := float64(i) * 0.5
+		if got, ok := byTs[base+int64(i)]; !ok || got != want {
+			t.Fatalf("point %d: ts=%d got %v (present=%v), want %v", i, base+int64(i), got, ok, want)
+		}
+	}
+}
+
+// TestPipelinedWriterMergeAndSplit 验证同一张表的多个 chunk 合并后按 batchSize
+// 上限分批写出（2×30K 合并后拆为 40K+20K），数据完整。
+func TestPipelinedWriterMergeAndSplit(t *testing.T) {
+	db := newTestDB(t)
+	w := NewPipelinedWriter(db, 60_000, 40_000)
+	defer w.Close()
+
+	for i := 0; i < 2; i++ {
+		w.Submit("t", testPoints(30_000))
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if n := countRows(t, db); n != 60_000 {
+		t.Fatalf("rows = %d, want 60000", n)
+	}
+}
+
+// TestStreamIngestorMultiTableInterleaved 验证连续交替的多表流（A B A B…）
+// 不再退化为逐行小写：按表独立累积、总点数达阈值统一入库，各表数据完整。
+// 旧实现「表切换即刷」会让交替表流逐行 flush，产生大量单点小写。
+func TestStreamIngestorMultiTableInterleaved(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.CreateTable(tsdb.TableInfo{ColumnAttribute: tsdb.ColumnAttribute{Name: "u"}}); err != nil {
+		t.Fatalf("CreateTable u: %v", err)
+	}
+	w := NewPipelinedWriter(db, 60_000, 1<<30)
+	defer w.Close()
+
+	g := &StreamIngestor{
+		ingest:  func(table string, points []tsdb.TagPoint) (int, error) { return w.Submit(table, points), nil },
+		size:    streamBatchSize,
+		pending: make(map[string][]tsdb.TagPoint),
+	}
+	const perTable = 30_000 // 共 60K 点：中途触发一次 flush（50K 阈值），残余 10K 在 Finish 写入
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	for i := 0; i < 2*perTable; i++ {
+		table := "t"
+		if i%2 == 1 {
+			table = "u"
+		}
+		if err := g.Add(table, tsdb.TagPoint{
+			Tag:       "cpu",
+			Timestamp: base + int64(i),
+			Value:     variant.NewFloat64(float64(i) * 0.5),
+		}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	written, err := g.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if written != 2*perTable {
+		t.Fatalf("written = %d, want %d", written, 2*perTable)
+	}
+	w.signalWork()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	for _, table := range []string{"t", "u"} {
+		pts, err := db.QueryAll(table, "cpu", 0, time.Now().Add(time.Hour).UnixMilli(), nil)
+		if err != nil {
+			t.Fatalf("QueryAll(%s): %v", table, err)
+		}
+		if len(pts) != perTable {
+			t.Fatalf("table %s rows = %d, want %d", table, len(pts), perTable)
+		}
+		byTs := make(map[int64]float64, len(pts))
+		for _, p := range pts {
+			f, _ := p.V.AsFloat64()
+			byTs[p.Tms] = f
+		}
+		// t 表：偶数索引 i → 值 i*0.5；u 表：奇数索引。
+		expect := func(i int) bool { return (i%2 == 0) == (table == "t") }
+		for i := 0; i < 2*perTable; i++ {
+			if !expect(i) {
+				continue
+			}
+			want := float64(i) * 0.5
+			if got, ok := byTs[base+int64(i)]; !ok || got != want {
+				t.Fatalf("table %s point %d: got %v (present=%v), want %v", table, i, got, ok, want)
+			}
+		}
+	}
+}

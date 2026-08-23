@@ -414,7 +414,8 @@ func (s *ssTable) BuildColumn() error {
 	s.Meta = meta
 	s.columns = make([]*ssColumn, s.MaxPointDict)
 	s.Meta.Range(func(k string, u tagCode) bool {
-		s.columns[u] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
+		// tag 编码 1 起始（addTag 自增），columns 数组 0 起始（columns[tag-1]）。
+		s.columns[u-1] = newSSColumn(u, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval)
 		return true
 	})
 	return nil

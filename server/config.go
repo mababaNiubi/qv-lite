@@ -38,11 +38,14 @@ type Config struct {
 
 	// WriteBufferMs enables the decode→ingest pipeline: writes are buffered
 	// for up to this many milliseconds then coalesced into larger engine
-	// batches by a background writer. This decouples decoding (CPU) from
-	// ingestion (engine WAL lock) and improves throughput under many small
-	// concurrent requests. 0 disables it (default: immediate write, so data
-	// is queryable as soon as the write returns). Queries always flush the
-	// buffer first, so read-after-write stays consistent.
+	// batches by a single background writer goroutine. This decouples
+	// decoding (CPU, on the request goroutine) from ingestion (engine WAL
+	// lock, on the writer goroutine) — deserialization no longer blocks
+	// engine writes — and coalesces small concurrent request batches into
+	// one engine WriteBatch per table per flush cycle. Default 5.
+	// 0 disables the pipeline (immediate write on the request goroutine).
+	// Queries, single-point writes and shutdown always flush the buffer
+	// first, so read-after-write stays consistent.
 	WriteBufferMs int64 `json:"write_buffer_ms"`
 
 	// WriteBatchSize is the buffered point count that triggers a coalesced
@@ -50,15 +53,19 @@ type Config struct {
 	WriteBatchSize int `json:"write_batch_size"`
 }
 
-// DefaultConfig returns a server Config tuned for throughput: async flush so
-// writes never block on segment encoding, async cleanup for expired data, and
-// a reasonably large WAL buffer.
+// DefaultConfig returns a server Config tuned for throughput: the decode→ingest
+// pipeline is on (5ms buffer) so streaming writes run on a single background
+// writer goroutine, async flush keeps writes off the segment-encoding path,
+// async cleanup handles expired data, and the WAL buffer is reasonably large.
 func DefaultConfig() Config {
 	return Config{
 		Listen:       ":8686",
 		MaxBodyBytes: 64 << 20,
 		ReadTimeout:  "30s",
 		WriteTimeout: "60s",
+		// 流水线默认开启：流式写入由单个后台 goroutine 合并入库，
+		// 反序列化在请求 goroutine 上进行，互不阻塞。
+		WriteBufferMs: 5,
 		DB: tsdb.Config{
 			Path:                     "./qvLite-data",
 			MaxSegmentSize:           64 << 20,
@@ -120,7 +127,7 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.MaxBodyBytes, "max-body", c.MaxBodyBytes, "max request body bytes")
 	fs.BoolVar(&c.EnablePprof, "pprof", c.EnablePprof, "enable /debug/pprof endpoints")
 	fs.StringVar(&c.Token, "token", c.Token, "require this X-Auth-Token on every API request (empty = no auth)")
-	fs.Int64Var(&c.WriteBufferMs, "write-buffer-ms", c.WriteBufferMs, "enable decode->ingest pipeline with this buffer period in ms (0 = immediate writes)")
+	fs.Int64Var(&c.WriteBufferMs, "write-buffer-ms", c.WriteBufferMs, "decode->ingest pipeline buffer period in ms (default 5; 0 = immediate writes)")
 	fs.IntVar(&c.WriteBatchSize, "write-batch-size", c.WriteBatchSize, "coalesced engine batch size for the write pipeline")
 }
 

@@ -438,7 +438,7 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 		return 0, err
 	}
 	for i := tagCode(len(s.columns)); i < code; i++ {
-		s.columns = append(s.columns, newSSColumn(i, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
+		s.columns = append(s.columns, newSSColumn(i+1, &s.tableInfo, s.maxSegmentSize, s.maxSegmentTimeInterval))
 	}
 	return code, nil
 }

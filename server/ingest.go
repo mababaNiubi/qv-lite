@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync"
 	"unsafe"
 
 	"github.com/mababaNiubi/qv-lite/tsdb"
@@ -10,6 +11,16 @@ import (
 // 累积点统一入库：内存恒定（≈一批），传输与入库并行，引擎每次锁时长短，
 // 不随请求总点数增长而积压。
 const streamBatchSize = 50_000
+
+// pointBatchPool 复用 StreamIngestor 的累积缓冲与 PipelinedWriter 的入队
+// 缓冲。flush 时缓冲所有权直接移交给 ingest（流水线模式由写入器写完 clear
+// 后归还；直写模式由 ingest 立即归还），避免入队时的整批 memcpy。池条目
+// 容量固定为 streamBatchSize，稳态零分配、零整批拷贝。
+var pointBatchPool = sync.Pool{
+	New: func() any {
+		return make([]tsdb.TagPoint, 0, streamBatchSize)
+	},
+}
 
 // StreamIngestor 实现「边解码边分批入库」。
 //
@@ -39,6 +50,7 @@ type StreamIngestor struct {
 	lastVal   string // 对应的驻留副本
 	lastTable string // pending 上次命中的表
 	lastPts   []tsdb.TagPoint
+	lastValid bool // lastTable/lastPts 是否有效（表名可能是 ""，不能拿它当哨兵）
 }
 
 // newStreamIngestor 创建流式入库器，ingest 为实际入库函数
@@ -51,16 +63,14 @@ func (s *Server) newStreamIngestor() *StreamIngestor {
 	}
 }
 
-// Add 追加一个点；待入库总点数达到阈值时统一入库（按表分组）。
+// Add 追加一个点到待入库缓冲；待入库总点数达到阈值时统一入库（按表分组）。
+// table 与 p.Tag 假定已是请求内驻留的规范串（各 handler 负责驻留：二进制由
+// internBytes/intern 驻留，Line/JSON 在调用前显式 intern）。驻留只影响内存
+// 去重，不影响正确性。
 func (g *StreamIngestor) Add(table string, p tsdb.TagPoint) error {
-	table = g.intern(table)
-	p.Tag = g.intern(p.Tag)
 	pts := g.pendingSlice(table)
 	pts = append(pts, p)
-	g.pending[table] = pts
-	if table == g.lastTable {
-		g.lastPts = pts // 追加可能扩容换新数组，保持快路径缓存一致
-	}
+	g.lastPts = pts // pendingSlice 已保证 table 是活动表；append 后及时刷新（可能换新数组）
 	g.pendingN++
 	if g.pendingN >= g.size {
 		return g.flush()
@@ -69,9 +79,14 @@ func (g *StreamIngestor) Add(table string, p tsdb.TagPoint) error {
 }
 
 // pendingSlice 返回 table 的待入库切片；连续同表时命中快路径，免 map 查找。
+// 切表时才把上一个活动表的最新切片头（含最新 len）写回 map，整个 Add 热循环
+// 不再每点做一次 map 写（pprof 中 aeshash/mapaccess 的每点开销来源）。
 func (g *StreamIngestor) pendingSlice(table string) []tsdb.TagPoint {
-	if table == g.lastTable {
+	if g.lastValid && table == g.lastTable {
 		return g.lastPts
+	}
+	if g.lastValid {
+		g.pending[g.lastTable] = g.lastPts
 	}
 	pts, ok := g.pending[table]
 	if !ok {
@@ -84,6 +99,7 @@ func (g *StreamIngestor) pendingSlice(table string) []tsdb.TagPoint {
 	}
 	g.lastTable = table
 	g.lastPts = pts
+	g.lastValid = true
 	return pts
 }
 
@@ -96,12 +112,17 @@ func (g *StreamIngestor) Finish() (int, error) {
 }
 
 // flush 把当前各表累积的点统一入库（逐表调用 ingest）。各表写入互不影响，
-// 顺序无关；map 遍历顺序随机不影响正确性。ingest 同步返回（流水线为入队、
-// 立即返回），返回后缓冲切片可安全复用（Submit 复制语义；直接写引擎则
-// WriteBatch 已完成）。
+// 顺序无关；map 遍历顺序随机不影响正确性。
+// ingest 契约：调用方把缓冲所有权交给 ingest，返回后本表不再复用该缓冲——
+// 流水线模式写入器异步消费并归还 pool，直写模式 ingest 立即归还。flush 随后
+// 从池取新缓冲继续累积，稳态零分配、无整批拷贝。
 func (g *StreamIngestor) flush() error {
 	if g.pendingN == 0 {
 		return nil
+	}
+	// 先把活动表写回 map，确保遍历覆盖最后还在累积的表。
+	if g.lastValid {
+		g.pending[g.lastTable] = g.lastPts
 	}
 	for table, pts := range g.pending {
 		if len(pts) == 0 {
@@ -113,12 +134,15 @@ func (g *StreamIngestor) flush() error {
 		}
 		g.written += n
 		g.pendingN -= len(pts)
-		pts = pts[:0] // 复用缓冲：已入队/已写完，安全
-		g.pending[table] = pts
-		if table == g.lastTable {
-			g.lastPts = pts // 保持快路径缓存与 map 一致（[:0] 后仍复用同一数组）
+		// 所有权已移交：从池取新缓冲续写，决不复用刚交给 ingest 的数组。
+		seen := pointBatchPool.Get().([]tsdb.TagPoint)
+		g.pending[table] = seen
+		if g.lastValid && table == g.lastTable {
+			g.lastPts = seen
 		}
 	}
+	// 迭代结束：所有表都已写回新缓冲，清空活动表标记。
+	g.lastValid = false
 	return nil
 }
 
@@ -167,4 +191,14 @@ func (g *StreamIngestor) internBytes(b []byte) string {
 	g.internMap[s] = s
 	g.lastKey, g.lastVal = s, s
 	return s
+}
+
+// internSpan 把 line 上的一个 token 区间转成请求内驻留的规范串。无转义时走
+// internBytes 零拷贝驻留（重复值不新分配）；含转义时才解码后驻留（少见路径）。
+// line 可能指向随后被覆写的读缓冲，调用方必须在覆写前完成驻留。
+func (g *StreamIngestor) internSpan(line []byte, s tokenSpan, esc bool) string {
+	if esc {
+		return g.intern(spanString(line, s, true))
+	}
+	return g.internBytes(line[s.start:s.end])
 }

@@ -39,18 +39,12 @@ type PipelinedWriter struct {
 	done    chan struct{}
 	closeCh sync.Once  // 保证 quitCh 只关闭一次（Close 幂等）
 	writeMu sync.Mutex // 串行化所有引擎写入
-
-	// chunkPool 复用 Submit 的池化缓冲。Submit 必须把数据复制进写入器自有
-	// 缓冲：调用方（如 StreamIngestor）在 Submit 返回后会复用传入切片的底层
-	// 数组，若按引用入队，后台尚未消费时数据即被覆写（数据错乱）。复制进
-	// 池化缓冲后由 writeChunks 在写完后 clear 并归还，稳态零分配。
-	chunkPool sync.Pool
 }
 
 type batchChunk struct {
 	table  string
 	points []tsdb.TagPoint
-	pooled bool // points 来自 chunkPool，写完后需 clear 并归还
+	pooled bool // points 来自 pointBatchPool，写完后需 clear 并归还
 }
 
 // NewPipelinedWriter 启动流水线写入器。
@@ -70,47 +64,36 @@ func NewPipelinedWriter(db *tsdb.DB, intervalMs int, batchSize int) *PipelinedWr
 		quitCh:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
-	// 池化缓冲容量按流式分批大小（streamBatchSize）预分配；超过时按需扩容。
-	w.chunkPool.New = func() any { return make([]tsdb.TagPoint, 0, streamBatchSize) }
 	w.cond = sync.NewCond(&w.mu)
 	go w.run()
 	return w
 }
 
-// Submit 把一批已解码的点复制进池化缓冲后入队并立即返回，返回入队点数。
-// 复制是必须的：调用方（StreamIngestor 等）在 Submit 返回后会复用传入切片的
-// 底层数组，若按引用入队，后台写入器尚未消费时数据即被覆写。
-// 缓冲达到背压上限时降级为同步直接写入（既不无限积压，也不阻塞请求，
-// 保证吞吐）。
+// Submit 把一批点按所有权移交方式入队并立即返回，返回入队点数，且不做整批
+// 拷贝。调用方（StreamIngestor.flush）在返回后必须放弃对缓冲的所有权：写入器
+// 消费完会 clear 并归还 pointBatchPool。缓冲达到背压上限时降级为同步直接写入
+// （既不无限积压，也不阻塞请求），随后仍归还池。
 func (w *PipelinedWriter) Submit(table string, points []tsdb.TagPoint) int {
 	if len(points) == 0 {
 		return 0
 	}
-	// 复制进写入器自有池化缓冲。
-	pts := w.chunkPool.Get().([]tsdb.TagPoint)
-	if cap(pts) < len(points) {
-		pts = make([]tsdb.TagPoint, 0, len(points))
-	}
-	pts = append(pts[:0], points...)
-
 	// 队列上限：batchSize 的 32 倍，防止无限积压。
 	maxQueue := w.batchSize * 32
 	w.mu.Lock()
 	if w.quit || w.count >= maxQueue {
-		n := len(pts)
+		n := len(points)
 		w.mu.Unlock()
-		// 已关闭或缓冲打满：直接同步写，避免积压与阻塞。
-		_ = w.writeChunks([]batchChunk{{table: table, points: pts, pooled: true}})
+		_ = w.writeChunks([]batchChunk{{table: table, points: points, pooled: true}})
 		return n
 	}
-	w.buf = append(w.buf, batchChunk{table: table, points: pts, pooled: true})
-	w.count += len(pts)
+	w.buf = append(w.buf, batchChunk{table: table, points: points, pooled: true})
+	w.count += len(points)
 	notify := w.count >= w.batchSize
 	w.mu.Unlock()
 	if notify {
 		w.signalWork()
 	}
-	return len(pts)
+	return len(points)
 }
 
 // Flush 同步等待所有已提交数据入库（含后台进行中的写批），随后返回。
@@ -265,7 +248,7 @@ func (w *PipelinedWriter) releaseChunks(chunks []batchChunk) {
 	for _, c := range chunks {
 		if c.pooled {
 			clear(c.points)
-			w.chunkPool.Put(c.points[:0])
+			pointBatchPool.Put(c.points[:0])
 		}
 	}
 }

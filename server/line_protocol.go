@@ -36,17 +36,21 @@ import (
 // 任何一行的解析错误都会导致整批请求返回 400（含行号）。
 //
 // 性能：解析为 span 化（只记录字节区间，不拷贝），token 扫描零分配；
-// 仅在需要生成 string 值（表名/tag/字符串值）或含转义时才分配。数字与
-// 时间戳用手工逐字节解析（零分配），浮点用零拷贝 string 视图交给 strconv。
+// 表名/tag 以原始字节区间返回，由调用方 internBytes 零分配驻留（重复值不
+// 新分配）；仅含转义或字符串值时才分配。数字与时间戳用手工逐字节解析
+// （零分配），浮点用零拷贝 string 视图交给 strconv。
 
 const (
 	linePrecisionNS = "ns" // 文档默认单位；引擎不强制单位，原样存储
 )
 
-// linePoint 是解析出的一行数据（含表名，供按表分组批量写）。
+// linePoint 是解析出的一行数据。Table/Tag 是指向 line 的只读字节区间
+// （不拷贝；scanner 缓冲随后会被覆写），调用方必须立即 intern 成规范串。
 type linePoint struct {
-	Table     string
-	Tag       string
+	Table     tokenSpan
+	TableEsc  bool
+	Tag       tokenSpan
+	TagEsc    bool
 	Timestamp int64
 	Value     variant.Variant
 }
@@ -132,17 +136,18 @@ func scanToken(line []byte, pos *int, esc *bool, seps ...byte) (tokenSpan, error
 
 // parseLine 解析单行 line protocol。tagScratch/fieldScratch 为调用方持有的
 // 复用缓冲（请求级）：parseSeries/parseFields 直接 append 进复用切片，
-// 避免每行从 nil 增长临时切片（占 Line 流式写入分配次数 ~88%）。
+// 避免每行从 nil 增长临时切片。
 func parseLine(line []byte, nowNS int64, tagScratch *[]tagPair, fieldScratch *[]fieldPair) (linePoint, error) {
 	*tagScratch = (*tagScratch)[:0]
 	*fieldScratch = (*fieldScratch)[:0]
 	pos := 0
 
 	// 1) measurement（表名）与 tag set（到第一个空格为止）。
-	table, tags, err := parseSeries(line, &pos, tagScratch)
+	tspan, tableEsc, tags, err := parseSeries(line, &pos, tagScratch)
 	if err != nil {
 		return linePoint{}, err
 	}
+	tagSpan, tagEsc := tagFromSet(line, tags)
 
 	// 2) field set（到下一个空格或行尾）。
 	fields, err := parseFields(line, &pos, fieldScratch)
@@ -165,12 +170,18 @@ func parseLine(line []byte, nowNS int64, tagScratch *[]tagPair, fieldScratch *[]
 		}
 	}
 
-	tag := tagFromSet(line, tags)
 	value, err := fieldsToValue(line, fields)
 	if err != nil {
 		return linePoint{}, err
 	}
-	return linePoint{Table: table, Tag: tag, Timestamp: ts, Value: value}, nil
+	return linePoint{
+		Table:     tspan,
+		TableEsc:  tableEsc,
+		Tag:       tagSpan,
+		TagEsc:    tagEsc,
+		Timestamp: ts,
+		Value:     value,
+	}, nil
 }
 
 type tagPair struct {
@@ -179,16 +190,16 @@ type tagPair struct {
 	valEsc     bool
 }
 
-// parseSeries 解析 measurement 与 tag set。返回表名与 tag 区间列表。
-// tags 为复用缓冲：追加到 *tags，避免每行分配切片。
-func parseSeries(line []byte, pos *int, tags *[]tagPair) (string, []tagPair, error) {
+// parseSeries 解析 measurement 与 tag set。返回表名（measurement）字节区间、
+// 是否含转义，以及 tag 区间列表。tags 为复用缓冲：追加到 *tags，避免每行
+// 分配切片。
+func parseSeries(line []byte, pos *int, tags *[]tagPair) (tokenSpan, bool, []tagPair, error) {
 	// measurement：到 ','（tag 开始）或 ' '（无 tag）为止。
 	var tableEsc bool
 	tspan, err := scanToken(line, pos, &tableEsc, ',', ' ')
 	if err != nil {
-		return "", nil, errors.New("invalid escape in measurement")
+		return tokenSpan{}, false, nil, errors.New("invalid escape in measurement")
 	}
-	table := spanString(line, tspan, tableEsc)
 
 	if *pos < len(line) && line[*pos] == ',' {
 		for *pos < len(line) && line[*pos] != ' ' {
@@ -196,16 +207,16 @@ func parseSeries(line []byte, pos *int, tags *[]tagPair) (string, []tagPair, err
 			var keyEsc bool
 			k, err := scanToken(line, pos, &keyEsc, '=', ',', ' ')
 			if err != nil {
-				return "", nil, err
+				return tokenSpan{}, false, nil, err
 			}
 			if *pos >= len(line) || line[*pos] != '=' {
-				return "", nil, fmt.Errorf("malformed tag %q", spanString(line, k, keyEsc))
+				return tokenSpan{}, false, nil, fmt.Errorf("malformed tag %q", spanString(line, k, keyEsc))
 			}
 			*pos++ // 跳过 '='
 			var valEsc bool
 			v, err := scanToken(line, pos, &valEsc, ',', ' ')
 			if err != nil {
-				return "", nil, err
+				return tokenSpan{}, false, nil, err
 			}
 			*tags = append(*tags, tagPair{key: k, keyEsc: keyEsc, value: v, valEsc: valEsc})
 		}
@@ -214,20 +225,20 @@ func parseSeries(line []byte, pos *int, tags *[]tagPair) (string, []tagPair, err
 	for *pos < len(line) && line[*pos] == ' ' {
 		*pos++
 	}
-	return table, *tags, nil
+	return tspan, tableEsc, *tags, nil
 }
 
-// tagFromSet 把 tag set 映射为 qv-lite 的 tag 标识。
-func tagFromSet(line []byte, tags []tagPair) string {
+// tagFromSet 把 tag set 映射为 qv-lite 的 tag 标识（字节区间 + 转义标记）。
+// 约定：含 tag=<v> 键时直接用其值作为标识，否则保留整个 tag 段文本。
+func tagFromSet(line []byte, tags []tagPair) (tokenSpan, bool) {
 	if len(tags) == 0 {
-		return ""
+		return tokenSpan{}, false
 	}
 	for _, t := range tags {
 		if spanEq(line, t.key, t.keyEsc, "tag") {
-			return spanString(line, t.value, t.valEsc) // 约定：tag=<v> 直接作为标识
+			return t.value, t.valEsc
 		}
 	}
-	// 否则保留全部维度：k=v,k2=v2（原始 tag 段文本，含转义时整体解码）。
 	esc := false
 	for _, t := range tags {
 		if t.keyEsc || t.valEsc {
@@ -235,7 +246,7 @@ func tagFromSet(line []byte, tags []tagPair) string {
 			break
 		}
 	}
-	return spanString(line, tokenSpan{start: tags[0].key.start, end: tags[len(tags)-1].value.end}, esc)
+	return tokenSpan{start: tags[0].key.start, end: tags[len(tags)-1].value.end}, esc
 }
 
 type fieldPair struct {

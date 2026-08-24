@@ -146,12 +146,12 @@ func TestPipelineServerConsistency(t *testing.T) {
 	}
 }
 
-// TestStreamingPipelineNoAliasing 回归：流式分批 + 流水线时 Submit 必须复制
-// 数据。旧实现把 StreamIngestor 的缓冲按引用入队，而 StreamIngestor 在
-// flush 后复用底层数组，导致后台尚未消费的第一批被第二批覆写（数据错乱）。
+// TestStreamingPipelineNoAliasing 回归：流式分批 + 流水线时缓冲按所有权移交，
+// 入队零拷贝。StreamIngestor.flush 把当批缓冲交给写入器后，改从池取新缓冲
+// 续写，决不把刚移交的数组复用给下一批。
 //
-// interval/batchSize 取极大值，使写入器只在显式 Flush 时消费——稳定复现
-// 旧实现的错乱：两批都写完后，第一批的内容已被第二批覆写。
+// interval/batchSize 取极大值，使写入器只在显式 Flush 时消费——密集复现
+// 若 flush 复用同一下层数组会产生的覆盖错乱：两批都写完后再验证数据完整。
 func TestStreamingPipelineNoAliasing(t *testing.T) {
 	db := newTestDB(t)
 	w := NewPipelinedWriter(db, 60_000, 1<<30)

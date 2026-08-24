@@ -74,6 +74,7 @@ func (s *Server) handleBatchBinary(w http.ResponseWriter, r *http.Request) {
 	}
 	g := s.newStreamIngestor()
 	g.firstHint = min(count, streamBatchSize) // 头部已知点数：预分配首个表缓冲
+	table = g.intern(table)                   // 请求级表名驻留一次，Add 不再驻留
 	blk := newBlockReader(br)                 // 批量读缓冲：每点不再单独 ReadFull
 	var p tsdb.TagPoint
 	for i := 0; i < count; i++ {

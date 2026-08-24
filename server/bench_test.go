@@ -115,9 +115,12 @@ func BenchmarkPipelineSubmitFlush(b *testing.B) {
 	db := benchDB(b)
 	w := NewPipelinedWriter(db, 1000, 50_000)
 	defer w.Close()
-	pts := testPoints(50_000)
+	src := testPoints(50_000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 生产侧从池取缓冲填充一批，所有权交给写入器，Flush 后归还池。
+		pts := pointBatchPool.Get().([]tsdb.TagPoint)
+		pts = append(pts[:0], src...)
 		w.Submit("t", pts)
 		if err := w.Flush(); err != nil {
 			b.Fatalf("Flush: %v", err)

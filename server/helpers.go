@@ -1,11 +1,56 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"runtime/debug"
 	"time"
+
+	"github.com/mababaNiubi/qv-lite/tsdb"
 )
+
+type apiError struct {
+	Error string `json:"error"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, apiError{Error: err.Error()})
+}
+
+func decodeBody(r *http.Request, dst any) error {
+	return json.NewDecoder(r.Body).Decode(dst)
+}
+
+// badRequest 以统一的 "bad request: <err>" 文本写 400。
+func badRequest(w http.ResponseWriter, err error) {
+	writeErr(w, http.StatusBadRequest, fmt.Errorf("bad request: %w", err))
+}
+
+// writeError 按引擎错误类型映射 HTTP 状态并写出；无法识别的错误写 500。
+func writeError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, tsdb.ErrorTableExists):
+		status = http.StatusConflict
+	case errors.Is(err, tsdb.ErrorTableNotExists),
+		errors.Is(err, tsdb.ErrorTagNotFound),
+		errors.Is(err, tsdb.ErrorNoDataForTag):
+		status = http.StatusNotFound
+	case errors.Is(err, tsdb.ErrorTimeOut),
+		errors.Is(err, tsdb.ErrorValueIsEmpty):
+		status = http.StatusBadRequest
+	}
+	writeErr(w, status, err)
+}
 
 // mustDuration parses a Go duration string, falling back to def on any error.
 func mustDuration(s string, def time.Duration) time.Duration {
@@ -53,8 +98,7 @@ func (s *Server) withRecovery(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				s.logger.Printf("panic serving %s: %v\n%s", r.URL.Path, rec, debug.Stack())
-				status := http.StatusInternalServerError
-				writeJSON(w, status, apiError{Error: "internal server error"})
+				writeJSON(w, http.StatusInternalServerError, apiError{Error: "internal server error"})
 			}
 		}()
 		next.ServeHTTP(w, r)

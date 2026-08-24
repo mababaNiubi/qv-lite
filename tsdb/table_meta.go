@@ -32,7 +32,26 @@ import (
 const (
 	metaMagic   = 0x4D455441 // "META"
 	metaHeadLen = 4
+
+	// defaultTagCacheSlots 是每表 tag→code 热缓存的默认槽数(2 的幂)。
+	// 直接映射缓存, tag 基数大且轮询写入时, 槽数过小会导致缓存 miss 抖动
+	// (每次 miss 都回查 SyncMap 并回填 Store), 拖慢写入路径。65536 槽下
+	// 10K tag 轮询的碰撞概率约 1%(命中率 99%), 内存上限约 2MB, 可忽略。
+	defaultTagCacheSlots = 65536
 )
+
+// nextPowerOfTwo 向上取整到 2 的幂, 保证 StringKeyCache 的 &(len-1) 索引正确。
+// n <= 0 时返回默认值。
+func nextPowerOfTwo(n int) int {
+	if n <= 0 {
+		return defaultTagCacheSlots
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
+}
 
 type Meta struct {
 	MaxPointDict tagCode
@@ -135,7 +154,13 @@ func (s *Meta) Close() error {
 	return nil
 }
 
-func NewMeta(path string) (*Meta, error) {
+// NewMeta opens or creates the tag meta file for a table directory.
+// slots 可选: 指定 tag→code 热缓存槽数(2 的幂), 缺省或 <=0 时用默认值 65536。
+func NewMeta(path string, slots ...int) (*Meta, error) {
+	tagCacheSlots := defaultTagCacheSlots
+	if len(slots) > 0 && slots[0] > 0 {
+		tagCacheSlots = slots[0]
+	}
 	m := &Meta{
 		Path:     filepath.Join(path, metaFile),
 		pending:  make([]byte, 0, 1024),

@@ -25,6 +25,9 @@ type ssTable struct {
 	flushMute              sync.Mutex
 	queryMute              sync.RWMutex // serializes queries with flush commit+truncate
 
+	// tagCacheSlots 是此表 Meta.tagCache 的槽数(2 的幂), 来自 Config.TagCacheSlots。
+	tagCacheSlots int
+
 	// Asynchronous processing (enabled via Config).
 	asyncFlush      bool
 	asyncCleanup    bool
@@ -38,7 +41,7 @@ type ssTable struct {
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
 	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig,
-	parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration) (*ssTable, error) {
+	tagCacheSlots int, parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -47,6 +50,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		expirationMinuteTime:   expirationMinuteTime,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
 		maxStorageTime:         maxStorageTime,
+		tagCacheSlots:          tagCacheSlots,
 		asyncFlush:             asyncFlush,
 		asyncCleanup:           asyncCleanup,
 		cleanupInterval:        cleanupInterval,
@@ -407,7 +411,7 @@ func (s *ssTable) setAsyncErr(err error) {
 func (s *ssTable) BuildColumn() error {
 	s.flushMute.Lock()
 	defer s.flushMute.Unlock()
-	meta, err := NewMeta(s.dirPath)
+	meta, err := NewMeta(s.dirPath, s.tagCacheSlots)
 	if err != nil {
 		return err
 	}

@@ -75,6 +75,12 @@ type Config struct {
 	// cleanup sweeps when AsyncCleanup is enabled. An initial sweep runs
 	// immediately on startup. Default 60.
 	CleanupIntervalSeconds int64 `json:"cleanup_interval_seconds"`
+	// TagCacheSlots 是每个表的 tag→code 热缓存槽数(直接映射, 需为 2 的幂)。
+	// 默认 65536。tag 基数大且轮询写入时, 槽数过小会导致缓存 miss 抖动
+	// (每次 miss 都回查 SyncMap 并回填 Store), 显著拖慢写入; 增大可提升
+	// 高基数写入性能。内存开销约 8B×slots + 24B×活跃tag数, 65536 槽上限
+	// 约 2MB, 可忽略。非 2 的幂会自动向上取整。
+	TagCacheSlots int `json:"tag_cache_slots"`
 }
 
 const DefaultTableName = "default"
@@ -120,6 +126,11 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 	if config.CleanupIntervalSeconds <= 0 {
 		config.CleanupIntervalSeconds = 60
 	}
+	if config.TagCacheSlots <= 0 {
+		config.TagCacheSlots = defaultTagCacheSlots
+	}
+	// StringKeyCache 索引用 &(len-1), 槽数必须是 2 的幂。
+	config.TagCacheSlots = nextPowerOfTwo(config.TagCacheSlots)
 	db := &DB{
 		Config:     config,
 		tableCache: *container.NewStringKeyCache[*ssTable](tableCacheSlots),
@@ -166,6 +177,7 @@ func (db *DB) BuildTable() error {
 			db.MaxStorageTime*int64(time.Second),
 			db.SecondaryCompressionName,
 			config,
+			db.TagCacheSlots,
 			db.ctx,
 			db.AsyncFlush,
 			db.AsyncCleanup,
@@ -208,6 +220,7 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.MinIntervalMs*int64(time.Millisecond),
 		db.MaxStorageTime*int64(time.Second),
 		db.SecondaryCompressionName, config,
+		db.TagCacheSlots,
 		db.ctx,
 		db.AsyncFlush,
 		db.AsyncCleanup,

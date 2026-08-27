@@ -8,6 +8,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,16 +152,32 @@ func BenchmarkWriteParallel(b *testing.B) {
 		b.Run(fmt.Sprintf("g%d", goroutines), func(b *testing.B) {
 			db, _ := benchOpen(b, "t", 256<<20)
 			base := time.Now().UnixNano()
-			var seq atomic.Int64
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			errCh := make(chan error, goroutines)
 			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					i := seq.Add(1) - 1
-					if _, err := db.Write("t", "CPU", base+i*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
-						b.Fatal(err)
+			wg.Add(goroutines)
+			for range goroutines {
+				go func() {
+					defer wg.Done()
+					for {
+						i := next.Add(1) - 1
+						if i >= int64(b.N) {
+							return
+						}
+						if _, err := db.Write("t", "CPU", base+i*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
+							errCh <- err
+							return
+						}
 					}
-				}
-			})
+				}()
+			}
+			wg.Wait()
+			select {
+			case err := <-errCh:
+				b.Fatal(err)
+			default:
+			}
 		})
 	}
 }

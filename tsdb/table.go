@@ -476,20 +476,17 @@ func (s *ssTable) forEachBlock(code tagCode, startTime, endTime int64, handle fu
 			if startTime > idx.MaxTime || endTime < idx.MinTime {
 				return true
 			}
-			matching := make([]BlockIndexEntry, 0, 5)
-			for i := range idx.Blocks {
-				b := &idx.Blocks[i]
-				if b.Attribute != code || startTime > b.MaxTime || endTime < b.MinTime {
-					continue
-				}
-				matching = append(matching, *b)
+			matching := idx.matchingBlockPositions(code, startTime, endTime)
+			if len(matching) == 0 {
+				return true
 			}
 			if len(matching) > len(idx.Blocks)/2 || len(matching) > 100 {
 				err = s.scanSegment(fs, code, startTime, endTime, handle)
 				return true
 			}
-			for i := range matching {
-				head, td, vd, err2 := fs.ReadAt(matching[i].Offset, &s.tableInfo)
+			for _, position := range matching {
+				block := &idx.Blocks[position]
+				head, td, vd, err2 := fs.ReadAt(block.Offset, &s.tableInfo)
 				if err2 != nil || head == nil {
 					continue
 				}

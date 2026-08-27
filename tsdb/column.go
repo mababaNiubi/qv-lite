@@ -19,10 +19,10 @@ func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentT
 	if maxSize == 0 {
 		maxSize = maxSegmentSize
 	}
-	// Default to 7 days; minimum interval is 5 minutes.
-	if maxSegmentTimeInterval < 60*5 {
-		maxSegmentTimeInterval = 7 * 24 * 60 * 60
-	}
+	// maxSegmentTimeInterval is already expressed in nanoseconds by DB.Open.
+	// Keep zero as "unlimited"; silently replacing it with a duration here both
+	// violated the public Config contract and previously mixed seconds with
+	// nanoseconds.
 	sc := &ssColumn{
 		index:                  index,
 		tableInfo:              tableInfo,
@@ -164,16 +164,16 @@ func (s *ssColumn) glowWrite(fileSegments *fileSegmentList) (bool, error) {
 		if maxTms > fileIndex.MaxTime {
 			fileIndex.MaxTime = maxTms
 		}
-		fileIndex.Blocks = append(fileIndex.Blocks, BlockIndexEntry{
+		fileIndex.appendBlock(BlockIndexEntry{
 			Attribute: s.index,
 			MinTime:   minTime,
 			MaxTime:   maxTms,
 			Offset:    blockOffset,
 			DataSize:  header.DataSize,
 		})
-		beyondSegmentTime = fileIndex.MinTime+s.maxSegmentTimeInterval >= fileIndex.MaxTime
+		beyondSegmentTime = segmentTimeExceeded(fileIndex.MinTime, fileIndex.MaxTime, s.maxSegmentTimeInterval)
 	} else {
-		beyondSegmentTime = w.GetMinTms()+s.maxSegmentTimeInterval >= maxTms
+		beyondSegmentTime = segmentTimeExceeded(w.GetMinTms(), maxTms, s.maxSegmentTimeInterval)
 	}
 
 	s.tmsCompressor.Reset()
@@ -182,6 +182,14 @@ func (s *ssColumn) glowWrite(fileSegments *fileSegmentList) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// segmentTimeExceeded reports whether [minTime, maxTime] has reached the
+// configured segment span. interval <= 0 disables time-based rotation. The
+// subtraction is only evaluated for an ordered range, avoiding signed overflow
+// for malformed/reversed timestamps.
+func segmentTimeExceeded(minTime, maxTime, interval int64) bool {
+	return interval > 0 && maxTime >= minTime && uint64(maxTime)-uint64(minTime) >= uint64(interval)
 }
 
 func (s *ssColumn) Reset() {

@@ -208,6 +208,8 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 
 func (s *walFile) updateWalConfig(walConfig WalConfig) {
 	walConfig.setDefaultValues()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	s.config = walConfig
 }
 
@@ -220,12 +222,11 @@ func (s *walFile) SetPreFlush(fn func() error) {
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	if ws.writeFile == nil || ws.writeBuffer == nil {
 		return false, 0, ErrorWALClose
 	}
-
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
 
 	fileIndex := len(ws.walFiles) - 1
 	if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
@@ -280,12 +281,11 @@ func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (b
 // WriteBatch writes multiple entries under a single mutex lock, reducing lock
 // contention compared to calling Write repeatedly.
 func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	if ws.writeFile == nil || ws.writeBuffer == nil {
 		return 0, ErrorWALClose
 	}
-
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
 
 	results := 0
 	fileIndex := len(ws.walFiles) - 1
@@ -631,21 +631,20 @@ func (ws *walFile) addWalFile() error {
 }
 
 func (ws *walFile) NeedFlush() bool {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	return len(ws.walFiles) > 1
 }
 
 func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	if ws.config.CloseBuffer && len(ws.walFiles) > 0 {
-		ws.mutex.Lock()
 		_ = ws.flushPending()
 		if ws.writeBuffer != nil {
 			_ = ws.writeBuffer.Flush()
 		}
-		ws.mutex.Unlock()
 	}
-
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
 	estCap := 512
 	if !ws.config.CloseBuffer {
 		total := 0
@@ -684,10 +683,11 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
 	ws.mutex.Lock()
 	snapshot := ws.walFiles[:len(ws.walFiles)-1]
+	closeBuffer := ws.config.CloseBuffer
 	ws.mutex.Unlock()
 
 	for i := 0; i < len(snapshot); i++ {
-		if ws.config.CloseBuffer {
+		if closeBuffer {
 			err := forEachWalFile(snapshot[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
 				return fc(i, tag, timestamp, data, offset)
 			})

@@ -250,12 +250,13 @@ type PointCachePack struct {
 
 func NewPointCachePack(points []Point) PointPack {
 	return &PointCachePack{
-		points: points,
+		currentIdx: -1,
+		points:     points,
 	}
 }
 
 func (p *PointCachePack) Reset() {
-	p.currentIdx = 0
+	p.currentIdx = -1
 	p.points = nil
 }
 

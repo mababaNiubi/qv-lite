@@ -105,9 +105,7 @@ func (w *fileSegment) PersistIndex() error {
 
 func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) (map[tagCode]Point, error) {
 	_ = w.OpenReader()
-	idx := &FileIndex{
-		Blocks: make([]BlockIndexEntry, 0, 5),
-	}
+	idx := newFileIndex(5)
 	lastPoints := make(map[tagCode]Point)
 	for {
 		lastOffset := w.GetReadEffectiveSize()
@@ -131,7 +129,7 @@ func (w *fileSegment) InspectBlockIndex(tableInfo *TableInfo) (map[tagCode]Point
 		if head.MaxTime > idx.MaxTime {
 			idx.MaxTime = head.MaxTime
 		}
-		idx.Blocks = append(idx.Blocks, BlockIndexEntry{
+		idx.appendBlock(BlockIndexEntry{
 			Attribute: head.Attribute,
 			MinTime:   head.MinTime,
 			MaxTime:   head.MaxTime,
@@ -209,7 +207,7 @@ func (s *fileSegmentList) OpenTransaction() error {
 			return err
 		}
 		f.Close()
-		fs := newFileSegment(path, timestamp, s.compressor, &FileIndex{Blocks: make([]BlockIndexEntry, 0, 5)}, s.readerCache)
+		fs := newFileSegment(path, timestamp, s.compressor, newFileIndex(5), s.readerCache)
 		s.segments = append(s.segments, fs)
 		s.activeIdx = len(s.segments) - 1
 	}
@@ -257,7 +255,7 @@ func (s *fileSegmentList) AddTransactionSegment() error {
 		return err
 	}
 	f.Close()
-	fs := newFileSegment(path, timestamp, s.compressor, &FileIndex{Blocks: make([]BlockIndexEntry, 0, 5)}, s.readerCache)
+	fs := newFileSegment(path, timestamp, s.compressor, newFileIndex(5), s.readerCache)
 	s.segments = append(s.segments, fs)
 	s.activeIdx = len(s.segments) - 1
 	return fs.OpenWriter()
@@ -410,7 +408,7 @@ func (s *fileSegmentList) BuildFragmentation(dirPath string, compressor BlockCom
 	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
 	for _, ts := range timestamps {
 		path := filepath.Join(s.tableFragmentationFilePath, fmt.Sprintf("%v%s", ts, dataSuffix))
-		index := &FileIndex{Blocks: make([]BlockIndexEntry, 0, 5)}
+		index := newFileIndex(5)
 		if idx := readIndexFile(indexFilePath(path)); idx != nil {
 			index = idx
 		}

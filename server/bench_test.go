@@ -59,7 +59,10 @@ func buildLineBody(n int) []byte {
 	sb.Grow(n * 40)
 	base := time.Now().Add(-time.Hour).UnixMilli()
 	for i := 0; i < n; i++ {
-		fmt.Fprintf(&sb, "t,tag=cpu value=36.5 %d\n", base+int64(i))
+		// Equal timestamps are valid when dedup/min-interval are disabled. Keeping
+		// them equal ensures repeated benchmark iterations still exercise actual
+		// WAL writes instead of being discarded as older than the prior batch.
+		fmt.Fprintf(&sb, "t,tag=cpu value=36.5 %d\n", base)
 	}
 	return []byte(sb.String())
 }
@@ -70,7 +73,7 @@ func buildJSONBody(n int) []byte {
 	pts := make([]map[string]any, n)
 	for i := range pts {
 		pts[i] = map[string]any{
-			"tag": "cpu", "timestamp": base + int64(i), "value": 36.5,
+			"tag": "cpu", "timestamp": base, "value": 36.5,
 		}
 	}
 	raw, err := json.Marshal(map[string]any{"points": pts})
@@ -99,7 +102,7 @@ func buildBinaryBody(n int) []byte {
 		buf.Write(tlen[:])
 		buf.WriteString(tag)
 		var ts [8]byte
-		binary.BigEndian.PutUint64(ts[:], uint64(base+int64(i)))
+		binary.BigEndian.PutUint64(ts[:], uint64(base))
 		buf.Write(ts[:])
 		var val [8]byte
 		binary.BigEndian.PutUint64(val[:], math.Float64bits(36.5))
@@ -116,6 +119,9 @@ func BenchmarkPipelineSubmitFlush(b *testing.B) {
 	w := NewPipelinedWriter(db, 1000, 50_000)
 	defer w.Close()
 	src := testPoints(50_000)
+	for i := range src {
+		src[i].Timestamp = src[0].Timestamp
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// 生产侧从池取缓冲填充一批，所有权交给写入器，Flush 后归还池。

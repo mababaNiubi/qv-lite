@@ -5,6 +5,7 @@
   "write_timeout": "60s",
   "enable_pprof": false,
   "token": "",
+  "write_buffer_ms": 0,
   "db": {
     "path": "./qvLite-data",
     "max_segment_size": 67108864,
@@ -17,6 +18,12 @@
     "async_flush": true,
     "async_cleanup": true,
     "cleanup_interval_seconds": 60,
+    "ingest_config": {
+      "shards": 16,
+      "max_batch_size": 4096,
+      "flush_interval_ms": 5,
+      "queue_size": 8
+    },
     "wal_config": {
       "max_file_size": 67108864,
       "max_file_number": 0,

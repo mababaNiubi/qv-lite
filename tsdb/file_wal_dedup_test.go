@@ -43,9 +43,9 @@ func eqInt64(t *testing.T, got, want []int64) {
 	}
 }
 
-// TestDedupRunPath verifies the sorted-chunk fast path (dedupRuns): an
-// out-of-order single-tag chunk is sorted and all points are kept; a later
-// chunk with older points has them deduped against the running max.
+// TestDedupRunPath verifies the prepared-batch path (dedupRuns). With no
+// dedup or sampling policy configured, late points in a later batch are kept;
+// the WAL marks that uncommon file for flush-time ordering.
 func TestDedupRunPath(t *testing.T) {
 	dir := tempDir(t)
 	cfg := WalConfig{MaxFileSize: maxSegmentSize, MaxBufferBatchSize: 5, MaxFileNumber: 100}
@@ -55,17 +55,22 @@ func TestDedupRunPath(t *testing.T) {
 	}
 	tag := tagCode(1)
 
-	// Chunk 1 (5 entries, out of order → sorted → dedupRuns): all kept.
-	for _, ts := range []int64{100, 50, 75, 80, 90} {
-		if _, _, err := wf.Write(tag, ts, variant.NewInt64(ts)); err != nil {
-			t.Fatal(err)
-		}
+	// Every input batch already satisfies the batcher contract: one ordered run
+	// per tag. Late points in batch 2 are relative to batch 1, not within a run.
+	batch := make([]walDataEntry, 0, 5)
+	for _, ts := range []int64{50, 75, 80, 90, 100} {
+		batch = append(batch, walDataEntry{Key: tag, Timestamp: ts, Value: variant.NewInt64(ts)})
 	}
-	// Chunk 2 (5 entries): 30,60 < running max 100 → dropped.
-	for _, ts := range []int64{60, 200, 30, 150, 250} {
-		if _, _, err := wf.Write(tag, ts, variant.NewInt64(ts)); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := wf.WriteBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+	// Batch 2 contains late points 30 and 60; both must remain durable.
+	batch = batch[:0]
+	for _, ts := range []int64{30, 60, 150, 200, 250} {
+		batch = append(batch, walDataEntry{Key: tag, Timestamp: ts, Value: variant.NewInt64(ts)})
+	}
+	if _, err := wf.WriteBatch(batch); err != nil {
+		t.Fatal(err)
 	}
 
 	if ts, _, ok := wf.GetTagMaxTimestamp(tag); !ok || ts != 250 {
@@ -76,14 +81,13 @@ func TestDedupRunPath(t *testing.T) {
 	}
 
 	rw := reopenWal(t, dir, cfg)
-	eqInt64(t, readAll(rw, tag, 0, 1000), []int64{50, 75, 80, 90, 100, 150, 200, 250})
+	eqInt64(t, readAll(rw, tag, 0, 1000), []int64{30, 50, 60, 75, 80, 90, 100, 150, 200, 250})
 }
 
-// TestDedupInterleavedPath verifies the interleaved per-tag-monotonic path
-// (dedupPerEntry, the no-sort high-cardinality case): two tags interleaved with
-// non-decreasing timestamps are deduped correctly, and old cross-chunk points
-// are dropped per tag.
-func TestDedupInterleavedPath(t *testing.T) {
+// TestDedupGroupedTags verifies that multiple contiguous tag runs need not be
+// ordered by tagCode, and late points in a later batch remain visible when no
+// filtering policy is configured.
+func TestDedupGroupedTags(t *testing.T) {
 	dir := tempDir(t)
 	cfg := WalConfig{MaxFileSize: maxSegmentSize, MaxBufferBatchSize: 5, MaxFileNumber: 100}
 	wf, err := NewWalFile(dir, 0, 0, cfg)
@@ -92,23 +96,27 @@ func TestDedupInterleavedPath(t *testing.T) {
 	}
 	const tagA, tagB = tagCode(1), tagCode(2)
 
-	// Interleaved monotonic chunk: [A:10 B:10 A:20 B:20 A:30] → dedupPerEntry, all kept.
+	// Tag B precedes tag A, proving tagCode order itself is not required.
+	batch := make([]walDataEntry, 0, 5)
 	for _, e := range []struct {
 		k tagCode
 		v int64
-	}{{tagA, 10}, {tagB, 10}, {tagA, 20}, {tagB, 20}, {tagA, 30}} {
-		if _, _, err := wf.Write(e.k, e.v, variant.NewInt64(e.v)); err != nil {
-			t.Fatal(err)
-		}
+	}{{tagB, 10}, {tagB, 20}, {tagA, 10}, {tagA, 20}, {tagA, 30}} {
+		batch = append(batch, walDataEntry{Key: e.k, Timestamp: e.v, Value: variant.NewInt64(e.v)})
 	}
-	// Second chunk: A:5,B:15 older than A:30,B:20 → dropped; rest kept.
+	if _, err := wf.WriteBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+	// Second batch: A:5,B:15 are late but must not be silently dropped.
+	batch = batch[:0]
 	for _, e := range []struct {
 		k tagCode
 		v int64
-	}{{tagA, 5}, {tagB, 15}, {tagA, 35}, {tagB, 25}, {tagA, 40}} {
-		if _, _, err := wf.Write(e.k, e.v, variant.NewInt64(e.v)); err != nil {
-			t.Fatal(err)
-		}
+	}{{tagA, 5}, {tagA, 35}, {tagA, 40}, {tagB, 15}, {tagB, 25}} {
+		batch = append(batch, walDataEntry{Key: e.k, Timestamp: e.v, Value: variant.NewInt64(e.v)})
+	}
+	if _, err := wf.WriteBatch(batch); err != nil {
+		t.Fatal(err)
 	}
 
 	if ts, _, ok := wf.GetTagMaxTimestamp(tagA); !ok || ts != 40 {
@@ -122,8 +130,8 @@ func TestDedupInterleavedPath(t *testing.T) {
 	}
 
 	rw := reopenWal(t, dir, cfg)
-	eqInt64(t, readAll(rw, tagA, 0, 1000), []int64{10, 20, 30, 35, 40})
-	eqInt64(t, readAll(rw, tagB, 0, 1000), []int64{10, 20, 25})
+	eqInt64(t, readAll(rw, tagA, 0, 1000), []int64{5, 10, 20, 30, 35, 40})
+	eqInt64(t, readAll(rw, tagB, 0, 1000), []int64{10, 15, 20, 25})
 }
 
 // TestDedupWindow applies dedupWindowMs across chunk boundaries on both paths
@@ -156,9 +164,8 @@ func TestDedupWindow(t *testing.T) {
 	eqInt64(t, readAll(rw, tag, 0, 2000000), []int64{42, 43})
 }
 
-// TestDedupHighCardinality writes many rotating tags (each in monotonic order)
-// so chunks take the interleaved dedupPerEntry path, then verifies every point
-// survives with per-tag ordering intact.
+// TestDedupHighCardinality writes many tags as single-entry prepared batches,
+// then verifies every point survives with per-tag ordering intact.
 func TestDedupHighCardinality(t *testing.T) {
 	dir := tempDir(t)
 	cfg := WalConfig{MaxFileSize: maxSegmentSize, MaxBufferBatchSize: 64, MaxFileNumber: 1000}
@@ -170,8 +177,7 @@ func TestDedupHighCardinality(t *testing.T) {
 	const tags = 100
 	const perTag = 20
 	base := int64(1000000000000)
-	// Zigzag tag order within each round (0,99,1,98,...) so each 64-entry chunk
-	// is interleaved (per-tag monotonic but not sorted) → dedupPerEntry path.
+	// Zigzag tag order exercises arbitrary tagCode order across batches.
 	order := make([]int, 0, tags)
 	for i := 0; i < tags/2; i++ {
 		order = append(order, i, tags-1-i)

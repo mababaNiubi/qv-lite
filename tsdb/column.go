@@ -59,6 +59,7 @@ type ssColumn struct {
 	tmsCompressor          *TimeEncoder
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
+	lastFlushEpoch         uint64
 
 	// preTms/preVariant save a (timestamp, value) pair rejected by the value
 	// encoder due to a type change. They are flushed on the next Write call
@@ -179,7 +180,8 @@ func (s *ssColumn) glowWrite(fileSegments *fileSegmentList) (bool, error) {
 	s.tmsCompressor.Reset()
 	s.valueCompressor.Reset()
 	if w.PhysicalSize() >= s.maxSegmentSize || beyondSegmentTime {
-		return true, nil
+		_ = fileSegments.PersistLastIndex()
+		return true, fileSegments.AddTransactionSegment()
 	}
 	return false, nil
 }

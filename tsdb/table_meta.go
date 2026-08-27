@@ -61,9 +61,10 @@ type Meta struct {
 	mu   sync.Mutex
 	file *os.File
 	// pending buffers tag entries written by addTag. They are flushed to the
-	// file (and fsynced) by flushPendingLocked, which the WAL calls before any
-	// WAL bytes reach the OS. This turns per-tag fsync (~3ms/tag) into one
-	// fsync per WAL batch, which is what makes high-cardinality writes viable.
+	// file (and fsynced) by flushPendingLocked, which the table batcher worker
+	// calls before appending the points that reference them to the WAL. This
+	// turns per-tag fsync (~3ms/tag) into one fsync per WAL batch, which is what
+	// makes high-cardinality writes viable.
 	pending []byte
 
 	// tagCache is a direct-mapped hot-tag cache in front of the embedded map.
@@ -111,10 +112,10 @@ func (s *Meta) addTag(tag string) (tagCode, error) {
 	return s.MaxPointDict, nil
 }
 
-// FlushPending writes and fsyncs any buffered tag entries. The WAL calls it
-// before writing WAL bytes to the OS, guaranteeing tag codes are durable
-// before the points that reference them can be. Idempotent and safe to call
-// when nothing is pending.
+// FlushPending writes and fsyncs any buffered tag entries. The table batcher
+// worker calls it before appending a batch to the WAL, guaranteeing tag codes
+// are durable before the points that reference them can be. Idempotent and
+// safe to call when nothing is pending.
 func (s *Meta) FlushPending() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -36,14 +36,13 @@ type Config struct {
 	// "X-Auth-Token" header matching this value. Default empty (no auth).
 	Token string `json:"token,omitempty"`
 
-	// WriteBufferMs enables the decode→ingest pipeline: writes are buffered
+	// WriteBufferMs optionally enables the legacy decode→ingest pipeline: writes are buffered
 	// for up to this many milliseconds then coalesced into larger engine
 	// batches by a single background writer goroutine. This decouples
-	// decoding (CPU, on the request goroutine) from ingestion (engine WAL
-	// lock, on the writer goroutine) — deserialization no longer blocks
-	// engine writes — and coalesces small concurrent request batches into
-	// one engine WriteBatch per table per flush cycle. Default 5.
-	// 0 disables the pipeline (immediate write on the request goroutine).
+	// decoding from ingestion and coalesces small request batches. The engine
+	// now has its own sharded asynchronous ingest buffer, so this layer is
+	// disabled by default to preserve concurrent shard writes. Default 0.
+	// Set a positive value only when decode/ingest pipelining is beneficial.
 	// Queries, single-point writes and shutdown always flush the buffer
 	// first, so read-after-write stays consistent.
 	WriteBufferMs int64 `json:"write_buffer_ms"`
@@ -53,19 +52,16 @@ type Config struct {
 	WriteBatchSize int `json:"write_batch_size"`
 }
 
-// DefaultConfig returns a server Config tuned for throughput: the decode→ingest
-// pipeline is on (5ms buffer) so streaming writes run on a single background
-// writer goroutine, async flush keeps writes off the segment-encoding path,
-// async cleanup handles expired data, and the WAL buffer is reasonably large.
+// DefaultConfig returns a server Config tuned for throughput. Request
+// goroutines write directly into the engine's sharded ingest buffer; async
+// segment flush and cleanup keep expensive maintenance off the request path.
 func DefaultConfig() Config {
 	return Config{
-		Listen:       ":8686",
-		MaxBodyBytes: 64 << 20,
-		ReadTimeout:  "30s",
-		WriteTimeout: "60s",
-		// 流水线默认开启：流式写入由单个后台 goroutine 合并入库，
-		// 反序列化在请求 goroutine 上进行，互不阻塞。
-		WriteBufferMs: 5,
+		Listen:        ":8686",
+		MaxBodyBytes:  64 << 20,
+		ReadTimeout:   "30s",
+		WriteTimeout:  "60s",
+		WriteBufferMs: 0,
 		DB: tsdb.Config{
 			Path:                     "./qvLite-data",
 			MaxSegmentSize:           64 << 20,
@@ -74,6 +70,12 @@ func DefaultConfig() Config {
 			AsyncCleanup:             true,
 			CleanupIntervalSeconds:   60,
 			SecondaryCompressionName: "zstd",
+			IngestConfig: tsdb.IngestConfig{
+				Shards:          16,
+				MaxBatchSize:    4096,
+				FlushIntervalMs: 5,
+				QueueSize:       8,
+			},
 		},
 	}
 }
@@ -123,11 +125,15 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.DB.DedupWindowMs, "dedup-window", c.DB.DedupWindowMs, "deduplication window in milliseconds (0 = disabled)")
 	fs.Int64Var(&c.DB.MinIntervalMs, "min-interval", c.DB.MinIntervalMs, "minimum interval between writes in milliseconds (0 = disabled)")
 	fs.Int64Var(&c.DB.MaxStorageTime, "max-storage-time", c.DB.MaxStorageTime, "max allowed age of stored timestamps vs now, seconds (0 = loose)")
+	fs.IntVar(&c.DB.IngestConfig.Shards, "ingest-shards", c.DB.IngestConfig.Shards, "number of sharded engine ingest locks (rounded up to a power of two)")
+	fs.IntVar(&c.DB.IngestConfig.MaxBatchSize, "ingest-batch-size", c.DB.IngestConfig.MaxBatchSize, "active engine points that trigger an asynchronous WAL batch")
+	fs.Int64Var(&c.DB.IngestConfig.FlushIntervalMs, "ingest-flush-ms", c.DB.IngestConfig.FlushIntervalMs, "maximum engine ingest buffer delay in milliseconds")
+	fs.IntVar(&c.DB.IngestConfig.QueueSize, "ingest-queue-size", c.DB.IngestConfig.QueueSize, "maximum frozen engine batches queued for the WAL worker")
 	fs.StringVar(&c.DB.SecondaryCompressionName, "compression", c.DB.SecondaryCompressionName, "block compression: zstd, lz4, snappy, gzip, none")
 	fs.Int64Var(&c.MaxBodyBytes, "max-body", c.MaxBodyBytes, "max request body bytes")
 	fs.BoolVar(&c.EnablePprof, "pprof", c.EnablePprof, "enable /debug/pprof endpoints")
 	fs.StringVar(&c.Token, "token", c.Token, "require this X-Auth-Token on every API request (empty = no auth)")
-	fs.Int64Var(&c.WriteBufferMs, "write-buffer-ms", c.WriteBufferMs, "decode->ingest pipeline buffer period in ms (default 5; 0 = immediate writes)")
+	fs.Int64Var(&c.WriteBufferMs, "write-buffer-ms", c.WriteBufferMs, "optional server decode->ingest pipeline period in ms (default 0; engine batching remains enabled)")
 	fs.IntVar(&c.WriteBatchSize, "write-batch-size", c.WriteBatchSize, "coalesced engine batch size for the write pipeline")
 }
 

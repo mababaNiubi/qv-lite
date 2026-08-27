@@ -2,6 +2,7 @@ package tsdb
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,8 +23,11 @@ type ssTable struct {
 	expirationMinuteTime   int64
 	maxStorageTime         int64
 	walFile                WalFile
+	batcher                *tableBatcher
 	flushMute              sync.Mutex
 	queryMute              sync.RWMutex // serializes queries with flush commit+truncate
+	flushEpoch             uint64
+	flushTouched           []*ssColumn
 
 	// tagCacheSlots 是此表 Meta.tagCache 的槽数(2 的幂), 来自 Config.TagCacheSlots。
 	tagCacheSlots int
@@ -41,7 +45,8 @@ type ssTable struct {
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
 	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig,
-	tagCacheSlots int, parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration) (*ssTable, error) {
+	tagCacheSlots int, parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration,
+	ingestConfig IngestConfig) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -77,9 +82,6 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	if err != nil {
 		return nil, err
 	}
-	// Persist tag metadata before any WAL bytes reach the OS, so tag codes are
-	// always durable ahead of the points referencing them.
-	s.walFile.SetPreFlush(s.Meta.FlushPending)
 	// Handle file corruption caused by an abnormal interruption during writes.
 	lastPoints, err := s.fragmentation.InspectLastBlockIndex(&s.tableInfo)
 	if err != nil {
@@ -88,6 +90,7 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 	for k, lp := range lastPoints {
 		s.walFile.SetLastPoint(k, lp.Tms, lp.V)
 	}
+	s.batcher = newTableBatcher(s, ingestConfig)
 	// Start the background cleanup loop when async cleanup is enabled.
 	if s.asyncCleanup {
 		s.cleanupDone = make(chan struct{})
@@ -98,90 +101,71 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 }
 
 func (s *ssTable) Write(tag string, timestamp int64, value variant.Variant) (bool, error) {
-	if s.walFile == nil {
+	if s.walFile == nil || s.batcher == nil {
 		return false, ErrorWALCacheIsNil
 	}
-	if value.IsEmpty() {
-		return false, ErrorValueIsEmpty
+	if err := s.validateWrite(timestamp, value, time.Now().UnixNano()); err != nil {
+		return false, err
 	}
-	if s.maxStorageTime != 0 && time.Now().UnixNano()+s.maxStorageTime < timestamp {
-		// Reject data with timestamps too far beyond the current time.
-		return false, ErrorTimeOut
+	if err := s.batcher.add(tag, timestamp, value); err != nil {
+		return false, err
 	}
-	// Look up the column index. Meta.Load serves hot tags from its cache.
-	code, ok := s.Meta.Load(tag)
-	if !ok {
-		var err error
-		code, err = s.CreateColumn(tag)
-		if err != nil {
-			return false, err
-		}
-	}
-	// Write to WAL cache.
-	ok, _, err := s.walFile.Write(code, timestamp, value)
-	if err != nil {
-		if err == ErrorWALCacheFull {
-			// Backpressure: flush synchronously, then retry.
-			if flushErr := s.flushBlocking(); flushErr != nil {
-				return ok, flushErr
-			}
-			ok, _, err = s.walFile.Write(code, timestamp, value)
-		}
-		return ok, err
-	}
-	// Flush to disk when the cache exceeds the size limit.
-	if s.walFile.NeedFlush() {
-		if err = s.maybeFlush(); err != nil {
-			return ok, err
-		}
-	}
-	return ok, nil
+	return true, nil
 }
 
-// WriteBatch writes multiple data points under a single WAL mutex acquisition,
-// reducing lock contention compared to calling Write repeatedly.
+// WriteBatch validates and appends multiple raw-tag points to the sharded
+// table buffer. Tag resolution and WAL I/O happen on the background worker.
 func (s *ssTable) WriteBatch(points []TagPoint) (int, error) {
-	if s.walFile == nil {
+	if s.walFile == nil || s.batcher == nil {
 		return 0, ErrorWALCacheIsNil
 	}
-	// Resolve all tag codes, creating columns for new tags.
-	entries := make([]walDataEntry, len(points))
-	for i, p := range points {
-		code, ok := s.Meta.Load(p.Tag)
-		if !ok {
-			var err error
-			code, err = s.CreateColumn(p.Tag)
-			if err != nil {
-				return 0, err
-			}
-		}
-		if p.Value.IsEmpty() {
-			return 0, ErrorValueIsEmpty
-		}
-		if s.maxStorageTime != 0 && time.Now().UnixNano()+s.maxStorageTime < p.Timestamp {
-			// Reject data with timestamps too far beyond the current time.
-			return 0, ErrorTimeOut
-		}
-		entries[i] = walDataEntry{
-			Key:       code,
-			Timestamp: p.Timestamp,
-			Value:     p.Value,
+	now := time.Now().UnixNano()
+	for _, p := range points {
+		if err := s.validateWrite(p.Timestamp, p.Value, now); err != nil {
+			return 0, err
 		}
 	}
+	if err := s.batcher.addBatch(points); err != nil {
+		return 0, err
+	}
+	return len(points), nil
+}
 
-	results, err := s.walFile.WriteBatch(entries)
+func (s *ssTable) validateWrite(timestamp int64, value variant.Variant, now int64) error {
+	if value.IsEmpty() {
+		return ErrorValueIsEmpty
+	}
+	if s.maxStorageTime != 0 && now+s.maxStorageTime < timestamp {
+		return ErrorTimeOut
+	}
+	return nil
+}
+
+// commitRawWriteBatch runs off the caller path. It resolves each distinct tag
+// once, sorts only out-of-order tag buffers, persists any newly created tag
+// codes to Meta, and only then appends the prepared numeric batch to the WAL.
+func (s *ssTable) commitRawWriteBatch(batch *frozenWriteBatch) (int, error) {
+	entries, err := s.batcher.prepareRawWriteBatch(batch)
 	if err != nil {
-		if err == ErrorWALCacheFull {
-			// Backpressure: flush synchronously, then retry.
-			if flushErr := s.flushBlocking(); flushErr != nil {
-				return results, flushErr
-			}
-			results, err = s.walFile.WriteBatch(entries)
+		return 0, err
+	}
+	// Durability ordering: codes created by prepareRawWriteBatch must be fsynced
+	// before the WAL bytes that reference them reach the OS. Otherwise a crash
+	// leaves WAL points whose codes Meta cannot resolve, breaking recovery. One
+	// Meta fsync per batch; a no-op when the batch introduced no new tags.
+	if err := s.Meta.FlushPending(); err != nil {
+		return 0, err
+	}
+	results, err := s.walFile.WriteBatch(entries)
+	if err == ErrorWALCacheFull {
+		if flushErr := s.flushBlocking(); flushErr != nil {
+			return results, flushErr
 		}
+		results, err = s.walFile.WriteBatch(entries)
+	}
+	if err != nil {
 		return results, err
 	}
-
-	// Check flush once after the batch.
 	if s.walFile.NeedFlush() {
 		if err = s.maybeFlush(); err != nil {
 			return results, err
@@ -197,94 +181,156 @@ func (s *ssTable) flushCache() error {
 	s.queryMute.Lock()
 	defer s.queryMute.Unlock()
 
-	// Flush the active WAL file's unflushed chunk first so that
-	// complete files only contain flushed data during encoding.
+	// Flush already accepted WAL bytes before encoding complete files.
 	if s.walFile != nil {
 		_ = s.walFile.FlushPending()
 	}
 
-	// Open or create a data segment.
-	var err, readErr error
-	err = s.fragmentation.OpenTransaction()
-	if err != nil {
+	completeCount, needsSort := s.walFile.completeFileState()
+	if completeCount == 0 {
+		return nil
+	}
+
+	var entries []flushEntry
+	lastReadFile := -1
+	lastReadOffset := int64(0)
+	repairReadError := func(consumed int, readErr error) error {
+		truncateSize := int64(0)
+		if lastReadFile == consumed {
+			truncateSize = lastReadOffset
+		}
+		if err := s.walFile.retainWalFilePrefix(consumed, truncateSize); err != nil {
+			return err
+		}
+		return readErr
+	}
+
+	consumed := completeCount
+	if needsSort {
+		entries = make([]flushEntry, 0, 4096)
+		var readErr error
+		consumed, readErr = s.walFile.forEachCompleteFile(completeCount, func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
+			entries = append(entries, flushEntry{tag: tag, timestamp: timestamp, value: value})
+			lastReadFile = fileIndex
+			lastReadOffset = offset
+			return true
+		})
+		if readErr != nil {
+			return repairReadError(consumed, readErr)
+		}
+		if len(entries) == 0 {
+			s.walFile.truncate(consumed)
+			return nil
+		}
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].tag != entries[j].tag {
+				return entries[i].tag < entries[j].tag
+			}
+			return entries[i].timestamp < entries[j].timestamp
+		})
+	}
+
+	if err := s.fragmentation.OpenTransaction(); err != nil {
 		return err
 	}
-	// Iterate over WAL data and write to column encoders.
-	readSize := int64(0)
-	// Track the position of the last successfully read entry for error recovery.
-	errIndex := 0
-	var consumed int
-	consumed, err = s.walFile.forEachCompleteFile(func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
-		column := s.columns[tag-1]
-		// Find the column for this tag and write the data point.
-		glowNot := true
-		glowNot, readErr = column.Write(timestamp, value)
-		if !glowNot {
-			// Flush encoder data to disk.
-			var needNewFile bool
-			needNewFile, readErr = column.glowWrite(&s.fragmentation)
-			if readErr != nil {
-				return false
-			}
-			// Create a new data segment if the disk size limit is exceeded.
-			if needNewFile {
-				_ = s.fragmentation.PersistLastIndex()
-				readErr = s.fragmentation.AddTransactionSegment()
-				if readErr != nil {
-					return false
-				}
-			}
-		}
-		if readErr != nil {
-			errIndex = fileIndex
-			return false
-		}
-		readSize = offset
-		return true
-	})
-	if err != nil || readErr != nil {
-		// Reset all encoder state.
+
+	s.flushEpoch++
+	if s.flushEpoch == 0 {
+		// Only reachable after 2^64 flushes. Keep zero reserved for columns that
+		// have never participated in a flush.
 		for _, column := range s.columns {
+			column.lastFlushEpoch = 0
+		}
+		s.flushEpoch = 1
+	}
+	epoch := s.flushEpoch
+	s.flushTouched = s.flushTouched[:0]
+
+	rollbackTransaction := func() error {
+		for _, column := range s.flushTouched {
 			column.Reset()
 		}
-		// Roll back all data segments.
-		errRollback := s.fragmentation.RollbackLastCommitTransaction()
-		if errRollback != nil {
-			return errRollback
-		}
-		// Truncate WAL to the last valid position on read error.
-		err2 := s.walFile.retainWalFilePrefix(errIndex, readSize)
-		if err2 != nil {
-			return err2
-		}
-		if readErr != nil {
-			return readErr
-		}
-		return err
+		return s.fragmentation.RollbackLastCommitTransaction()
 	}
-	// Flush remaining encoder data to disk.
-	for _, column := range s.columns {
-		var needNewFile bool
-		needNewFile, err = column.glowWrite(&s.fragmentation)
-		if err != nil {
-			break
+
+	var processErr error
+	processEntry := func(tag tagCode, timestamp int64, value variant.Variant) bool {
+		if tag == 0 || int(tag) > len(s.columns) {
+			processErr = ErrorWALDataCorruption
+			return false
 		}
-		if needNewFile {
-			_ = s.fragmentation.PersistLastIndex()
-			err = s.fragmentation.AddTransactionSegment()
-			if err != nil {
+		column := s.columns[tag-1]
+		if column.lastFlushEpoch != epoch {
+			column.lastFlushEpoch = epoch
+			s.flushTouched = append(s.flushTouched, column)
+		}
+		glowNot, err := column.Write(timestamp, value)
+		if err != nil {
+			processErr = err
+			return false
+		}
+		if !glowNot {
+			if _, err := column.glowWrite(&s.fragmentation); err != nil {
+				processErr = err
+				return false
+			}
+		}
+		return true
+	}
+
+	if needsSort {
+		for i := range entries {
+			entry := &entries[i]
+			if !processEntry(entry.tag, entry.timestamp, entry.value) {
 				break
 			}
 		}
+	} else {
+		var readErr error
+		consumed, readErr = s.walFile.forEachCompleteFile(completeCount, func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool {
+			lastReadFile = fileIndex
+			lastReadOffset = offset
+			return processEntry(tag, timestamp, value)
+		})
+		if processErr != nil {
+			_ = rollbackTransaction()
+			return processErr
+		}
+		if readErr != nil {
+			if err := rollbackTransaction(); err != nil {
+				return err
+			}
+			return repairReadError(consumed, readErr)
+		}
+	}
+	if processErr != nil {
+		_ = rollbackTransaction()
+		return processErr
+	}
+	if len(s.flushTouched) == 0 {
+		if err := rollbackTransaction(); err != nil {
+			return err
+		}
+		s.walFile.truncate(consumed)
+		return nil
+	}
+
+	// Flush remaining encoder data to disk.
+	var err error
+	for _, column := range s.flushTouched {
+		_, err = column.glowWrite(&s.fragmentation)
+		if err != nil {
+			break
+		}
+	}
+	if err != nil {
+		_ = rollbackTransaction()
+		return err
 	}
 	// Commit the data segments and truncate the consumed WAL files.
 	err = s.fragmentation.CommitTransactionFileSegment()
 	if err != nil {
-		// On commit failure, roll back to protect data integrity.
-		errRollback := s.fragmentation.RollbackLastCommitTransaction()
-		if errRollback != nil {
-			return errRollback
-		}
+		_ = rollbackTransaction()
 		return err
 	}
 	// Truncate WAL after successful flush.
@@ -544,6 +590,11 @@ func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCo
 }
 
 func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([]Point, error) {
+	if s.batcher != nil {
+		if err := s.batcher.Flush(); err != nil {
+			return nil, err
+		}
+	}
 	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
@@ -571,6 +622,11 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 
 // QueryLatest returns the most recent data point for the specified tag.
 func (s *ssTable) QueryLatest(tag string) (*Point, error) {
+	if s.batcher != nil {
+		if err := s.batcher.Flush(); err != nil {
+			return nil, err
+		}
+	}
 	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
@@ -598,6 +654,11 @@ func isNumericType(v variant.Variant) bool {
 // QueryWindow queries data for a tag within a time range, aggregating within fixed-size windows.
 // windowSize is the aggregation window in nanoseconds. fusion controls aggregation: 0=avg, 1=min, 2=max.
 func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, windowSize int64, fusion uint8, cond any) ([]Point, error) {
+	if s.batcher != nil {
+		if err := s.batcher.Flush(); err != nil {
+			return nil, err
+		}
+	}
 	code, ok := s.Meta.Load(tag)
 	if !ok {
 		return nil, ErrorTagNotFound
@@ -716,6 +777,12 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 }
 
 func (s *ssTable) Close() error {
+	// Stop accepting new points and commit both active and queued MemTable
+	// batches before shutting down WAL/segment workers.
+	var batchErr error
+	if s.batcher != nil {
+		batchErr = s.batcher.Close()
+	}
 	// Stop background goroutines and wait for any in-flight async flush so that
 	// files are not closed mid-transaction.
 	if s.cancel != nil {
@@ -725,10 +792,7 @@ func (s *ssTable) Close() error {
 	if s.cleanupDone != nil {
 		<-s.cleanupDone
 	}
-	// Close the WAL. Its internal flushPending flushes the active chunk and
-	// may rotate the file, creating a new complete file. We must drain again
-	// so that file is also encoded and truncated, otherwise its data would
-	// appear in both segments and the WAL on reopen.
+	// Close the WAL after the table batcher has committed every accepted point.
 	var closeErr error
 	if s.walFile != nil {
 		closeErr = s.walFile.Close()
@@ -745,13 +809,18 @@ func (s *ssTable) Close() error {
 	if s.walFile != nil {
 		s.walFile.removeOrphanedFiles()
 	}
+	var metaErr error
+	if s.Meta != nil {
+		metaErr = s.Meta.Close()
+	}
 	if closeErr != nil {
 		return closeErr
 	}
-	if s.Meta != nil {
-		if err := s.Meta.Close(); err != nil {
-			return err
-		}
+	if batchErr != nil {
+		return batchErr
+	}
+	if metaErr != nil {
+		return metaErr
 	}
 	// Surface the last asynchronous flush error, if any.
 	if v := s.asyncErr.Load(); v != nil {

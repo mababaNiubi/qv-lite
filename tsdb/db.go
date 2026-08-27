@@ -17,11 +17,48 @@ type WalConfig struct {
 	MaxFileSize int64 `json:"max_file_size"`
 	// MaxFileNumber is the maximum number of WAL files.
 	MaxFileNumber int `json:"max_file_number"`
-	// CloseBuffer disables the WAL write buffer when true.
+	// CloseBuffer disables the in-memory WAL read cache when true; queries read
+	// WAL files directly in that mode.
 	CloseBuffer bool `json:"close_buffer"`
-	// MaxBufferBatchSize is the maximum number of entries to buffer in memory
-	// before sorting by timestamp and flushing to the WAL file. Default 10000.
+	// MaxBufferBatchSize is the chunk capacity of the WAL read cache. Write
+	// accumulation is configured independently by IngestConfig. Default 4096.
 	MaxBufferBatchSize int `json:"max_buffer_batch_size"`
+}
+
+// IngestConfig controls the table-level sharded MemTable that sits in front of
+// the WAL. Points are accumulated without resolving tagCode, then active
+// buffers are swapped and prepared asynchronously when either the point limit
+// or flush interval is reached.
+type IngestConfig struct {
+	// Shards is the number of independently locked tag shards. It is rounded up
+	// to a power of two. Default 16.
+	Shards int `json:"shards"`
+	// MaxBatchSize triggers an asynchronous buffer swap after this many active
+	// points. Default 4096.
+	MaxBatchSize int `json:"max_batch_size"`
+	// FlushIntervalMs is the maximum time a point waits in the active MemTable.
+	// Default 5ms.
+	FlushIntervalMs int64 `json:"flush_interval_ms"`
+	// QueueSize bounds the number of frozen batches waiting for the WAL writer.
+	// Normal writes are independent of queue occupancy; callers wait only if a
+	// stalled trigger lets the active maps grow past two batches. Default 8.
+	QueueSize int `json:"queue_size"`
+}
+
+func (config *IngestConfig) setDefaultValues() {
+	if config.Shards <= 0 {
+		config.Shards = 16
+	}
+	config.Shards = nextPowerOfTwo(config.Shards)
+	if config.MaxBatchSize <= 0 {
+		config.MaxBatchSize = 4096
+	}
+	if config.FlushIntervalMs <= 0 {
+		config.FlushIntervalMs = 5
+	}
+	if config.QueueSize <= 0 {
+		config.QueueSize = 8
+	}
 }
 
 func (config *WalConfig) setDefaultValues() {
@@ -38,6 +75,9 @@ type Config struct {
 	Path string `json:"path"`
 	// WalConfig groups WAL-related settings.
 	WalConfig WalConfig `json:"wal_config"`
+	// IngestConfig configures the sharded table-level write buffer in front of
+	// the WAL.
+	IngestConfig IngestConfig `json:"ingest_config"`
 	// maxSegmentSize is the maximum size of a segment in bytes.
 	// Default 64M
 	MaxSegmentSize int64 `json:"max_segment_size"`
@@ -123,6 +163,7 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 		config.SecondaryCompressionName = "zstd"
 	}
 	config.WalConfig.setDefaultValues()
+	config.IngestConfig.setDefaultValues()
 	if config.CleanupIntervalSeconds <= 0 {
 		config.CleanupIntervalSeconds = 60
 	}
@@ -181,7 +222,8 @@ func (db *DB) BuildTable() error {
 			db.ctx,
 			db.AsyncFlush,
 			db.AsyncCleanup,
-			time.Duration(db.CleanupIntervalSeconds)*time.Second)
+			time.Duration(db.CleanupIntervalSeconds)*time.Second,
+			db.IngestConfig)
 		if err != nil {
 			return err
 		}
@@ -224,7 +266,8 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.ctx,
 		db.AsyncFlush,
 		db.AsyncCleanup,
-		time.Duration(db.CleanupIntervalSeconds)*time.Second)
+		time.Duration(db.CleanupIntervalSeconds)*time.Second,
+		db.IngestConfig)
 	if err != nil {
 		return err
 	}
@@ -286,7 +329,9 @@ func (db *DB) getTable(tableName string) (*ssTable, error) {
 	return table, nil
 }
 
-// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
+// Write accepts a data point into the specified table's ingest buffer. A true
+// result means accepted; tag mapping, dedup and WAL persistence happen on the
+// ordered background worker. Queries and Close wait for prior accepted writes.
 // An empty tableName writes to the default table, which is auto-created on first use.
 func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
 	table, err := db.getTable(tableName)
@@ -296,9 +341,9 @@ func (db *DB) Write(tableName string, tag string, timestamp int64, value variant
 	return table.Write(tag, timestamp, value)
 }
 
-// WriteBatch writes multiple data points to the specified table in a single batch.
-// This acquires the WAL mutex once instead of once per point, reducing lock contention.
-// An empty tableName writes to the default table.
+// WriteBatch appends multiple raw-tag points to the table's sharded ingest
+// buffer. Tag mapping, sorting and WAL I/O are handled asynchronously. An empty
+// tableName writes to the default table.
 func (db *DB) WriteBatch(tableName string, points []TagPoint) (int, error) {
 	if len(points) == 0 {
 		return 0, nil

@@ -7,14 +7,14 @@ import (
 	"github.com/mababaNiubi/qv-lite/tsdb"
 )
 
-// PipelinedWriter 实现「编解码 / 入库」流水线，提高高并发小请求写入吞吐。
+// PipelinedWriter 是可选的「编解码 / 入库」流水线，主要用于让超大流式请求的
+// 解码与引擎入库重叠。引擎已有分片异步攒批，因此服务端默认不启用本层。
 //
-// 编解码（handler goroutine，CPU 密集）与入库（引擎 WriteBatch，持 WAL 锁）
-// 是两类不同的工作。默认串行：一个请求 decode 完才入库。流水线把入库交给
+// 编解码（handler goroutine，CPU 密集）与引擎 WriteBatch 是两类不同的工作。
+// 流水线把入库交给
 // 一个后台 goroutine：handler 只需把解码后的点 Submit 进缓冲立即返回，后台
 // 用 interval（WriteBufferMs）或缓冲达 batchSize 触发，把多个请求的小批在
-// 内存中合并成大批再调用引擎 WriteBatch——引擎单锁下大批明显快于小批，
-// 且 decode 新数据与旧数据入库并行。
+// 内存中合并成大批再调用引擎 WriteBatch，使 decode 新数据与旧数据入库并行。
 //
 // 一致性：Submit 的数据在 Flush（查询/单点写/关闭前调用）之后立即可见，
 // 开启流水线后「写后立即可查」语义保持不变，只是写入有 ≤ interval 的
@@ -180,9 +180,8 @@ func (w *PipelinedWriter) flush() {
 
 // writeChunks 按表合并后调用引擎 WriteBatch（串行化）。
 //
-// 同一张表的多个 chunk 先拼接成大批再调用引擎：减少引擎 WAL 锁获取次数，
-// 引擎单锁下大批明显快于小批。每批点数以 batchSize 为上限分批写出，避免
-// 单次 WriteBatch 过长持锁阻塞其他写入。写完后归还池化缓冲。
+// 同一张表的多个 chunk 先拼接成大批再调用引擎。每批点数以 batchSize 为
+// 上限分批写出，控制单次移交的内存规模。写完后归还池化缓冲。
 func (w *PipelinedWriter) writeChunks(chunks []batchChunk) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()

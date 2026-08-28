@@ -6,6 +6,41 @@ import (
 	"github.com/mababaNiubi/variant"
 )
 
+func TestWalReadBufferResetReusesChunksWithoutStaleValues(t *testing.T) {
+	buffer := newWalReadBuffer(2)
+	for i := 0; i < 5; i++ {
+		buffer.appendValue(tagCode(i+1), int64(i+10), variant.NewString("old"))
+	}
+	if buffer.activeChunks != 3 {
+		t.Fatalf("active chunks = %d, want 3", buffer.activeChunks)
+	}
+	firstKeys := &buffer.chunks[0].keys[:cap(buffer.chunks[0].keys)][0]
+
+	buffer.resetForReuse(maxRetainedWALReadBufferBytes)
+	if buffer.activeChunks != 0 || buffer.total != 0 {
+		t.Fatalf("reset state = (%d chunks, %d points), want zero", buffer.activeChunks, buffer.total)
+	}
+	buffer.appendValue(9, 99, variant.NewInt64(99))
+	if &buffer.chunks[0].keys[:cap(buffer.chunks[0].keys)][0] != firstKeys {
+		t.Fatal("reset discarded a reusable WAL read chunk")
+	}
+	seen := 0
+	buffer.forEach(func(key tagCode, timestamp int64, value variant.Variant) bool {
+		seen++
+		if key != 9 || timestamp != 99 {
+			t.Fatalf("stale point after reset: key=%d timestamp=%d", key, timestamp)
+		}
+		return true
+	})
+	if seen != 1 {
+		t.Fatalf("points after reset = %d, want 1", seen)
+	}
+	buffer.resetForReuse(1)
+	if len(buffer.chunks) != 0 {
+		t.Fatalf("tiny reuse budget retained %d chunks, want 0", len(buffer.chunks))
+	}
+}
+
 func TestReadByTime_LateBatch(t *testing.T) {
 	dir := tempDir(t)
 	wf, err := NewWalFile(dir, 0, 0, WalConfig{

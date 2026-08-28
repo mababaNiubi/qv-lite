@@ -30,10 +30,46 @@ type rawTagBuffer struct {
 }
 
 type ingestSeries struct {
-	tag     string
-	hash    uint64
-	code    tagCode
-	buffers []rawTagBuffer
+	tag            string
+	hash           uint64
+	code           tagCode
+	preparedPoints int
+	encoderWarmed  bool
+
+	// Most sparse series occur in only one active/frozen ingest buffer. Keep
+	// that first buffer inline and allocate the remaining buffer slots only if
+	// the series actually crosses a batch boundary. This avoids reserving
+	// QueueSize+3 rawTagBuffers for every one-shot high-cardinality tag.
+	primaryBufferID int
+	primaryBuffer   rawTagBuffer
+	otherBuffers    []rawTagBuffer
+}
+
+// Dense series are warmed on the WAL worker before segment flush. This spreads
+// encoder allocation across ingest batches under a tight memory limit, while
+// one-shot/sparse tags keep the much smaller metadata-only representation.
+const denseSeriesEncoderWarmupPoints = 8
+
+func (s *ingestSeries) bufferFor(id, bufferCount int) *rawTagBuffer {
+	if s.primaryBufferID < 0 {
+		s.primaryBufferID = id
+		s.primaryBuffer.series = s
+		return &s.primaryBuffer
+	}
+	if id == s.primaryBufferID {
+		return &s.primaryBuffer
+	}
+	if s.otherBuffers == nil {
+		s.otherBuffers = make([]rawTagBuffer, bufferCount-1)
+		for i := range s.otherBuffers {
+			s.otherBuffers[i].series = s
+		}
+	}
+	otherID := id
+	if id > s.primaryBufferID {
+		otherID--
+	}
+	return &s.otherBuffers[otherID]
 }
 
 type ingestTagCacheEntry struct {
@@ -227,19 +263,16 @@ func (b *tableBatcher) appendPoint(tag string, timestamp int64, value variant.Va
 		series = shard.series[tag]
 		if series == nil {
 			series = &ingestSeries{
-				tag:     tag,
-				hash:    hash,
-				buffers: make([]rawTagBuffer, cap(shard.free)+1),
-			}
-			for i := range series.buffers {
-				series.buffers[i].series = series
+				tag:             tag,
+				hash:            hash,
+				primaryBufferID: -1,
 			}
 			shard.series[tag] = series
 		}
 		cacheEntry.tag = tag
 		cacheEntry.series = series
 	}
-	tagBuffer := &series.buffers[ingest.id]
+	tagBuffer := series.bufferFor(ingest.id, cap(shard.free)+1)
 	if len(tagBuffer.points) == 0 {
 		ingest.used = append(ingest.used, tagBuffer)
 		tagBuffer.ordered = true
@@ -455,6 +488,13 @@ func (b *tableBatcher) prepareRawWriteBatch(batch *frozenWriteBatch) ([]walDataR
 				sort.SliceStable(tagBuffer.points, func(i, j int) bool {
 					return tagBuffer.points[i].timestamp < tagBuffer.points[j].timestamp
 				})
+			}
+			if !series.encoderWarmed {
+				series.preparedPoints += len(tagBuffer.points)
+				if series.preparedPoints >= denseSeriesEncoderWarmupPoints {
+					b.table.columns[code-1].ensureCompressors()
+					series.encoderWarmed = true
+				}
 			}
 			runs = append(runs, walDataRun{Key: code, Points: tagBuffer.points})
 		}

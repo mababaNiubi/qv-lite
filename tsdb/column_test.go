@@ -3,6 +3,8 @@ package tsdb
 import (
 	"testing"
 	"time"
+
+	"github.com/mababaNiubi/variant"
 )
 
 func TestSegmentTimeExceeded(t *testing.T) {
@@ -35,5 +37,19 @@ func TestNewSSColumnKeepsUnlimitedSegmentInterval(t *testing.T) {
 	column := newSSColumn(1, nil, 0, 0)
 	if column.maxSegmentTimeInterval != 0 {
 		t.Fatalf("maxSegmentTimeInterval = %d, want 0 (unlimited)", column.maxSegmentTimeInterval)
+	}
+}
+
+func TestSSColumnInitializesEncodersLazily(t *testing.T) {
+	column := newSSColumn(1, nil, 0, 0)
+	if column.tmsCompressor != nil || column.valueCompressor != nil {
+		t.Fatal("new sparse column allocated encoders before its first segment write")
+	}
+	ok, err := column.Write(1, variant.NewFloat64(1.25))
+	if err != nil || !ok {
+		t.Fatalf("Write() = (%v, %v), want (true, nil)", ok, err)
+	}
+	if column.tmsCompressor == nil || column.valueCompressor == nil {
+		t.Fatal("first segment write did not initialize encoders")
 	}
 }

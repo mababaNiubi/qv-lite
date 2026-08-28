@@ -11,6 +11,35 @@ import (
 	"github.com/mababaNiubi/variant"
 )
 
+func TestIngestSeriesAllocatesSecondaryBuffersLazily(t *testing.T) {
+	series := &ingestSeries{primaryBufferID: -1}
+	primary := series.bufferFor(3, 11)
+	if primary != &series.primaryBuffer || primary.series != series {
+		t.Fatal("first ingest buffer was not kept inline")
+	}
+	if series.otherBuffers != nil {
+		t.Fatal("one-shot series allocated buffers for unused queue slots")
+	}
+	if series.bufferFor(3, 11) != primary {
+		t.Fatal("primary buffer lookup was not stable")
+	}
+
+	seen := make(map[*rawTagBuffer]int, 11)
+	for id := 0; id < 11; id++ {
+		buffer := series.bufferFor(id, 11)
+		if previous, ok := seen[buffer]; ok {
+			t.Fatalf("buffer ids %d and %d share storage", previous, id)
+		}
+		if buffer.series != series {
+			t.Fatalf("buffer %d lost its series reference", id)
+		}
+		seen[buffer] = id
+	}
+	if len(series.otherBuffers) != 10 {
+		t.Fatalf("secondary buffer count = %d, want 10", len(series.otherBuffers))
+	}
+}
+
 func newBatcherTestDB(t *testing.T, ingest IngestConfig) (*DB, *ssTable) {
 	t.Helper()
 	db, err := Open(Config{

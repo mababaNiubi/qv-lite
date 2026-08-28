@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -66,10 +67,16 @@ type walReadChunk struct {
 // touching timestamps and Variants. Chunks only bound slice growth; write
 // batching remains owned by tableBatcher.
 type walReadBuffer struct {
-	chunks   []walReadChunk
-	total    int
-	chunkCap int
+	chunks        []walReadChunk
+	activeChunks  int
+	total         int
+	chunkCap      int
+	hasReferences bool
 }
+
+// Keep WAL rotation reuse useful without pinning an entire decoded default
+// (64 MiB) WAL per table. CloseBuffer remains the zero-cache option.
+const maxRetainedWALReadBufferBytes int64 = 12 << 20
 
 func newWalReadBuffer(chunkCap int) *walReadBuffer {
 	return &walReadBuffer{chunkCap: chunkCap}
@@ -80,23 +87,57 @@ func (b *walReadBuffer) append(e walDataEntry) {
 }
 
 func (b *walReadBuffer) appendValue(key tagCode, timestamp int64, value variant.Variant) {
-	n := len(b.chunks)
-	if n == 0 || len(b.chunks[n-1].keys) >= b.chunkCap {
-		b.chunks = append(b.chunks, walReadChunk{
-			keys:       make([]tagCode, 0, b.chunkCap),
-			timestamps: make([]int64, 0, b.chunkCap),
-			values:     make([]variant.Variant, 0, b.chunkCap),
-		})
+	if b.activeChunks == 0 || len(b.chunks[b.activeChunks-1].keys) >= b.chunkCap {
+		if b.activeChunks == len(b.chunks) {
+			b.chunks = append(b.chunks, walReadChunk{
+				keys:       make([]tagCode, 0, b.chunkCap),
+				timestamps: make([]int64, 0, b.chunkCap),
+				values:     make([]variant.Variant, 0, b.chunkCap),
+			})
+		}
+		b.activeChunks++
 	}
-	chunk := &b.chunks[len(b.chunks)-1]
+	chunk := &b.chunks[b.activeChunks-1]
 	chunk.keys = append(chunk.keys, key)
 	chunk.timestamps = append(chunk.timestamps, timestamp)
 	chunk.values = append(chunk.values, value)
+	if !b.hasReferences {
+		switch value.Type() {
+		case variant.TypeString, variant.TypeList, variant.TypeMap:
+			b.hasReferences = true
+		}
+	}
 	b.total++
 }
 
+// resetForReuse releases values that may own heap data and keeps a bounded
+// prefix of fixed-size struct-of-arrays chunks for the next WAL rotation.
+func (b *walReadBuffer) resetForReuse(maxRetainedBytes int64) {
+	for i := 0; i < b.activeChunks; i++ {
+		chunk := &b.chunks[i]
+		if b.hasReferences {
+			clear(chunk.values)
+		}
+		chunk.keys = chunk.keys[:0]
+		chunk.timestamps = chunk.timestamps[:0]
+		chunk.values = chunk.values[:0]
+	}
+	chunkBytes := int64(b.chunkCap) * int64(unsafe.Sizeof(tagCode(0))+unsafe.Sizeof(int64(0))+unsafe.Sizeof(variant.Variant{}))
+	maxChunks := 0
+	if chunkBytes > 0 && maxRetainedBytes > 0 {
+		maxChunks = min(len(b.chunks), int(maxRetainedBytes/chunkBytes))
+	}
+	for i := maxChunks; i < len(b.chunks); i++ {
+		b.chunks[i] = walReadChunk{}
+	}
+	b.chunks = b.chunks[:maxChunks:maxChunks]
+	b.activeChunks = 0
+	b.total = 0
+	b.hasReferences = false
+}
+
 func (b *walReadBuffer) forEach(fn func(key tagCode, timestamp int64, value variant.Variant) bool) bool {
-	for i := range b.chunks {
+	for i := 0; i < b.activeChunks; i++ {
 		chunk := &b.chunks[i]
 		for j := range chunk.keys {
 			if !fn(chunk.keys[j], chunk.timestamps[j], chunk.values[j]) {
@@ -108,7 +149,7 @@ func (b *walReadBuffer) forEach(fn func(key tagCode, timestamp int64, value vari
 }
 
 func (b *walReadBuffer) appendMatching(dst []Point, tag tagCode, startTime, endTime int64) []Point {
-	for i := range b.chunks {
+	for i := 0; i < b.activeChunks; i++ {
 		chunk := &b.chunks[i]
 		for j, key := range chunk.keys {
 			if key != tag {
@@ -155,6 +196,7 @@ type WalFile interface {
 type walFile struct {
 	mutex           sync.Mutex
 	walFiles        []walFileEnty
+	spareReadBuffer *walReadBuffer
 	tagStates       []walTagState
 	tagMaxTimestamp map[tagCode]int64
 	tagLastValue    map[tagCode]variant.Variant
@@ -307,6 +349,9 @@ func (s *walFile) updateWalConfig(walConfig WalConfig) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	s.config = walConfig
+	if walConfig.CloseBuffer || (s.spareReadBuffer != nil && s.spareReadBuffer.chunkCap != walConfig.MaxBufferBatchSize) {
+		s.spareReadBuffer = nil
+	}
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
@@ -608,9 +653,9 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 
 	// Also scan the unflushed last chunk for newer data.
 	fileIndex := len(ws.walFiles) - 1
-	chunks := ws.walFiles[fileIndex].readBuffer.chunks
-	if len(chunks) > 0 {
-		lastChunk := &chunks[len(chunks)-1]
+	readBuffer := ws.walFiles[fileIndex].readBuffer
+	if readBuffer.activeChunks > 0 {
+		lastChunk := &readBuffer.chunks[readBuffer.activeChunks-1]
 		for i, entryKey := range lastChunk.keys {
 			if entryKey == key && lastChunk.timestamps[i] >= maxTs {
 				maxTs = lastChunk.timestamps[i]
@@ -654,10 +699,16 @@ func (ws *walFile) addWalFile() error {
 	if err != nil {
 		return err
 	}
+	readBuffer := ws.spareReadBuffer
+	if readBuffer == nil || readBuffer.chunkCap != ws.config.MaxBufferBatchSize {
+		readBuffer = newWalReadBuffer(ws.config.MaxBufferBatchSize)
+	} else {
+		ws.spareReadBuffer = nil
+	}
 	ws.walFiles = append(ws.walFiles, walFileEnty{
 		fileName:   fileName,
 		length:     0,
-		readBuffer: newWalReadBuffer(ws.config.MaxBufferBatchSize),
+		readBuffer: readBuffer,
 	})
 	ws.writeFile = file
 	ws.writeBuffer.Reset(file)
@@ -799,6 +850,12 @@ func (ws *walFile) truncate(n int) {
 	if n <= 0 {
 		return
 	}
+	if !ws.config.CloseBuffer && ws.spareReadBuffer == nil {
+		// The newest consumed file is normally the fullest candidate. Keep only
+		// a bounded prefix from one buffer; older files remain available to GC.
+		ws.spareReadBuffer = ws.walFiles[n-1].readBuffer
+		ws.spareReadBuffer.resetForReuse(maxRetainedWALReadBufferBytes)
+	}
 	for i := 0; i < n; i++ {
 		if err := os.Remove(ws.walFiles[i].fileName); err != nil {
 			_ = os.Rename(ws.walFiles[i].fileName, ws.walFiles[i].fileName+".deleted")
@@ -853,6 +910,7 @@ func (ws *walFile) Close() error {
 		return err
 	}
 	ws.writeFile = nil
+	ws.spareReadBuffer = nil
 	return err
 }
 

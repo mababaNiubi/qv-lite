@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"sync"
 
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -86,12 +87,57 @@ func (GzipCompressor) Decode(src []byte) ([]byte, error) {
 // ZstdCompressor uses zstd for block-level compression.
 type ZstdCompressor struct{}
 
+var reusableZstdEncoder struct {
+	sync.Once
+	encoder *zstd.Encoder
+}
+
+var reusableZstdDecoder struct {
+	sync.Once
+	decoder *zstd.Decoder
+}
+
+func blockZstdEncoder() *zstd.Encoder {
+	reusableZstdEncoder.Do(func() {
+		encoder, err := zstd.NewWriter(nil,
+			zstd.WithEncoderConcurrency(1),
+			zstd.WithWindowSize(1<<20),
+			zstd.WithLowerEncoderMem(true),
+			zstd.WithZeroFrames(true),
+		)
+		if err != nil {
+			panic("failed to create block zstd encoder: " + err.Error())
+		}
+		reusableZstdEncoder.encoder = encoder
+	})
+	return reusableZstdEncoder.encoder
+}
+
+func blockZstdDecoder() *zstd.Decoder {
+	reusableZstdDecoder.Do(func() {
+		decoder, err := zstd.NewReader(nil,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxMemory(1<<30),
+		)
+		if err != nil {
+			panic("failed to create block zstd decoder: " + err.Error())
+		}
+		reusableZstdDecoder.decoder = decoder
+	})
+	return reusableZstdDecoder.decoder
+}
+
 func (ZstdCompressor) Encode(src []byte) []byte {
-	return zstd.EncodeTo(nil, src)
+	// BlockFile emits 64 KiB independent frames. A single-worker Encoder is
+	// enough for each call and is safe for concurrent EncodeAll calls; retaining
+	// it avoids rebuilding the dependency's CPU-wide weakly held encoder after
+	// every memory-pressure GC.
+	return blockZstdEncoder().EncodeAll(src, nil)
 }
 
 func (ZstdCompressor) Decode(src []byte) ([]byte, error) {
-	return zstd.DecodeTo(nil, src)
+	return blockZstdDecoder().DecodeAll(src, nil)
 }
 
 // ─── NoCompressor ─────────────────────────────────────────────────────

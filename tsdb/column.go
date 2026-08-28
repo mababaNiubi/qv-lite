@@ -3,9 +3,16 @@ package tsdb
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"sync"
 
 	"github.com/mababaNiubi/variant"
 )
+
+// columnEncoderInitCap keeps the per-series cold footprint small. A column's
+// buffers grow geometrically and are retained across Reset, so dense series pay
+// the growth cost only during warm-up while sparse high-cardinality tables do
+// not reserve encoderInitCap entries for every tag up front.
+const columnEncoderInitCap = 32
 
 func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentTimeInterval int64) *ssColumn {
 	if tableInfo == nil {
@@ -28,27 +35,35 @@ func newSSColumn(index tagCode, tableInfo *TableInfo, maxSize int64, maxSegmentT
 		tableInfo:              tableInfo,
 		maxSegmentSize:         maxSize,
 		maxSegmentTimeInterval: maxSegmentTimeInterval,
-		tmsCompressor:          NewTimeEncoder(encoderInitCap),
-	}
-	switch tableInfo.Type {
-	case ColumnTypeUnknown:
-		sc.valueCompressor = NewAdaptColumnEncoder(tableInfo.FloatPrecision, encoderInitCap)
-		//sc.valueCompressor = NewUnknownEncoder(tableInfo.FloatPrecision, batchSize)
-	case ColumnTypeBool:
-		sc.valueCompressor = NewBooleanEncoder(encoderInitCap)
-	case ColumnTypeFloat:
-		sc.valueCompressor = NewFloatEncoder(tableInfo.FloatPrecision, encoderInitCap)
-	case ColumnTypeInt:
-		sc.valueCompressor = NewIntegerEncoder(encoderInitCap)
-	case ColumnTypeString:
-		sc.valueCompressor = NewStringEncoder(encoderInitCap)
-	case ColumnTypeStructure:
-		sc.valueCompressor = NewColumnEncoder(tableInfo.Structure, encoderInitCap)
-	default:
-		sc.valueCompressor = &JsonEncoder{}
-
 	}
 	return sc
+}
+
+// ensureCompressors lazily creates the comparatively heavy per-tag encoder
+// state. A newly discovered tag is durable in Meta and may remain only in the
+// active WAL for a long time; allocating encoders before its first segment
+// flush makes sparse high-cardinality workloads retain memory they never use.
+func (s *ssColumn) ensureCompressors() {
+	s.encoderOnce.Do(func() {
+		s.tmsCompressor = NewTimeEncoder(columnEncoderInitCap)
+		tableInfo := s.tableInfo
+		switch tableInfo.Type {
+		case ColumnTypeUnknown:
+			s.valueCompressor = NewAdaptColumnEncoder(tableInfo.FloatPrecision, columnEncoderInitCap)
+		case ColumnTypeBool:
+			s.valueCompressor = NewBooleanEncoder(columnEncoderInitCap)
+		case ColumnTypeFloat:
+			s.valueCompressor = NewFloatEncoder(tableInfo.FloatPrecision, columnEncoderInitCap)
+		case ColumnTypeInt:
+			s.valueCompressor = NewIntegerEncoder(columnEncoderInitCap)
+		case ColumnTypeString:
+			s.valueCompressor = NewStringEncoder(columnEncoderInitCap)
+		case ColumnTypeStructure:
+			s.valueCompressor = NewColumnEncoder(tableInfo.Structure, columnEncoderInitCap)
+		default:
+			s.valueCompressor = &JsonEncoder{}
+		}
+	})
 }
 
 type ssColumn struct {
@@ -60,6 +75,8 @@ type ssColumn struct {
 	maxSegmentSize         int64
 	maxSegmentTimeInterval int64
 	lastFlushEpoch         uint64
+	encoderOnce            sync.Once
+	writeInitialized       bool
 
 	// preTms/preVariant save a (timestamp, value) pair rejected by the value
 	// encoder due to a type change. They are flushed on the next Write call
@@ -69,6 +86,13 @@ type ssColumn struct {
 }
 
 func (s *ssColumn) Write(timestamp int64, value variant.Variant) (bool, error) {
+	// Segment flushes are serialized per table. Keep the sync.Once for the
+	// concurrent WAL-worker warm-up, but pay its atomic fast path only on this
+	// column's first actual segment write instead of once per point.
+	if !s.writeInitialized {
+		s.ensureCompressors()
+		s.writeInitialized = true
+	}
 	// Flush a previously rejected (timestamp, value) pair first.
 	if s.preTms != 0 {
 		prevTs := s.preTms

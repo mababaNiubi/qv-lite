@@ -276,6 +276,47 @@ func BenchmarkReadScan(b *testing.B) {
 	}
 }
 
+// BenchmarkWALReadTagScale measures the decoded in-memory WAL cache directly.
+// It queries one tag while the same total point count is distributed across
+// increasing tag cardinality, exposing key-scan and result-capacity costs
+// without segment decode I/O.
+func BenchmarkWALReadTagScale(b *testing.B) {
+	const totalPoints = 1_000_000
+	for _, numTags := range []int{1, 100, 10_000} {
+		b.Run(fmt.Sprintf("tags%d", numTags), func(b *testing.B) {
+			db, _ := benchOpen(b, "t", 256<<20)
+			tags := prebuiltTags(numTags)
+			base := time.Now().UnixNano()
+			for i := 0; i < totalPoints; i++ {
+				if _, err := db.Write("t", tags[i%numTags], base+int64(i), variant.NewFloat64(float64(i))); err != nil {
+					b.Fatal(err)
+				}
+			}
+			table, ok := db.ssTables.Load("t")
+			if !ok {
+				b.Fatal("table missing")
+			}
+			if err := table.batcher.Flush(); err != nil {
+				b.Fatal(err)
+			}
+
+			target := tags[numTags-1]
+			want := totalPoints / numTags
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				points, err := db.QueryAll("t", target, base-1, base+totalPoints, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(points) != want {
+					b.Fatalf("points=%d, want %d", len(points), want)
+				}
+			}
+			b.ReportMetric(totalPoints, "wal-points-scanned/op")
+		})
+	}
+}
+
 // BenchmarkReadWindow 固定窗口聚合读(Query + windowSize)。
 func BenchmarkReadWindow(b *testing.B) {
 	for _, points := range []int{100_000, 1_000_000} {

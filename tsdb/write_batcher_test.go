@@ -2,10 +2,12 @@ package tsdb
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mababaNiubi/qv-lite/container"
 	"github.com/mababaNiubi/variant"
 )
 
@@ -180,6 +182,51 @@ func TestTableBatcherBackpressureWakesAllEligibleWriters(t *testing.T) {
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("backpressure wake timed out with %d writers remaining", remaining)
+		}
+	}
+}
+
+func TestTableBatcherTagCacheCollisionFallsBackToExactTag(t *testing.T) {
+	db, table := newBatcherTestDB(t, IngestConfig{
+		Shards:          1,
+		MaxBatchSize:    4,
+		FlushIntervalMs: 60_000,
+		QueueSize:       2,
+	})
+	defer db.Close()
+
+	seen := make(map[uint64]string)
+	var first, second string
+	for i := 0; i < 100_000 && second == ""; i++ {
+		tag := fmt.Sprintf("collision-%d", i)
+		hash := container.HashString(tag)
+		slot := (hash >> table.batcher.shardShift) & table.batcher.tagCacheMask
+		if prior, ok := seen[slot]; ok && prior != tag {
+			first, second = prior, tag
+			break
+		}
+		seen[slot] = tag
+	}
+	if second == "" {
+		t.Fatal("failed to find ingest tag-cache collision")
+	}
+
+	base := time.Now().UnixNano()
+	const pointsPerTag = 20
+	for i := 0; i < pointsPerTag; i++ {
+		for _, tag := range []string{first, second} {
+			if _, err := db.Write("batcher", tag, base+int64(i), variant.NewInt(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, tag := range []string{first, second} {
+		points, err := db.QueryAll("batcher", tag, base-1, base+pointsPerTag, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(points) != pointsPerTag {
+			t.Fatalf("tag %q points=%d, want %d", tag, len(points), pointsPerTag)
 		}
 	}
 }

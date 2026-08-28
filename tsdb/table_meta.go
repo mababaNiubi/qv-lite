@@ -76,12 +76,19 @@ type Meta struct {
 // Load resolves a tag to its code, using the hot-tag cache to skip the map on
 // the write hot loop. Identical semantics to the embedded map's Load.
 func (s *Meta) Load(tag string) (tagCode, bool) {
-	if code, ok := s.tagCache.Lookup(tag); ok {
+	return s.loadHash(tag, container.HashString(tag))
+}
+
+// loadHash avoids hashing tag again when the ingest path already computed its
+// routing hash. The embedded SyncMap remains the authoritative collision-safe
+// fallback.
+func (s *Meta) loadHash(tag string, hash uint64) (tagCode, bool) {
+	if code, ok := s.tagCache.LookupHash(tag, hash); ok {
 		return code, true
 	}
 	code, ok := s.SyncMap.Load(tag)
 	if ok {
-		s.tagCache.Store(tag, code)
+		s.tagCache.StoreHash(tag, hash, code)
 	}
 	return code, ok
 }

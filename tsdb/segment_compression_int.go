@@ -60,6 +60,7 @@ func (e *IntegerEncoder) Reset() {
 	e.prev = 0
 	e.rle = true
 	e.values = e.values[:0]
+	e.err = nil
 }
 
 // Write encodes v to the underlying buffers.

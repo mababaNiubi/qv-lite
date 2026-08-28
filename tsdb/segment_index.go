@@ -2,11 +2,15 @@ package tsdb
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"os"
 	"sort"
 	"strings"
+)
+
+const (
+	indexHeaderSize = 4 + 4 + 8 + 8
+	indexEntrySize  = 4 + 8 + 8 + 8 + 8
 )
 
 type BlockIndexEntry struct {
@@ -131,27 +135,28 @@ func writeIndexFile(path string, idx *FileIndex) error {
 	}
 	defer f.Close()
 	bw := bufio.NewWriter(f)
-	err = binary.Write(bw, binary.BigEndian, uint32(indexMagic))
-	if err != nil {
+	var header [indexHeaderSize]byte
+	binary.BigEndian.PutUint32(header[0:4], uint32(indexMagic))
+	binary.BigEndian.PutUint32(header[4:8], uint32(len(idx.Blocks)))
+	binary.BigEndian.PutUint64(header[8:16], uint64(idx.MinTime))
+	binary.BigEndian.PutUint64(header[16:24], uint64(idx.MaxTime))
+	if _, err = bw.Write(header[:]); err != nil {
 		return err
 	}
-	err = binary.Write(bw, binary.BigEndian, uint32(len(idx.Blocks)))
-	if err != nil {
-		return err
-	}
-	err = binary.Write(bw, binary.BigEndian, idx.MinTime)
-	if err != nil {
-		return err
-	}
-	err = binary.Write(bw, binary.BigEndian, idx.MaxTime)
-	if err != nil {
-		return err
-	}
+
+	var entryBuf [indexEntrySize]byte
 	for i := range idx.Blocks {
-		err = binary.Write(bw, binary.BigEndian, idx.Blocks[i])
+		entry := &idx.Blocks[i]
+		binary.BigEndian.PutUint32(entryBuf[0:4], uint32(entry.Attribute))
+		binary.BigEndian.PutUint64(entryBuf[4:12], uint64(entry.MinTime))
+		binary.BigEndian.PutUint64(entryBuf[12:20], uint64(entry.MaxTime))
+		binary.BigEndian.PutUint64(entryBuf[20:28], uint64(entry.Offset))
+		binary.BigEndian.PutUint64(entryBuf[28:36], uint64(entry.DataSize))
+		if _, err = bw.Write(entryBuf[:]); err != nil {
+			return err
+		}
 	}
-	err = bw.Flush()
-	if err != nil {
+	if err = bw.Flush(); err != nil {
 		return err
 	}
 	return f.Sync()
@@ -159,28 +164,30 @@ func writeIndexFile(path string, idx *FileIndex) error {
 
 func readIndexFile(path string) *FileIndex {
 	data, err := os.ReadFile(path)
-	if err != nil || len(data) < 24 {
+	if err != nil || len(data) < indexHeaderSize {
 		return nil
 	}
-	br := bytes.NewReader(data)
-	var magic, blockCount uint32
-	var minTime, maxTime int64
-	if binary.Read(br, binary.BigEndian, &magic) != nil || magic != uint32(indexMagic) {
+	if binary.BigEndian.Uint32(data[0:4]) != uint32(indexMagic) {
 		return nil
 	}
-	binary.Read(br, binary.BigEndian, &blockCount)
-	binary.Read(br, binary.BigEndian, &minTime)
-	binary.Read(br, binary.BigEndian, &maxTime)
+	blockCount := binary.BigEndian.Uint32(data[4:8])
+	if uint64(blockCount) > uint64((len(data)-indexHeaderSize)/indexEntrySize) {
+		return nil
+	}
 	idx := newFileIndex(int(blockCount))
-	idx.MinTime = minTime
-	idx.MaxTime = maxTime
+	idx.MinTime = int64(binary.BigEndian.Uint64(data[8:16]))
+	idx.MaxTime = int64(binary.BigEndian.Uint64(data[16:24]))
+	position := indexHeaderSize
 	for i := uint32(0); i < blockCount; i++ {
-		var b BlockIndexEntry
-		err = binary.Read(br, binary.BigEndian, &b)
-		if err != nil {
-			return nil
+		entry := BlockIndexEntry{
+			Attribute: tagCode(binary.BigEndian.Uint32(data[position : position+4])),
+			MinTime:   int64(binary.BigEndian.Uint64(data[position+4 : position+12])),
+			MaxTime:   int64(binary.BigEndian.Uint64(data[position+12 : position+20])),
+			Offset:    int64(binary.BigEndian.Uint64(data[position+20 : position+28])),
+			DataSize:  int64(binary.BigEndian.Uint64(data[position+28 : position+36])),
 		}
-		idx.appendBlock(b)
+		idx.appendBlock(entry)
+		position += indexEntrySize
 	}
 	return idx
 }

@@ -1,11 +1,13 @@
 package tsdb
 
 import (
+	"math/bits"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/mababaNiubi/qv-lite/container"
 	"github.com/mababaNiubi/variant"
 )
 
@@ -20,20 +22,34 @@ type rawWritePoint struct {
 // series arrive in order, allowing the background worker to skip sorting for
 // that tag entirely.
 type rawTagBuffer struct {
+	series       *ingestSeries
+	points       []rawWritePoint
+	lastTms      int64
+	ordered      bool
+	hasReference bool
+}
+
+type ingestSeries struct {
 	tag     string
+	hash    uint64
 	code    tagCode
-	points  []rawWritePoint
-	lastTms int64
-	ordered bool
+	buffers []rawTagBuffer
+}
+
+type ingestTagCacheEntry struct {
+	tag    string
+	series *ingestSeries
 }
 
 type ingestBuffer struct {
-	tags map[string]*rawTagBuffer
+	id   int
 	used []*rawTagBuffer
 }
 
 type ingestShard struct {
 	mu          sync.Mutex
+	series      map[string]*ingestSeries
+	tagCache    []ingestTagCacheEntry
 	active      ingestBuffer
 	free        []ingestBuffer
 	activeCount int
@@ -59,6 +75,8 @@ type tableBatcher struct {
 
 	shards       []ingestShard
 	shardMask    uint64
+	shardShift   uint
+	tagCacheMask uint64
 	maxBatchSize int64
 	maxActive    int64
 	interval     time.Duration
@@ -83,16 +101,9 @@ type tableBatcher struct {
 	waiters   atomic.Int32
 	err       atomic.Pointer[batcherError]
 
-	// tagCodes is owned by the single WAL worker. It prevents a high-cardinality
-	// table from resolving the same tag through Meta while the bounded ingest
-	// buffer set warms up. Steady-state batches read code directly from
-	// rawTagBuffer and do not hash the tag again on the worker.
-	tagCodes map[string]tagCode
-
-	// preparedEntries is also worker-owned. WAL WriteBatch consumes entries
-	// synchronously, so retaining the largest preparation buffer avoids
-	// allocating and collecting one large []walDataEntry per frozen batch.
-	preparedEntries []walDataEntry
+	// preparedRuns is worker-owned. Each entry references one pooled per-tag
+	// point slice, avoiding a second flat copy of every point before WAL encode.
+	preparedRuns []walDataRun
 }
 
 func newTableBatcher(table *ssTable, config IngestConfig) *tableBatcher {
@@ -107,6 +118,7 @@ func newTableBatcher(table *ssTable, config IngestConfig) *tableBatcher {
 		table:        table,
 		shards:       make([]ingestShard, config.Shards),
 		shardMask:    uint64(config.Shards - 1),
+		shardShift:   uint(bits.TrailingZeros64(uint64(config.Shards))),
 		maxBatchSize: int64(config.MaxBatchSize),
 		maxActive:    maxActive,
 		interval:     time.Duration(config.FlushIntervalMs) * time.Millisecond,
@@ -115,8 +127,19 @@ func newTableBatcher(table *ssTable, config IngestConfig) *tableBatcher {
 		stopTrigger:  make(chan struct{}),
 		triggerDone:  make(chan struct{}),
 		workerDone:   make(chan struct{}),
-		tagCodes:     make(map[string]tagCode),
 	}
+	// Use the existing table-level tag cache budget as the sizing hint, divided
+	// across shards. Cap the direct-mapped cache because the stable per-shard
+	// series registry remains the collision-safe fallback.
+	cacheSlots := table.tagCacheSlots / config.Shards
+	if cacheSlots < 64 {
+		cacheSlots = 64
+	}
+	cacheSlots = nextPowerOfTwo(cacheSlots)
+	if cacheSlots > 2048 {
+		cacheSlots = 2048
+	}
+	b.tagCacheMask = uint64(cacheSlots - 1)
 	// A frozen batch owns one buffer from every shard until the WAL worker has
 	// committed it. Keep enough buffers for the active batch, the worker, the
 	// entire bounded queue, and one trigger blocked while enqueueing. This
@@ -125,18 +148,22 @@ func newTableBatcher(table *ssTable, config IngestConfig) *tableBatcher {
 	buffersPerShard := config.QueueSize + 3
 	for i := range b.shards {
 		shard := &b.shards[i]
-		shard.active.tags = make(map[string]*rawTagBuffer)
+		shard.series = make(map[string]*ingestSeries)
+		shard.tagCache = make([]ingestTagCacheEntry, cacheSlots)
+		shard.active = newIngestBuffer(0)
 		shard.free = make([]ingestBuffer, 0, buffersPerShard-1)
 		for j := 1; j < buffersPerShard; j++ {
-			shard.free = append(shard.free, ingestBuffer{
-				tags: make(map[string]*rawTagBuffer),
-			})
+			shard.free = append(shard.free, newIngestBuffer(j))
 		}
 	}
 	b.spaceCond = sync.NewCond(&b.waitMu)
 	go b.runTrigger()
 	go b.runWorker()
 	return b
+}
+
+func newIngestBuffer(id int) ingestBuffer {
+	return ingestBuffer{id: id}
 }
 
 func (b *tableBatcher) add(tag string, timestamp int64, value variant.Variant) error {
@@ -190,20 +217,40 @@ func (b *tableBatcher) waitIfOverloaded(observed int64) error {
 }
 
 func (b *tableBatcher) appendPoint(tag string, timestamp int64, value variant.Variant) int64 {
-	shard := &b.shards[hashIngestTag(tag)&b.shardMask]
+	hash := container.HashString(tag)
+	shard := &b.shards[hash&b.shardMask]
 	shard.mu.Lock()
-	tagBuffer := shard.active.tags[tag]
-	if tagBuffer == nil {
-		tagBuffer = &rawTagBuffer{tag: tag, ordered: true}
-		shard.active.tags[tag] = tagBuffer
+	ingest := &shard.active
+	cacheEntry := &shard.tagCache[(hash>>b.shardShift)&b.tagCacheMask]
+	series := cacheEntry.series
+	if series == nil || cacheEntry.tag != tag {
+		series = shard.series[tag]
+		if series == nil {
+			series = &ingestSeries{
+				tag:     tag,
+				hash:    hash,
+				buffers: make([]rawTagBuffer, cap(shard.free)+1),
+			}
+			for i := range series.buffers {
+				series.buffers[i].series = series
+			}
+			shard.series[tag] = series
+		}
+		cacheEntry.tag = tag
+		cacheEntry.series = series
 	}
+	tagBuffer := &series.buffers[ingest.id]
 	if len(tagBuffer.points) == 0 {
-		shard.active.used = append(shard.active.used, tagBuffer)
+		ingest.used = append(ingest.used, tagBuffer)
 		tagBuffer.ordered = true
 	} else if timestamp < tagBuffer.lastTms {
 		tagBuffer.ordered = false
 	}
 	tagBuffer.points = append(tagBuffer.points, rawWritePoint{timestamp: timestamp, value: value})
+	switch value.Type() {
+	case variant.TypeString, variant.TypeList, variant.TypeMap:
+		tagBuffer.hasReference = true
+	}
 	tagBuffer.lastTms = timestamp
 	shard.activeCount++
 	active := b.activePoints.Add(1)
@@ -244,8 +291,8 @@ func (b *tableBatcher) runWorker() {
 		if batch.err != nil {
 			b.setError(batch.err)
 		}
-		clear(b.preparedEntries)
-		b.preparedEntries = b.preparedEntries[:0]
+		clear(b.preparedRuns)
+		b.preparedRuns = b.preparedRuns[:0]
 		b.recycleBatch(batch)
 		close(batch.done)
 	}
@@ -301,9 +348,17 @@ func (b *tableBatcher) freezeAndEnqueue() *frozenWriteBatch {
 func (b *tableBatcher) recycleBatch(batch *frozenWriteBatch) {
 	for i, frozen := range batch.shards {
 		for _, tagBuffer := range frozen.used {
+			// Numeric Variants have a nil complexValue and are overwritten by the
+			// next append, so clearing their whole backing slice only burns memory
+			// bandwidth. Reference-bearing values must be cleared to avoid keeping
+			// old strings/lists/maps alive while this pooled buffer is idle.
+			if tagBuffer.hasReference {
+				clear(tagBuffer.points)
+			}
 			tagBuffer.points = tagBuffer.points[:0]
 			tagBuffer.lastTms = 0
 			tagBuffer.ordered = true
+			tagBuffer.hasReference = false
 		}
 		frozen.used = frozen.used[:0]
 		shard := &b.shards[i]
@@ -374,63 +429,36 @@ func (b *tableBatcher) terminalError() error {
 	return b.getError()
 }
 
-func hashIngestTag(tag string) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	hash := uint64(offset64)
-	for i := 0; i < len(tag); i++ {
-		hash ^= uint64(tag[i])
-		hash *= prime64
-	}
-	return hash
-}
-
 // prepareRawWriteBatch resolves a persistent tag buffer only once, sorts only
 // buffers that observed out-of-order timestamps, and emits one contiguous run
 // per tag. Tag-code order is irrelevant to the grouped WAL fast path, so
 // high-cardinality batches avoid a second slice and O(tags log tags) sort.
-func (b *tableBatcher) prepareRawWriteBatch(batch *frozenWriteBatch) ([]walDataEntry, error) {
-	entries := b.preparedEntries[:0]
-	if cap(entries) < batch.count {
-		entries = make([]walDataEntry, 0, batch.count)
-	}
+func (b *tableBatcher) prepareRawWriteBatch(batch *frozenWriteBatch) ([]walDataRun, error) {
+	runs := b.preparedRuns[:0]
 	for _, shard := range batch.shards {
 		for _, tagBuffer := range shard.used {
-			tag := tagBuffer.tag
-			code := tagBuffer.code
+			series := tagBuffer.series
+			code := series.code
 			if code == 0 {
 				var ok bool
-				code, ok = b.tagCodes[tag]
+				code, ok = b.table.Meta.loadHash(series.tag, series.hash)
 				if !ok {
-					code, ok = b.table.Meta.Load(tag)
-					if !ok {
-						var err error
-						code, err = b.table.CreateColumn(tag)
-						if err != nil {
-							return nil, err
-						}
+					var err error
+					code, err = b.table.CreateColumn(series.tag)
+					if err != nil {
+						return nil, err
 					}
-					b.tagCodes[tag] = code
 				}
-				tagBuffer.code = code
+				series.code = code
 			}
 			if !tagBuffer.ordered {
 				sort.SliceStable(tagBuffer.points, func(i, j int) bool {
 					return tagBuffer.points[i].timestamp < tagBuffer.points[j].timestamp
 				})
 			}
-			for i := range tagBuffer.points {
-				point := &tagBuffer.points[i]
-				entries = append(entries, walDataEntry{
-					Key:       code,
-					Timestamp: point.timestamp,
-					Value:     point.value,
-				})
-			}
+			runs = append(runs, walDataRun{Key: code, Points: tagBuffer.points})
 		}
 	}
-	b.preparedEntries = entries
-	return entries, nil
+	b.preparedRuns = runs
+	return runs, nil
 }

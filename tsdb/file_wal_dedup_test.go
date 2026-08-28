@@ -164,6 +164,63 @@ func TestDedupWindow(t *testing.T) {
 	eqInt64(t, readAll(rw, tag, 0, 2000000), []int64{42, 43})
 }
 
+func TestWriteRunsPreservesDedupPolicy(t *testing.T) {
+	dir := tempDir(t)
+	cfg := WalConfig{MaxFileSize: maxSegmentSize, MaxBufferBatchSize: 5, MaxFileNumber: 100}
+	wf, err := NewWalFile(dir, 1000, 0, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tag = tagCode(1)
+	base := int64(1_000_000)
+	runs := []walDataRun{{
+		Key: tag,
+		Points: []rawWritePoint{
+			{timestamp: base, value: variant.NewInt64(42)},
+			{timestamp: base + 100, value: variant.NewInt64(42)},
+			{timestamp: base + 200, value: variant.NewInt64(43)},
+		},
+	}}
+	written, err := wf.WriteRuns(runs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != 2 {
+		t.Fatalf("written=%d, want 2", written)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rw := reopenWal(t, dir, cfg)
+	eqInt64(t, readAll(rw, tag, 0, 2_000_000), []int64{42, 43})
+}
+
+func TestWriteRunsKeepsLateDataWithoutPolicy(t *testing.T) {
+	dir := tempDir(t)
+	cfg := WalConfig{MaxFileSize: maxSegmentSize, MaxBufferBatchSize: 5, MaxFileNumber: 100}
+	wf, err := NewWalFile(dir, 0, 0, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tag = tagCode(1)
+	for _, timestamps := range [][]int64{{50, 100}, {30, 60}} {
+		points := make([]rawWritePoint, 0, len(timestamps))
+		for _, timestamp := range timestamps {
+			points = append(points, rawWritePoint{timestamp: timestamp, value: variant.NewInt64(timestamp)})
+		}
+		if _, err := wf.WriteRuns([]walDataRun{{Key: tag, Points: points}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rw := reopenWal(t, dir, cfg)
+	eqInt64(t, readAll(rw, tag, 0, 1000), []int64{30, 50, 60, 100})
+}
+
 // TestDedupHighCardinality writes many tags as single-entry prepared batches,
 // then verifies every point survives with per-tag ordering intact.
 func TestDedupHighCardinality(t *testing.T) {

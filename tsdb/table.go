@@ -143,9 +143,9 @@ func (s *ssTable) validateWrite(timestamp int64, value variant.Variant, now int6
 
 // commitRawWriteBatch runs off the caller path. It resolves each distinct tag
 // once, sorts only out-of-order tag buffers, persists any newly created tag
-// codes to Meta, and only then appends the prepared numeric batch to the WAL.
+// codes to Meta, and only then appends the prepared tag runs to the WAL.
 func (s *ssTable) commitRawWriteBatch(batch *frozenWriteBatch) (int, error) {
-	entries, err := s.batcher.prepareRawWriteBatch(batch)
+	runs, err := s.batcher.prepareRawWriteBatch(batch)
 	if err != nil {
 		return 0, err
 	}
@@ -156,12 +156,12 @@ func (s *ssTable) commitRawWriteBatch(batch *frozenWriteBatch) (int, error) {
 	if err := s.Meta.FlushPending(); err != nil {
 		return 0, err
 	}
-	results, err := s.walFile.WriteBatch(entries)
+	results, err := s.walFile.WriteRuns(runs)
 	if err == ErrorWALCacheFull {
 		if flushErr := s.flushBlocking(); flushErr != nil {
 			return results, flushErr
 		}
-		results, err = s.walFile.WriteBatch(entries)
+		results, err = s.walFile.WriteRuns(runs)
 	}
 	if err != nil {
 		return results, err

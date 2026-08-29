@@ -134,6 +134,31 @@ func BenchmarkPipelineSubmitFlush(b *testing.B) {
 	}
 }
 
+// BenchmarkPipelineSubmitChunks 衡量多 chunk 提交的写入器路径（10×5K，
+// 总量与 PipelineSubmitFlush 相同）：旧实现会把多个 chunk 合并成大切片
+// （一次大分配 + 全量 memcpy）再入库；现为逐 chunk 直写引擎（引擎侧自有
+// 分片异步攒批，不需要 server 层再合批）。
+func BenchmarkPipelineSubmitChunks(b *testing.B) {
+	db := benchDB(b)
+	w := NewPipelinedWriter(db, 1000, 50_000)
+	defer w.Close()
+	src := testPoints(5000)
+	for i := range src {
+		src[i].Timestamp = src[0].Timestamp
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 10; j++ {
+			pts := pointBatchPool.Get().([]tsdb.TagPoint)
+			pts = append(pts[:0], src...)
+			w.Submit("t", pts)
+		}
+		if err := w.Flush(); err != nil {
+			b.Fatalf("Flush: %v", err)
+		}
+	}
+}
+
 // BenchmarkServerWriteLine 衡量 Line Protocol 流式写入口的端到端吞吐
 // （解码 + Submit + Flush 入库）。流水线开启（默认配置）。
 func BenchmarkServerWriteLine(b *testing.B) {

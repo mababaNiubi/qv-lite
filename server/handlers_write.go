@@ -46,99 +46,15 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"written": written})
 }
 
-type pointRequest struct {
-	Tag       string          `json:"tag"`
-	Timestamp int64           `json:"timestamp"`
-	Value     json.RawMessage `json:"value"`
-	ValueType string          `json:"valueType,omitempty"`
-}
-
 // handleBatch 处理 /api/v1/batch：二进制高吞吐路径，或 JSON 流式数组。
 func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	if ct := r.Header.Get("Content-Type"); len(ct) >= len(BatchContentType) && ct[:len(BatchContentType)] == BatchContentType {
 		s.handleBatchBinary(w, r)
 		return
 	}
-	// JSON 流式处理：手动遍历顶层对象，边解码 points 边分批入库，不把整个
-	// 请求反序列化进内存。
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
-	tok, err := dec.Token()
-	if err != nil {
-		badRequest(w, err)
-		return
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		writeErr(w, http.StatusBadRequest, errors.New("bad request: expected object"))
-		return
-	}
-	var (
-		table string
-		g     *StreamIngestor
-	)
-	applyTable := func(name string) string {
-		if p := r.URL.Query().Get("table"); p != "" {
-			return p // 查询参数优先
-		}
-		return name
-	}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-		key, _ := keyTok.(string)
-		switch key {
-		case "table":
-			if err := dec.Decode(&table); err != nil {
-				writeErr(w, http.StatusBadRequest, err)
-				return
-			}
-		case "points":
-			table = applyTable(table)
-			if _, err := dec.Token(); err != nil { // '['
-				writeErr(w, http.StatusBadRequest, err)
-				return
-			}
-			g = s.newStreamIngestor()
-			table = g.intern(table)
-			var p pointRequest
-			for dec.More() {
-				p = pointRequest{}
-				if err := dec.Decode(&p); err != nil {
-					writeErr(w, http.StatusBadRequest, fmt.Errorf("bad point: %w", err))
-					return
-				}
-				v, err := ValueToVariant(p.Value, p.ValueType)
-				if err != nil {
-					writeErr(w, http.StatusBadRequest, fmt.Errorf("point %q: %w", p.Tag, err))
-					return
-				}
-				p.Tag = g.intern(p.Tag)
-				if err := g.Add(table, tsdb.TagPoint{Tag: p.Tag, Timestamp: p.Timestamp, Value: v}); err != nil {
-					writeErr(w, http.StatusInternalServerError, err)
-					return
-				}
-			}
-			_, _ = dec.Token() // ']'
-		default:
-			var raw json.RawMessage
-			if err := dec.Decode(&raw); err != nil { // 跳过未知字段
-				writeErr(w, http.StatusBadRequest, err)
-				return
-			}
-		}
-	}
-	if g == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"written": 0})
-		return
-	}
-	written, err := g.Finish()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]int{"written": written})
+	// JSON 通道：手写流式解析（见 json_batch.go），边解析边分批入库，不把
+	// 整个请求反序列化进内存。
+	s.handleBatchJSON(w, r)
 }
 
 // handleWriteLine 提供 InfluxDB Line Protocol 兼容的文本写入通道。流式处理：

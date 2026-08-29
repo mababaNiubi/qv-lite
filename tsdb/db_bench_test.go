@@ -34,7 +34,7 @@ func benchOpen(b *testing.B, tableName string, walSize int64) (*DB, string) {
 	dir := benchDir(b)
 	db, err := Open(Config{
 		Path:           dir,
-		WalConfig:      WalConfig{MaxFileSize: walSize},
+		WalConfig:      WalConfig{MaxFileSize: walSize, CloseBuffer: false},
 		AsyncFlush:     true,
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
@@ -481,7 +481,7 @@ func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 	go func() {
 		http.ListenAndServe(":6060", nil)
 	}()
-	const totalPoints = 10_000_000 * 3 // 1000 万点(1ms 步长 ≈ 2.8h 跨度)
+	const totalPoints = 10_000_000 * 5 // 1000 万点(1ms 步长 ≈ 2.8h 跨度)
 	tableName := "eu12"
 	modes := []string{"single"}
 	tagList := []int{1, 100, 1000, 10000}

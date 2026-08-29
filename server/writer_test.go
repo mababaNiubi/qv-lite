@@ -205,8 +205,45 @@ func TestStreamingPipelineNoAliasing(t *testing.T) {
 	}
 }
 
-// TestPipelinedWriterMergeAndSplit 验证同一张表的多个 chunk 合并后按 batchSize
-// 上限分批写出（2×30K 合并后拆为 40K+20K），数据完整。
+// TestPipelinedWriterBackpressure 验证有界队列背压：缓冲达到 maxQueue 时
+// Submit 阻塞，写入器排空后放行，数据不丢失。
+// 白盒：interval 取极大值避免定时器干扰，直接置满 count 触发阻塞条件。
+func TestPipelinedWriterBackpressure(t *testing.T) {
+	db := newTestDB(t)
+	w := NewPipelinedWriter(db, 60_000, 1000)
+	defer w.Close()
+
+	w.mu.Lock()
+	w.count = w.batchSize * 32 // 模拟缓冲已达背压上限
+	w.mu.Unlock()
+
+	submitted := make(chan struct{})
+	go func() {
+		w.Submit("t", testPoints(1000))
+		close(submitted)
+	}()
+	select {
+	case <-submitted:
+		t.Fatal("Submit returned while buffer full; expected backpressure")
+	case <-time.After(100 * time.Millisecond):
+		// 阻塞符合预期。
+	}
+	w.signalWork() // 排空缓冲
+	select {
+	case <-submitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit stayed blocked after the writer drained")
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if n := countRows(t, db); n != 1000 {
+		t.Fatalf("rows = %d, want 1000", n)
+	}
+}
+
+// TestPipelinedWriterMergeAndSplit 验证同一张表的多个 chunk 逐批写出
+// （2×30K，batchSize 40K，每 chunk 单次 WriteBatch），数据完整。
 func TestPipelinedWriterMergeAndSplit(t *testing.T) {
 	db := newTestDB(t)
 	w := NewPipelinedWriter(db, 60_000, 40_000)

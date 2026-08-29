@@ -61,6 +61,22 @@ type walReadChunk struct {
 	values     []variant.Variant
 }
 
+// walReadChunkIndex maps a tag to entry positions within one immutable WAL
+// read chunk. It is built lazily on the first read that needs it and kept
+// until the buffer is reset, so repeated queries of a sparse tag skip the
+// per-entry key scan of every chunk. Only full (immutable) chunks are
+// indexed; the active chunk keeps growing and is always scanned directly.
+type walReadChunkIndex map[tagCode][]int32
+
+// maxWALTagIndexBytes caps the total estimated size of per-chunk tag indexes
+// in one read buffer. Beyond it, no new indexes are built and queries fall
+// back to scanning, keeping the read-side memory cost bounded.
+const maxWALTagIndexBytes = 8 << 20
+
+// minIndexedChunkEntries skips indexing tiny chunks where a scan is cheaper
+// than the map overhead.
+const minIndexedChunkEntries = 512
+
 // walReadBuffer is an in-memory, already-decoded read cache for values appended
 // to the WAL. Its struct-of-arrays layout avoids walDataEntry's alignment and
 // write-only EndPosition cost. It also lets a tag query scan compact keys before
@@ -72,6 +88,12 @@ type walReadBuffer struct {
 	total         int
 	chunkCap      int
 	hasReferences bool
+
+	// tagIndexes/tagIndexSize are read-path caches (see tagIndex). All access
+	// is guarded by tagIndexMu; the write path never touches them.
+	tagIndexMu   sync.Mutex
+	tagIndexes   []walReadChunkIndex
+	tagIndexSize int
 }
 
 // Keep WAL rotation reuse useful without pinning an entire decoded default
@@ -110,9 +132,45 @@ func (b *walReadBuffer) appendValue(key tagCode, timestamp int64, value variant.
 	b.total++
 }
 
+// tagIndex returns the lazy tag→positions index for the immutable chunk at c,
+// building it from the caller's snapshot of the chunk's keys (the caller
+// passes its own copy, so the build never touches write-path state). Returns
+// nil for chunks below the size threshold or when the byte budget is spent —
+// callers then scan the chunk directly. Positions are valid within the
+// caller's snapshot of the chunk, which is immutable once full.
+func (b *walReadBuffer) tagIndex(c int, keys []tagCode) walReadChunkIndex {
+	b.tagIndexMu.Lock()
+	defer b.tagIndexMu.Unlock()
+	if c < len(b.tagIndexes) && b.tagIndexes[c] != nil {
+		return b.tagIndexes[c]
+	}
+	if len(keys) < minIndexedChunkEntries || b.tagIndexSize >= maxWALTagIndexBytes {
+		return nil
+	}
+	// No map prealloc: a chunk with few distinct tags (the common case) keeps
+	// a tiny map, while high-cardinality chunks grow geometrically. A large
+	// fixed hint would waste ~4KB per chunk for single-tag buffers.
+	idx := make(map[tagCode][]int32)
+	for j, key := range keys {
+		idx[key] = append(idx[key], int32(j))
+	}
+	for len(b.tagIndexes) <= c {
+		b.tagIndexes = append(b.tagIndexes, nil)
+	}
+	b.tagIndexes[c] = idx
+	// Rough estimate: map entry overhead plus 4 bytes per position.
+	b.tagIndexSize += len(idx)*56 + len(keys)*4
+	return idx
+}
+
 // resetForReuse releases values that may own heap data and keeps a bounded
 // prefix of fixed-size struct-of-arrays chunks for the next WAL rotation.
 func (b *walReadBuffer) resetForReuse(maxRetainedBytes int64) {
+	b.tagIndexMu.Lock()
+	clear(b.tagIndexes)
+	b.tagIndexes = nil
+	b.tagIndexSize = 0
+	b.tagIndexMu.Unlock()
 	for i := 0; i < b.activeChunks; i++ {
 		chunk := &b.chunks[i]
 		if b.hasReferences {
@@ -181,6 +239,7 @@ type WalFile interface {
 	WriteBatch(entries []walDataEntry) (int, error)
 	WriteRuns(runs []walDataRun) (int, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
+	snapshotTagTime() walTagSnapshot
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool

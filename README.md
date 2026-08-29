@@ -118,11 +118,14 @@ if point != nil {
 
 | Method | Description |
 |--------|-------------|
-| `Query(tableName, tag, startTime, endTime, maxNumber, polymerization, cond)` | Range query. For spans > 1 hour, returns up to `maxNumber` downsampled points. For spans ≤ 1 hour, returns all raw points directly. |
-| `QueryAll(tableName, tag, startTime, endTime, cond)` | Returns all raw data points in the range without limit. |
+| `Query(tableName, tag, startTime, endTime, windowSize, polymerization, cond)` | Range query. `windowSize` is the aggregation window in nanoseconds (> 0 downsamples by window, 0 = return all raw points); `polymerization` is the fusion mode (0 avg / 1 min / 2 max). |
+| `QueryAll(tableName, tag, startTime, endTime, cond)` | Returns all raw data points in the range without limit (use with care for wide ranges). |
+| `QueryIter(ctx, tableName, tag, startTime, endTime, cond, opts)` | **Streaming query**: emits points one at a time in time order without materializing the full result set, keeping peak memory far below `QueryAll`. `opts` (`*tsdb.QueryOptions`) supports `Limit` (max points) and `Offset` (points to skip). The returned iterator must be `Close()`d. |
 | `QueryLatest(tableName, tag)` | Returns the most recent point for the given tag. |
 
-All timestamps are in **nanoseconds** (UnixNano). `maxNumber` defaults to 10000 when set to 0.
+All timestamps are in **nanoseconds** (UnixNano). Always pair raw-point queries with a `limit` or an aggregation window so a single query cannot pull the whole dataset.
+
+> Note: the 5th parameter of `Query` is `windowSize` (the aggregation window), **not** a result-count cap; cap results with `QueryIter` + `QueryOptions.Limit` (the HTTP `limit`/`offset` fields use this path).
 
 ### Table Management
 

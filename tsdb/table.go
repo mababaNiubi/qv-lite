@@ -494,101 +494,6 @@ func (s *ssTable) CreateColumn(tag string) (tagCode, error) {
 	return code, nil
 }
 
-func (s *ssTable) queryCache(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
-	allPoints, err := s.walFile.ReadByTime(code, startTime, endTime)
-	if err != nil {
-		return nil, err
-	}
-	points := make([]Point, 0, len(allPoints))
-	for i := range allPoints {
-		condition, err := evalCond(allPoints[i].V)
-		if err != nil {
-			return nil, err
-		}
-		if condition {
-			points = append(points, allPoints[i])
-		}
-	}
-	return points, nil
-}
-
-// forEachBlock iterates over matching data blocks. When the index is available,
-// random access is preferred; otherwise, a sequential scan is used.
-func (s *ssTable) forEachBlock(code tagCode, startTime, endTime int64, handle func(head *SegmentHeader, timeData, valueData []byte) error) error {
-	var err error
-	s.fragmentation.RangeFromTime(startTime, endTime, func(fs FileSegment) bool {
-		idx := fs.GetIndex()
-		if idx != nil && len(idx.Blocks) > 0 {
-			if startTime > idx.MaxTime || endTime < idx.MinTime {
-				return true
-			}
-			matching := idx.matchingBlockPositions(code, startTime, endTime)
-			if len(matching) == 0 {
-				return true
-			}
-			if len(matching) > len(idx.Blocks)/2 || len(matching) > 100 {
-				err = s.scanSegment(fs, code, startTime, endTime, handle)
-				return true
-			}
-			for _, position := range matching {
-				block := &idx.Blocks[position]
-				head, td, vd, err2 := fs.ReadAt(block.Offset, &s.tableInfo)
-				if err2 != nil || head == nil {
-					continue
-				}
-				if err = handle(head, td, vd); err != nil {
-					return false
-				}
-			}
-			fs.CloseReader()
-			return true
-		}
-		err = s.scanSegment(fs, code, startTime, endTime, handle)
-		return true
-	})
-	return err
-}
-
-// scanSegment sequentially scans a segment for matching blocks.
-func (s *ssTable) scanSegment(fs FileSegment, code tagCode, startTime, endTime int64, handle func(head *SegmentHeader, timeData, valueData []byte) error) error {
-	if e := fs.OpenReader(); e != nil {
-		return e
-	}
-	defer fs.CloseReader()
-	for {
-		head, td, vd, e := fs.NextReadFilter(code, startTime, endTime, &s.tableInfo)
-		if e != nil || head == nil {
-			return e
-		}
-		if e = handle(head, td, vd); e != nil {
-			return e
-		}
-	}
-}
-
-func (s *ssTable) queryDisk(code tagCode, startTime int64, endTime int64, evalCond ConditionFilter) ([]Point, error) {
-	var points pointCollector
-	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
-	err := s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
-		pack.Reset()
-		if e := pack.AddSegment(compressedTimeData, compressedValueData); e != nil {
-			return e
-		}
-		for pack.Next() {
-			tms, value := pack.Read()
-			ok, e := evalCond(value)
-			if e != nil {
-				return e
-			}
-			if ok {
-				points.append(Point{Tms: tms, V: value})
-			}
-		}
-		return nil
-	})
-	return points.result(), err
-}
-
 func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([]Point, error) {
 	if s.batcher != nil {
 		if err := s.batcher.Flush(); err != nil {
@@ -599,25 +504,31 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 	if !ok {
 		return nil, ErrorTagNotFound
 	}
-	evalCond := CompileCondition(cond)
-	s.queryMute.RLock()
-	cachePoints, err := s.queryCache(code, startTime, endTime, evalCond)
-	if err != nil {
-		s.queryMute.RUnlock()
-		return nil, err
-	}
-	disk, err := s.queryDisk(code, startTime, endTime, evalCond)
-	s.queryMute.RUnlock()
+	var points pointCollector
+	err := s.forEachQueryPoint(code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
+		points.append(p)
+		return true
+	})
 	if err != nil {
 		return nil, err
 	}
-	if len(cachePoints) == 0 {
-		return disk, nil
+	return points.result(), nil
+}
+
+// QueryIter streams query results for one tag in time order. The returned
+// iterator owns the table's query lock and must be closed by the caller.
+// opts controls limit/offset; nil means unbounded.
+func (s *ssTable) QueryIter(ctx context.Context, tag string, startTime int64, endTime int64, cond any, opts *QueryOptions) (PointIter, error) {
+	if s.batcher != nil {
+		if err := s.batcher.Flush(); err != nil {
+			return nil, err
+		}
 	}
-	result := make([]Point, 0, len(disk)+len(cachePoints))
-	result = append(result, disk...)
-	result = append(result, cachePoints...)
-	return result, nil
+	code, ok := s.Meta.Load(tag)
+	if !ok {
+		return nil, ErrorTagNotFound
+	}
+	return s.queryIter(ctx, code, startTime, endTime, compileCond(cond), opts), nil
 }
 
 // QueryLatest returns the most recent data point for the specified tag.
@@ -653,6 +564,8 @@ func isNumericType(v variant.Variant) bool {
 
 // QueryWindow queries data for a tag within a time range, aggregating within fixed-size windows.
 // windowSize is the aggregation window in nanoseconds. fusion controls aggregation: 0=avg, 1=min, 2=max.
+// It consumes a single two-phase disk+WAL stream, so windows span the flush
+// boundary correctly and no full result set is ever materialized.
 func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, windowSize int64, fusion uint8, cond any) ([]Point, error) {
 	if s.batcher != nil {
 		if err := s.batcher.Flush(); err != nil {
@@ -665,13 +578,10 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 	}
 	var interval = windowSize
 
-	s.queryMute.RLock()
-	defer s.queryMute.RUnlock()
-
-	evalCond := CompileCondition(cond)
 	targetValue := variant.NewEmpty()
 	var targetTms, varCount, lastTms int64
 	var windowNumeric bool
+	var windowType variant.Type
 	// resetWindow begins a new aggregation window at the given point.
 	resetWindow := func(tms int64, v variant.Variant) {
 		lastTms = tms
@@ -679,101 +589,92 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 		targetValue = v
 		varCount = 1
 		windowNumeric = isNumericType(v)
+		windowType = v.Type()
 	}
 
-	slideFunc := func(pack PointPack) ([]Point, error) {
-		fgPoints := make([]Point, 0, 100)
-		for pack.Next() {
-			tms, v := pack.Read()
-			condition, err := evalCond(v)
+	points := make([]Point, 0, 64)
+	var aggErr error
+	err := s.forEachQueryPoint(code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
+		if aggErr != nil {
+			return false
+		}
+		tms, v := p.Tms, p.V
+		if lastTms == 0 {
+			resetWindow(tms, v)
+			return true
+		}
+		if tms-lastTms >= interval {
+			points = append(points, Point{Tms: targetTms, V: targetValue})
+			resetWindow(tms, v)
+			return true
+		}
+		// If the window started with a non-numeric value, skip all aggregation
+		// and keep the first value. Otherwise only aggregate numeric values.
+		if !windowNumeric || !isNumericType(v) {
+			return true
+		}
+		switch fusion {
+		case MinFusion:
+			if targetValue.Comparable(v) {
+				targetValue = v
+				targetTms = tms
+			}
+		case MaxFusion:
+			if !targetValue.Comparable(v) {
+				targetValue = v
+				targetTms = tms
+			}
+		default:
+			varCount++
+			targetTms = targetTms + (tms-targetTms)/varCount
+			// Numeric fast path: for a uniform Int64/Float64 window, mirror the
+			// generic Reduce/Divide/Increase exactly (same IEEE/int64
+			// operations, same wrap-on-overflow semantics) without the per-point
+			// variant machinery. Mixed-type or UInt64 windows keep the generic
+			// path.
+			if v.Type() == windowType && (windowType == variant.TypeInt64 || windowType == variant.TypeFloat64) {
+				if windowType == variant.TypeInt64 {
+					ti, _ := targetValue.AsInt64()
+					vi, _ := v.AsInt64()
+					targetValue = variant.NewInt64(ti + (vi-ti)/varCount)
+				} else {
+					tf, _ := targetValue.AsFloat64()
+					vf, _ := v.AsFloat64()
+					targetValue = variant.NewFloat64(tf + (vf-tf)/float64(varCount))
+				}
+				return true
+			}
+			reduceVariant, err := v.Reduce(targetValue)
 			if err != nil {
-				return nil, err
+				aggErr = err
+				return false
 			}
-			if !condition {
-				continue
+			divideValue, err := reduceVariant.Divide(variant.NewInt64(varCount))
+			if err != nil {
+				aggErr = err
+				return false
 			}
-			if lastTms == 0 {
-				resetWindow(tms, v)
-				continue
-			}
-			if tms-lastTms >= interval {
-				fgPoints = append(fgPoints, Point{Tms: targetTms, V: targetValue})
-				resetWindow(tms, v)
-				continue
-			}
-			// If the window started with a non-numeric value, skip all aggregation
-			// and keep the first value. Otherwise only aggregate numeric values.
-			if !windowNumeric || !isNumericType(v) {
-				continue
-			}
-			switch fusion {
-			case MinFusion:
-				if targetValue.Comparable(v) {
-					targetValue = v
-					targetTms = tms
-				}
-			case MaxFusion:
-				if !targetValue.Comparable(v) {
-					targetValue = v
-					targetTms = tms
-				}
-			default:
-				varCount++
-				targetTms = targetTms + (tms-targetTms)/varCount
-				reduceVariant, err := v.Reduce(targetValue)
-				if err != nil {
-					return nil, err
-				}
-				divideValue, err := reduceVariant.Divide(variant.NewInt64(varCount))
-				if err != nil {
-					return nil, err
-				}
-				targetValue, err = targetValue.Increase(divideValue)
-				if err != nil {
-					return nil, err
-				}
+			targetValue, err = targetValue.Increase(divideValue)
+			if err != nil {
+				aggErr = err
+				return false
 			}
 		}
-
-		return fgPoints, nil
-	}
-
-	var err error
-	pack := NewPointDiskPack(s.tableInfo.Structure, startTime, endTime)
-	points := make([]Point, 0)
-	err = s.forEachBlock(code, startTime, endTime, func(head *SegmentHeader, compressedTimeData, compressedValueData []byte) error {
-		pack.Reset()
-		if e := pack.AddSegment(compressedTimeData, compressedValueData); e != nil {
-			return e
-		}
-		ps, e := slideFunc(pack)
-		if e != nil {
-			return e
-		}
-		points = append(points, ps...)
-		return nil
+		return true
 	})
+	if aggErr != nil {
+		return points, aggErr
+	}
 	if err != nil {
 		return points, err
 	}
-
-	cachePoints, err := s.walFile.ReadByTime(code, startTime, endTime)
-	if err != nil {
-		return nil, err
-	}
-
-	ps, err := slideFunc(NewPointCachePack(cachePoints))
-	if err != nil {
-		return points, err
-	}
-	points = append(points, ps...)
 	if lastTms != 0 {
 		points = append(points, Point{
 			Tms: targetTms,
 			V:   targetValue,
 		})
 	}
-	return points, err
+	return points, nil
 }
 
 func (s *ssTable) Close() error {

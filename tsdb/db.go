@@ -386,6 +386,25 @@ func (db *DB) QueryAll(tableName string, tag string, startTime int64, endTime in
 	return table.Query(tag, startTime, endTime, cond)
 }
 
+// QueryIter streams query results for one tag in time order without
+// materializing the full result set, so peak memory stays bounded by the
+// largest single block plus the merge state instead of the whole result.
+// The returned iterator must be closed by the caller (it holds the table's
+// query lock). opts controls limit/offset; nil means unbounded. An empty
+// tableName queries the default table.
+func (db *DB) QueryIter(ctx context.Context, tableName string, tag string, startTime int64, endTime int64, cond any, opts *QueryOptions) (PointIter, error) {
+	tableName = db.resolveTableName(tableName)
+	if db.ExpirationMinuteTime != 0 {
+		startTime = max(startTime, time.Now().Add(-time.Duration(db.ExpirationMinuteTime)*time.Minute).UnixNano())
+		endTime = min(endTime, time.Now().Add(time.Duration(db.ExpirationMinuteTime)*time.Minute).UnixNano())
+	}
+	table, ok := db.ssTables.Load(tableName)
+	if !ok {
+		return nil, nil
+	}
+	return table.QueryIter(ctx, tag, startTime, endTime, cond, opts)
+}
+
 // QueryLatest returns the most recent data point for the specified tag.
 // An empty tableName queries the default table.
 func (db *DB) QueryLatest(tableName string, tag string) (*Point, error) {

@@ -60,6 +60,7 @@ type fileSegment struct {
 	compressor BlockCompressor
 	timestamp  int64
 	index      *FileIndex
+	indexOnce  sync.Once // guards lazy index load against concurrent queries
 }
 
 func newFileSegment(filePath string, tm int64, compressor BlockCompressor, index *FileIndex, cache *readerCache) *fileSegment {
@@ -84,15 +85,19 @@ func (w *fileSegment) Remove() error {
 func (w *fileSegment) GetMinTms() int64 { return w.timestamp }
 
 // GetIndex returns the index, building it from the file if not already loaded.
+// The lazy load is guarded by sync.Once so concurrent queries cannot race on
+// the index field; flush-time appends stay safe because flush holds the table
+// query write lock exclusively.
 func (w *fileSegment) GetIndex() *FileIndex {
 	if w.index != nil {
 		return w.index
 	}
-	// Try loading from the .idx file first.
-	if idx := readIndexFile(indexFilePath(w.filePath)); idx != nil {
-		w.index = idx
-		return idx
-	}
+	w.indexOnce.Do(func() {
+		// Try loading from the .idx file first.
+		if idx := readIndexFile(indexFilePath(w.filePath)); idx != nil {
+			w.index = idx
+		}
+	})
 	return w.index
 }
 

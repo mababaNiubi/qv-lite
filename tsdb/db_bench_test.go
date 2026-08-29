@@ -535,17 +535,17 @@ func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 				// 逐 tag 全量查询,累加总点数。
 				queryStart := time.Now()
 				total := 0
-				//for _, tag := range tags {
-				//	all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
-				//	if err != nil {
-				//		b.Fatal(err)
-				//	}
-				//	total += len(all)
-				//}
+				for _, tag := range tags {
+					all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					total += len(all)
+				}
 				queryElapsed := time.Since(queryStart)
-				//if total != written {
-				//	b.Fatalf("query count %d != written %d", total, written)
-				//}
+				if total != written {
+					b.Fatalf("query count %d != written %d", total, written)
+				}
 
 				// 显式 Close 排空 async flush 未落的段,再量 size,得到真实落盘大小。
 				if err := db.Close(); err != nil {

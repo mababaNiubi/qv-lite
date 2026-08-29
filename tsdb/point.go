@@ -2,6 +2,7 @@ package tsdb
 
 import (
 	"sync"
+	"unsafe"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -57,10 +58,41 @@ type pointCollector struct {
 	total  int
 }
 
-var pointChunkPool = sync.Pool{
-	New: func() any {
-		return make([]Point, 0, pointChunkSize)
-	},
+// pointChunkPool reuses query result chunks with a hard byte cap. A plain
+// sync.Pool would keep every chunk a huge query ever pooled until two GC
+// cycles run; with no allocation pressure (idle server) that pins the full
+// result backing arrays in memory indefinitely. The capped pool drops chunks
+// beyond the cap at put time, so retention is deterministic regardless of GC
+// timing.
+var pointChunkPool = cappedChunkPool{maxBytes: 64 << 20}
+
+type cappedChunkPool struct {
+	mu       sync.Mutex
+	free     [][]Point
+	bytes    int
+	maxBytes int
+}
+
+func (p *cappedChunkPool) get() []Point {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n := len(p.free); n > 0 {
+		c := p.free[n-1]
+		p.free = p.free[:n-1]
+		p.bytes -= cap(c) * int(unsafe.Sizeof(Point{}))
+		return c
+	}
+	return make([]Point, 0, pointChunkSize)
+}
+
+func (p *cappedChunkPool) put(c []Point) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.bytes+cap(c)*int(unsafe.Sizeof(Point{})) > p.maxBytes {
+		return // drop oversized/excess chunks; GC reclaims them
+	}
+	p.free = append(p.free, c)
+	p.bytes += cap(c) * int(unsafe.Sizeof(Point{}))
 }
 
 var (
@@ -76,7 +108,7 @@ var (
 func (c *pointCollector) append(p Point) {
 	n := len(c.chunks)
 	if n == 0 || len(c.chunks[n-1]) >= pointChunkSize {
-		c.chunks = append(c.chunks, pointChunkPool.Get().([]Point))
+		c.chunks = append(c.chunks, pointChunkPool.get())
 		n++
 	}
 	c.chunks[n-1] = append(c.chunks[n-1], p)
@@ -87,13 +119,25 @@ func (c *pointCollector) append(p Point) {
 // chunk memory to the pool for reuse. The full backing array is zeroed before
 // returning each chunk to the pool so the GC does not scan stale pointers
 // inside variant.Variant values.
+//
+// A nearly-full single chunk (total > half the chunk size) is returned
+// directly without the flatten copy: its backing array's tail is zeroed by
+// the pool discipline (fresh make or cleared on put), so the extra capacity
+// carries no stale pointers. Smaller results keep the flatten path so a
+// 100-point query does not pin a 98KB chunk.
 func (c *pointCollector) result() []Point {
+	if c.total > pointChunkSize/2 && len(c.chunks) == 1 {
+		out := c.chunks[0][:c.total]
+		c.chunks = c.chunks[:0]
+		c.total = 0
+		return out
+	}
 	out := make([]Point, 0, c.total)
 	for _, chunk := range c.chunks {
 		out = append(out, chunk...)
 		clear(chunk)
 		chunk = chunk[:0]
-		pointChunkPool.Put(chunk)
+		pointChunkPool.put(chunk)
 	}
 	c.chunks = c.chunks[:0]
 	c.total = 0
@@ -227,6 +271,14 @@ func (p *PointDiskPack) Next() bool {
 		if p.endTime > 0 {
 			tms := seg.timeDecoder.Read()
 			if tms > p.endTime || tms < p.startTime {
+				// Next() has already advanced both decoders past this point,
+				// but the caller will never Read() it. IntegerDecoder's delta
+				// chain updates its accumulator (prev) only inside Read, so a
+				// filtered point would desync every later value by one delta
+				// (value 0 lost, value 1 duplicated). Consume and discard the
+				// value to keep decoder state in lockstep with the time
+				// stream. Read is side-effect free for the other decoders.
+				seg.valueDecoder.Read()
 				continue
 			}
 		}

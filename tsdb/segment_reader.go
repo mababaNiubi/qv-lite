@@ -57,6 +57,12 @@ func (r *fileReader) OpenReader() error {
 	return nil
 }
 
+// maxRetainedReadBufferBytes caps the per-reader block buffer retained across
+// CloseReader calls. A block can be megabytes when a tag accumulates a large
+// flush; without this cap every reader would permanently pin the largest
+// block it ever saw.
+const maxRetainedReadBufferBytes = 1 << 20
+
 func (r *fileReader) CloseReader() {
 	if r.bf == nil {
 		return
@@ -68,6 +74,9 @@ func (r *fileReader) CloseReader() {
 	}
 	r.bf = nil
 	r.readEffectiveOffset = 0
+	if cap(r.dataBuf) > maxRetainedReadBufferBytes {
+		r.dataBuf = nil
+	}
 }
 
 func (r *fileReader) NextRead(checkHead func(SegmentHeader) bool, tableInfo *TableInfo) (*SegmentHeader, []byte, []byte, error) {

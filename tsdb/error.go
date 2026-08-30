@@ -20,6 +20,7 @@ var (
 	ErrorUnsupportedNaN            = errors.New("unsupported value: NaN")
 	ErrorUnsupportedInf            = errors.New("unsupported value: Inf")
 	ErrorPointQuantityExceedsLimit = errors.New("point quantity exceeds limit")
+	ErrorQueryResultLimitExceeded  = errors.New("query result limit exceeded")
 )
 
 // WAL errors

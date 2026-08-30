@@ -125,6 +125,11 @@ type walPointIter struct {
 	startTime int64
 	endTime   int64
 
+	// ctx is checked every ctxCheckPeriod points (batch check: the atomic
+	// read per point would otherwise cost ~5-10ms per 1M points).
+	ctx     context.Context
+	ctxTick int
+
 	// needsSort fallback: fully materialized, sorted matching points.
 	sorted    []Point
 	sortedIdx int
@@ -144,12 +149,13 @@ type walPointIter struct {
 	err error
 }
 
-func newWalPointIter(snap walTagSnapshot, tag tagCode, startTime, endTime int64) *walPointIter {
+func newWalPointIter(snap walTagSnapshot, tag tagCode, startTime, endTime int64, ctx context.Context) *walPointIter {
 	w := &walPointIter{
 		snap:      snap,
 		tag:       tag,
 		startTime: startTime,
 		endTime:   endTime,
+		ctx:       ctx,
 	}
 	if !snap.anyNeedsSort {
 		return w
@@ -193,6 +199,15 @@ func newWalPointIter(snap walTagSnapshot, tag tagCode, startTime, endTime int64)
 func (w *walPointIter) next() (Point, bool, error) {
 	if w.err != nil {
 		return Point{}, false, w.err
+	}
+	if w.ctx != nil {
+		if w.ctxTick&ctxCheckMask == 0 {
+			if err := w.ctx.Err(); err != nil {
+				w.err = err
+				return Point{}, false, err
+			}
+		}
+		w.ctxTick++
 	}
 	if w.sorted != nil {
 		if w.sortedIdx < len(w.sorted) {
@@ -453,6 +468,10 @@ func (w *walPointIter) close() {
 
 // ─── Disk side ────────────────────────────────────────────────────────
 
+// ctxCheckMask 控制 ctx 批量检查粒度：每 4096 次调用检查一次（原子读摊薄，
+// 超时响应延迟 ≤ 一个检查周期 ≈ 物化 4096 点的时间）。
+const ctxCheckMask = 4095
+
 // diskPointIter pulls a tag's points from disk segments in block order,
 // decoding at most one block at a time. Each segment is read through a
 // per-query FileReader, so concurrent queries never share the mutable reader
@@ -465,6 +484,9 @@ type diskPointIter struct {
 	startTime int64
 	endTime   int64
 	ctx       context.Context
+
+	// ctxTick counts next() calls for batched ctx checking.
+	ctxTick int
 
 	segments []FileSegment
 	segIdx   int
@@ -488,10 +510,13 @@ func (d *diskPointIter) next() (Point, bool, error) {
 	}
 	for {
 		if d.ctx != nil {
-			if err := d.ctx.Err(); err != nil {
-				d.err = err
-				return Point{}, false, err
+			if d.ctxTick&ctxCheckMask == 0 {
+				if err := d.ctx.Err(); err != nil {
+					d.err = err
+					return Point{}, false, err
+				}
 			}
+			d.ctxTick++
 		}
 		if d.pack.Next() {
 			tms, value := d.pack.Read()
@@ -652,6 +677,7 @@ type mergePointIter struct {
 
 	evalCond ConditionFilter
 	ctx      context.Context
+	ctxTick  int
 	err      error
 
 	limit   int
@@ -659,7 +685,8 @@ type mergePointIter struct {
 	emitted int64
 	skipped int64
 
-	release func() // releases the table query lock
+	release func()             // releases the table query lock
+	cancel  context.CancelFunc // optional: queryTimeout-derived cancel
 }
 
 func (m *mergePointIter) next() (Point, bool, error) {
@@ -671,10 +698,13 @@ func (m *mergePointIter) next() (Point, bool, error) {
 			return Point{}, false, nil
 		}
 		if m.ctx != nil {
-			if err := m.ctx.Err(); err != nil {
-				m.err = err
-				return Point{}, false, err
+			if m.ctxTick&ctxCheckMask == 0 {
+				if err := m.ctx.Err(); err != nil {
+					m.err = err
+					return Point{}, false, err
+				}
 			}
+			m.ctxTick++
 		}
 		if m.cur == nil {
 			m.cur = m.a
@@ -718,6 +748,10 @@ func (m *mergePointIter) close() {
 		m.release()
 		m.release = nil
 	}
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
 }
 
 // Next implements PointIter.
@@ -734,16 +768,22 @@ func (m *mergePointIter) Close() error {
 // queryIter creates a time-ordered, condition-filtered point stream for one
 // tag. It holds the table query lock until the returned iterator is closed,
 // which also keeps concurrent flushes from truncating segments mid-query.
-// The caller must close the returned iterator.
+// The caller must close the returned iterator. A configured queryTimeout
+// derives a deadline from the caller's ctx.
 func (s *ssTable) queryIter(ctx context.Context, code tagCode, startTime, endTime int64, evalCond ConditionFilter, opts *QueryOptions) PointIter {
+	var cancel context.CancelFunc
+	if s.queryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.queryTimeout)
+	}
 	s.queryMute.RLock()
 	disk := newDiskIter(s, code, startTime, endTime, ctx)
 	m := &mergePointIter{
 		a:        disk,
-		b:        newWalPointIter(s.walFile.snapshotTagTime(), code, startTime, endTime),
+		b:        newWalPointIter(s.walFile.snapshotTagTime(), code, startTime, endTime, ctx),
 		evalCond: evalCond,
 		ctx:      ctx,
 		release:  s.queryMute.RUnlock,
+		cancel:   cancel,
 	}
 	if opts != nil {
 		m.limit = opts.Limit
@@ -836,12 +876,19 @@ func (d *diskPointIter) walk(evalCond ConditionFilter, limit int, offset int64, 
 // with the condition filter, offset/limit and the table query lock held. This
 // is the materialization path for Query/QueryAll/QueryWindow; the phases match
 // the historical disk-then-WAL result order without materializing the result.
-func (s *ssTable) forEachQueryPoint(code tagCode, startTime, endTime int64, evalCond ConditionFilter, opts *QueryOptions, fn func(Point) bool) error {
+// A configured queryTimeout derives a deadline from ctx (the table context
+// for materialized queries, the caller's context for QueryIter).
+func (s *ssTable) forEachQueryPoint(ctx context.Context, code tagCode, startTime, endTime int64, evalCond ConditionFilter, opts *QueryOptions, fn func(Point) bool) error {
+	if s.queryTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.queryTimeout)
+		defer cancel()
+	}
 	s.queryMute.RLock()
 	defer s.queryMute.RUnlock()
-	disk := newDiskIter(s, code, startTime, endTime, nil)
+	disk := newDiskIter(s, code, startTime, endTime, ctx)
 	defer disk.close()
-	wal := newWalPointIter(s.walFile.snapshotTagTime(), code, startTime, endTime)
+	wal := newWalPointIter(s.walFile.snapshotTagTime(), code, startTime, endTime, ctx)
 	defer wal.close()
 	limit := 0
 	offset := int64(0)

@@ -41,12 +41,16 @@ type ssTable struct {
 	flushWg         sync.WaitGroup // tracks in-flight async flush goroutines
 	cleanupDone     chan struct{}  // closed when the cleanup goroutine exits
 	asyncErr        atomic.Value   // stores error from async flush
+
+	// Query guards (Config.QueryTimeout / Config.MaxQueryPoints).
+	queryTimeout    time.Duration
+	maxQueryPoints  int64
 }
 
 func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentTimeInterval,
 	expirationMinuteTime int64, dedupWindowMs, minIntervalMs, maxStorageTime int64, compressionName string, walConfig WalConfig,
 	tagCacheSlots int, parentCtx context.Context, asyncFlush, asyncCleanup bool, cleanupInterval time.Duration,
-	ingestConfig IngestConfig) (*ssTable, error) {
+	ingestConfig IngestConfig, queryTimeout time.Duration, maxQueryPoints int64) (*ssTable, error) {
 	s := &ssTable{
 		tableInfo:              tableInfo,
 		dirPath:                dirPath,
@@ -59,6 +63,8 @@ func mewSSTable(tableInfo TableInfo, dirPath string, maxSegmentSize, maxSegmentT
 		asyncFlush:             asyncFlush,
 		asyncCleanup:           asyncCleanup,
 		cleanupInterval:        cleanupInterval,
+		queryTimeout:           queryTimeout,
+		maxQueryPoints:         maxQueryPoints,
 	}
 	s.ctx, s.cancel = context.WithCancel(parentCtx)
 	// Cancel the derived context if construction fails so it is not leaked.
@@ -505,14 +511,43 @@ func (s *ssTable) Query(tag string, startTime int64, endTime int64, cond any) ([
 		return nil, ErrorTagNotFound
 	}
 	var points pointCollector
-	err := s.forEachQueryPoint(code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
+	fn, getLimitErr := s.resultLimitFn(func(p Point) bool {
 		points.append(p)
 		return true
 	})
+	err := s.forEachQueryPoint(s.ctx, code, startTime, endTime, compileCond(cond), nil, fn)
 	if err != nil {
 		return nil, err
 	}
+	if le := getLimitErr(); le != nil {
+		return nil, le
+	}
 	return points.result(), nil
+}
+
+// resultLimitFn wraps fn with the MaxQueryPoints guard when configured
+// (default 0: no wrapping, zero per-point overhead). The wrapped fn counts
+// delivered points and aborts early beyond the limit, setting the returned
+// error so the caller can distinguish limit-abort from a user stop —
+// preventing a huge materialized result from unbounded allocation.
+func (s *ssTable) resultLimitFn(fn func(Point) bool) (func(Point) bool, func() error) {
+	if s.maxQueryPoints <= 0 {
+		return fn, func() error { return nil }
+	}
+	var limitErr error
+	count := int64(0)
+	wrapped := func(p Point) bool {
+		if !fn(p) {
+			return false
+		}
+		count++
+		if count > s.maxQueryPoints {
+			limitErr = ErrorQueryResultLimitExceeded
+			return false
+		}
+		return true
+	}
+	return wrapped, func() error { return limitErr }
 }
 
 // QueryIter streams query results for one tag in time order. The returned
@@ -594,7 +629,8 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 
 	points := make([]Point, 0, 64)
 	var aggErr error
-	err := s.forEachQueryPoint(code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
+	var limitErr error
+	err := s.forEachQueryPoint(s.ctx, code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
 		if aggErr != nil {
 			return false
 		}
@@ -605,6 +641,10 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 		}
 		if tms-lastTms >= interval {
 			points = append(points, Point{Tms: targetTms, V: targetValue})
+			if s.maxQueryPoints > 0 && int64(len(points)) >= s.maxQueryPoints {
+				limitErr = ErrorQueryResultLimitExceeded
+				return false
+			}
 			resetWindow(tms, v)
 			return true
 		}
@@ -665,10 +705,16 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 	if aggErr != nil {
 		return points, aggErr
 	}
+	if limitErr != nil {
+		return points, limitErr
+	}
 	if err != nil {
 		return points, err
 	}
 	if lastTms != 0 {
+		if s.maxQueryPoints > 0 && int64(len(points)) >= s.maxQueryPoints {
+			return points, ErrorQueryResultLimitExceeded
+		}
 		points = append(points, Point{
 			Tms: targetTms,
 			V:   targetValue,

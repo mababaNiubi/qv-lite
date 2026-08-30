@@ -121,6 +121,17 @@ type Config struct {
 	// 高基数写入性能。内存开销约 8B×slots + 24B×活跃tag数, 65536 槽上限
 	// 约 2MB, 可忽略。非 2 的幂会自动向上取整。
 	TagCacheSlots int `json:"tag_cache_slots"`
+
+	// QueryTimeout 是单次查询（物化 Query/QueryAll/QueryWindow 与流式
+	// QueryIter）的最长执行时间。默认 0 不限制。超时返回
+	// context.DeadlineExceeded（物化路径）或迭代器的 ctx 错误。
+	// 检查粒度为每 4096 点一次，超时响应延迟 ≤ 一个检查周期。
+	QueryTimeout time.Duration `json:"query_timeout"`
+
+	// MaxQueryPoints 是单次物化查询（Query/QueryAll/QueryWindow）允许返回的
+	// 最大点数。默认 0 不限制。超过即返回 ErrorQueryResultLimitExceeded——
+	// 用于防止大结果查询无限分配内存（1M 点 ≈ 40MB）。
+	MaxQueryPoints int64 `json:"max_query_points"`
 }
 
 const DefaultTableName = "default"
@@ -223,7 +234,9 @@ func (db *DB) BuildTable() error {
 			db.AsyncFlush,
 			db.AsyncCleanup,
 			time.Duration(db.CleanupIntervalSeconds)*time.Second,
-			db.IngestConfig)
+			db.IngestConfig,
+			db.QueryTimeout,
+			db.MaxQueryPoints)
 		if err != nil {
 			return err
 		}
@@ -267,7 +280,9 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.AsyncFlush,
 		db.AsyncCleanup,
 		time.Duration(db.CleanupIntervalSeconds)*time.Second,
-		db.IngestConfig)
+		db.IngestConfig,
+		db.QueryTimeout,
+		db.MaxQueryPoints)
 	if err != nil {
 		return err
 	}

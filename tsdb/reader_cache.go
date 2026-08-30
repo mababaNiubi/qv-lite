@@ -35,10 +35,15 @@ func (c *readerCache) acquire(filePath string) *BlockFile {
 }
 
 // release returns a BlockFile to the cache for reuse. If the cache is full,
-// the BlockFile is dropped (closed) instead.
+// the BlockFile is dropped (closed) instead. A stale entry for the same path
+// (another query releasing its reader for the same segment) is dropped first,
+// so one path never accumulates leaked open handles.
 func (c *readerCache) release(filePath string, bf *BlockFile) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if old, ok := c.readers[filePath]; ok {
+		old.Drop()
+	}
 	if len(c.readers) >= c.maxSize {
 		c.evictLocked()
 	}

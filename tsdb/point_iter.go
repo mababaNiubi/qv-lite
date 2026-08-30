@@ -593,6 +593,9 @@ func (d *diskPointIter) nextSegment() bool {
 			if seg, ok := fs.(*fileSegment); ok {
 				d.reader = NewFileReader(seg.filePath, seg.compressor, d.table.fragmentation.readerCache)
 			} else {
+				// 非 fileSegment 实现：复用段对象自带的 reader。调用方必须
+				// 保证该 reader 支持并发查询各自持有（生产代码仅 *fileSegment
+				// 走每查询新建路径，此分支用于其它 FileSegment 实现）。
 				d.reader = fs.(FileReader)
 			}
 		} else if seg, ok := fs.(*fileSegment); ok {

@@ -39,6 +39,11 @@ func (r *fileReader) OpenReader() error {
 		// forces a fresh open + index load per segment.
 		if r.bf.Path() != r.filePath {
 			if err := r.bf.Rebind(r.filePath, r.compressor); err != nil {
+				// The rebind may have closed the old file before failing on
+				// the new one; a half-bound BlockFile must not be released
+				// back to the shared cache for a later query to pick up.
+				r.bf.Drop()
+				r.bf = nil
 				return err
 			}
 		}

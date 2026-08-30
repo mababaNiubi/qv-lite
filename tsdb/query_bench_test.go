@@ -245,3 +245,164 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// ─── 多角度查询基准 ────────────────────────────────────────────────
+//
+// BenchmarkQueryRange 覆盖"全量 / 前 20% / 后 20% / 中间 50%"四个时间窗，
+// 位置轴（wal/disk）与规模轴（100K/1M）。不同时间窗的块命中模式不同：
+// 前 20% 命中少数早期块（索引随机访问），全量走顺序扫描，后 20% 落在
+// 最新段与 WAL 尾部——用于观察块选择、解码与 WAL 读取的差异。
+func BenchmarkQueryRange(b *testing.B) {
+	ranges := []struct {
+		name string
+		lo   float64
+		hi   float64
+	}{
+		{"all", 0, 1},
+		{"first20", 0, 0.2},
+		{"last20", 0.8, 1},
+		{"mid50", 0.25, 0.75},
+	}
+	for _, loc := range []struct {
+		name string
+		wal  int64
+	}{{"wal", 256 << 20}, {"disk", 1 << 20}} {
+		for _, n := range []int{100_000, 1_000_000} {
+			for _, r := range ranges {
+				b.Run(loc.name+"/"+r.name+"/"+itoa(n), func(b *testing.B) {
+					db := benchQueryOpen(b, loc.wal)
+					base := writePointsN(b, db, n, benchTag)
+					start := base + int64(float64(n)*1e6*r.lo) - 1
+					end := base + int64(float64(n)*1e6*r.hi) + 1
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						pts, err := db.QueryAll(benchTable, benchTag, start, end, nil)
+						if err != nil {
+							b.Fatalf("QueryAll: %v", err)
+						}
+						runtime.KeepAlive(pts)
+					}
+				})
+			}
+		}
+	}
+}
+
+// BenchmarkQueryRangeIter 与 BenchmarkQueryRange 同矩阵，但走流式
+// QueryIter（不物化结果），单独体现范围选择对迭代路径的影响。
+func BenchmarkQueryRangeIter(b *testing.B) {
+	ranges := []struct {
+		name string
+		lo   float64
+		hi   float64
+	}{
+		{"all", 0, 1},
+		{"first20", 0, 0.2},
+		{"last20", 0.8, 1},
+		{"mid50", 0.25, 0.75},
+	}
+	for _, loc := range []struct {
+		name string
+		wal  int64
+	}{{"wal", 256 << 20}, {"disk", 1 << 20}} {
+		for _, r := range ranges {
+			b.Run(loc.name+"/"+r.name+"/1M", func(b *testing.B) {
+				db := benchQueryOpen(b, loc.wal)
+				const n = 1_000_000
+				base := writePointsN(b, db, n, benchTag)
+				start := base + int64(float64(n)*1e6*r.lo) - 1
+				end := base + int64(float64(n)*1e6*r.hi) + 1
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					it, err := db.QueryIter(context.Background(), benchTable, benchTag, start, end, nil, nil)
+					if err != nil {
+						b.Fatalf("QueryIter: %v", err)
+					}
+					for {
+						_, ok, err := it.Next()
+						if err != nil {
+							b.Fatalf("Next: %v", err)
+						}
+						if !ok {
+							break
+						}
+					}
+					if err := it.Close(); err != nil {
+						b.Fatalf("Close: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkQueryConcurrentIter 流式查询的并发吞吐（与
+// BenchmarkQueryConcurrent 同矩阵，但不物化结果），对照物化路径在并发下
+// 的 GC/分配竞争差异。
+func BenchmarkQueryConcurrentIter(b *testing.B) {
+	for _, loc := range []struct {
+		name string
+		wal  int64
+	}{{"wal", 256 << 20}, {"disk", 1 << 20}} {
+		for _, workers := range []int{1, 2, 4, 8} {
+			b.Run(loc.name+"/conc"+itoa(workers), func(b *testing.B) {
+				db := benchQueryOpen(b, loc.wal)
+				const n = 1_000_000
+				base := writePointsN(b, db, n, benchTag)
+				start, end := base-1, base+int64(n)*1e6
+				b.SetParallelism(workers - 1)
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						it, err := db.QueryIter(context.Background(), benchTable, benchTag, start, end, nil, nil)
+						if err != nil {
+							b.Fatalf("QueryIter: %v", err)
+						}
+						for {
+							_, ok, err := it.Next()
+							if err != nil {
+								b.Fatalf("Next: %v", err)
+							}
+							if !ok {
+								break
+							}
+						}
+						if err := it.Close(); err != nil {
+							b.Fatalf("Close: %v", err)
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+// BenchmarkQueryConcurrent 并发物化查询吞吐：同一 tag 全量查询，并发度
+// 1/2/4/8（1 表示 RunParallel 默认全核）。体现 queryMute 共享读锁、
+// readerCache、解码器池与 WAL 快照在并发读下的表现（ns/op = 1/吞吐）。
+func BenchmarkQueryConcurrent(b *testing.B) {
+	for _, loc := range []struct {
+		name string
+		wal  int64
+	}{{"wal", 256 << 20}, {"disk", 1 << 20}} {
+		for _, workers := range []int{1, 2, 4, 8} {
+			b.Run(loc.name+"/conc"+itoa(workers), func(b *testing.B) {
+				db := benchQueryOpen(b, loc.wal)
+				const n = 1_000_000
+				base := writePointsN(b, db, n, benchTag)
+				start, end := base-1, base+int64(n)*1e6
+				b.SetParallelism(workers - 1)
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						pts, err := db.QueryAll(benchTable, benchTag, start, end, nil)
+						if err != nil {
+							b.Fatalf("QueryAll: %v", err)
+						}
+						runtime.KeepAlive(pts)
+					}
+				})
+			})
+		}
+	}
+}

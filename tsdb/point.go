@@ -2,6 +2,7 @@ package tsdb
 
 import (
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/mababaNiubi/variant"
@@ -63,8 +64,12 @@ type pointCollector struct {
 // cycles run; with no allocation pressure (idle server) that pins the full
 // result backing arrays in memory indefinitely. The capped pool drops chunks
 // beyond the cap at put time, so retention is deterministic regardless of GC
-// timing.
-var pointChunkPool = cappedChunkPool{maxBytes: 64 << 20}
+// timing. A sharded variant keeps the retention semantics while spreading
+// concurrent queries across per-shard mutexes (a single global mutex showed
+// up as a contention point in concurrent materialized benchmarks; sync.Pool
+// was tried instead but its GC-driven clearing destroyed chunk reuse and
+// measurably increased allocation under load).
+var pointChunkPool = shardedChunkPool{shards: 16, maxBytesPerShard: (64 << 20) / 16}
 
 type cappedChunkPool struct {
 	mu       sync.Mutex
@@ -93,6 +98,38 @@ func (p *cappedChunkPool) put(c []Point) {
 	}
 	p.free = append(p.free, c)
 	p.bytes += cap(c) * int(unsafe.Sizeof(Point{}))
+}
+
+// shardedChunkPool routes chunk get/put across per-shard capped pools with a
+// lock-free round-robin counter, so concurrent queries rarely contend on the
+// same shard mutex while total retention stays bounded (shards × per-shard
+// cap).
+type shardedChunkPool struct {
+	shards          int
+	maxBytesPerShard int
+	shardCursor     atomic.Uint64
+	pools           []cappedChunkPool
+}
+
+func (p *shardedChunkPool) get() []Point {
+	p.ensure()
+	i := p.shardCursor.Add(1) % uint64(p.shards)
+	return p.pools[i].get()
+}
+
+func (p *shardedChunkPool) put(c []Point) {
+	p.ensure()
+	i := p.shardCursor.Add(1) % uint64(p.shards)
+	p.pools[i].put(c)
+}
+
+func (p *shardedChunkPool) ensure() {
+	if p.pools == nil {
+		p.pools = make([]cappedChunkPool, p.shards)
+		for i := range p.pools {
+			p.pools[i].maxBytes = p.maxBytesPerShard
+		}
+	}
 }
 
 var (

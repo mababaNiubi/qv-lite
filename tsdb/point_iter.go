@@ -222,11 +222,31 @@ func (w *walPointIter) next() (Point, bool, error) {
 				// chunk. posIdx only advances here; it is reset when moving to
 				// a different chunk, never at the top of next().
 				chunk := &file.chunks[w.chunkIdx]
+				// For an ordered file the tag's positions in this chunk are
+				// timestamp-monotonic, so the whole chunk can be skipped by
+				// its first/last timestamp and the per-position loop can stop
+				// early past the query end.
+				ordered := !file.needsSort
+				if ordered && len(w.positions) > 0 {
+					if chunk.timestamps[w.positions[0]] > w.endTime ||
+						chunk.timestamps[w.positions[len(w.positions)-1]] < w.startTime {
+						w.positions = nil
+						w.chunkIdx++
+						w.posIdx = 0
+						continue
+					}
+				}
 				for w.posIdx < len(w.positions) {
 					j := w.positions[w.posIdx]
 					w.posIdx++
 					ts := chunk.timestamps[j]
-					if ts < w.startTime || ts > w.endTime {
+					if ts > w.endTime {
+						if ordered {
+							break // monotonic: later positions are larger
+						}
+						continue
+					}
+					if ts < w.startTime {
 						continue
 					}
 					return Point{Tms: ts, V: chunk.values[j]}, true, nil
@@ -273,8 +293,22 @@ func (w *walPointIter) next() (Point, bool, error) {
 }
 
 // walk streams this source into fn (see diskPointIter.walk for the rationale
-// of the duplicated concrete loop).
+// of the duplicated concrete loop and its branch-free fast path).
 func (w *walPointIter) walk(evalCond ConditionFilter, limit int, offset int64, emitted, skipped *int64, fn func(Point) bool) error {
+	if evalCond == nil && limit <= 0 && offset <= 0 {
+		for {
+			p, ok, err := w.next()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			if !fn(p) {
+				return nil
+			}
+		}
+	}
 	for {
 		p, ok, err := w.next()
 		if err != nil {
@@ -574,9 +608,8 @@ func (d *diskPointIter) nextSegment() bool {
 }
 
 func (d *diskPointIter) endSegment() {
-	if d.reader != nil {
-		d.reader.CloseReader()
-	}
+	// The per-query reader stays open across segment switches (OpenReader
+	// rebinds it to the next file); only the final close() releases it.
 	d.readerOpened = false
 	d.fs = nil
 	d.idx = nil
@@ -586,8 +619,14 @@ func (d *diskPointIter) endSegment() {
 }
 
 func (d *diskPointIter) close() {
-	d.endSegment()
+	if d.reader != nil {
+		d.reader.CloseReader()
+	}
+	d.readerOpened = false
 	d.reader = nil
+	d.fs = nil
+	d.idx = nil
+	d.positions = nil
 	if d.pack != nil {
 		d.pack.Reset()
 	}
@@ -742,8 +781,23 @@ func compileCond(cond any) ConditionFilter {
 // walk streams this source into fn, applying the condition filter and
 // offset/limit. The loop is a per-concrete-type method (also implemented on
 // walPointIter) so the per-point next call is direct instead of going through
-// the generic shape dictionary.
+// the generic shape dictionary. When no filter/limit/offset is configured the
+// common case runs a branch-free loop.
 func (d *diskPointIter) walk(evalCond ConditionFilter, limit int, offset int64, emitted, skipped *int64, fn func(Point) bool) error {
+	if evalCond == nil && limit <= 0 && offset <= 0 {
+		for {
+			p, ok, err := d.next()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			if !fn(p) {
+				return nil
+			}
+		}
+	}
 	for {
 		p, ok, err := d.next()
 		if err != nil {

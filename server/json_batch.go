@@ -563,6 +563,7 @@ func (s *Server) handleBatchJSON(w http.ResponseWriter, r *http.Request) {
 		case bytesEqString(key, "points"):
 			if g == nil {
 				g = s.newStreamIngestor()
+				g.firstHint = streamBatchSize // 同 Line 路径：避免扩容链
 			}
 			if err := p.readPoints(g, queryTable, bodyTable); err != nil {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("bad request: %v", err))

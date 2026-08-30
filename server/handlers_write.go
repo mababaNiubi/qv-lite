@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -62,35 +63,71 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWriteLine(w http.ResponseWriter, r *http.Request) {
 	nowNS := time.Now().UnixNano()
 	g := s.newStreamIngestor()
-	scanner := bufio.NewScanner(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 支持最长 1MB 单行
+	// 预分配整批缓冲：Line 流通常是单表连续流，避免 pending 切片从
+	// 1024 起步的 1.25x 扩容链（扩容总拷贝 ≈ 最终容量 5 倍，占该路径
+	// 分配 ~67%）。
+	g.firstHint = streamBatchSize
+	br := bufio.NewReaderSize(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes), 64*1024)
 	var tagScratch []tagPair
 	var fieldScratch []fieldPair
 	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 || line[0] == '#' {
-			continue
+	for {
+		line, err := br.ReadSlice('\n')
+		if len(line) > 0 {
+			lineNo++
+			line = bytes.TrimSpace(line)
+			if len(line) > 0 && line[0] != '#' {
+				p, perr := parseLine(line, nowNS, &tagScratch, &fieldScratch)
+				if perr != nil {
+					writeErr(w, http.StatusBadRequest, fmt.Errorf("line %d: %w", lineNo, perr))
+					return
+				}
+				// 解析只返回字节区间；立即驻留（读缓冲随后会被覆写）。
+				if aerr := g.Add(g.internSpan(line, p.Table, p.TableEsc), tsdb.TagPoint{
+					Tag:       g.internSpan(line, p.Tag, p.TagEsc),
+					Timestamp: p.Timestamp,
+					Value:     p.Value,
+				}); aerr != nil {
+					writeErr(w, http.StatusInternalServerError, aerr)
+					return
+				}
+			}
 		}
-		p, err := parseLine(line, nowNS, &tagScratch, &fieldScratch)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("line %d: %w", lineNo, err))
+			if err == io.EOF {
+				break
+			}
+			if err == bufio.ErrBufferFull {
+				// 单行超过读缓冲：取剩余部分拼接（行长由 MaxBodyBytes 兜底）。
+				rest, rerr := br.ReadString('\n')
+				joined := make([]byte, 0, len(line)+len(rest))
+				joined = append(joined, line...)
+				joined = append(joined, rest...)
+				lineNo++
+				joined = bytes.TrimSpace(joined)
+				if len(joined) > 0 && joined[0] != '#' {
+					p, perr := parseLine(joined, nowNS, &tagScratch, &fieldScratch)
+					if perr != nil {
+						writeErr(w, http.StatusBadRequest, fmt.Errorf("line %d: %w", lineNo, perr))
+						return
+					}
+					if aerr := g.Add(g.internSpan(joined, p.Table, p.TableEsc), tsdb.TagPoint{
+						Tag:       g.internSpan(joined, p.Tag, p.TagEsc),
+						Timestamp: p.Timestamp,
+						Value:     p.Value,
+					}); aerr != nil {
+						writeErr(w, http.StatusInternalServerError, aerr)
+						return
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				continue
+			}
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("read body: %w", err))
 			return
 		}
-		// 解析只返回字节区间；立即驻留（scanner 缓冲随后会被覆写）。
-		if err := g.Add(g.internSpan(line, p.Table, p.TableEsc), tsdb.TagPoint{
-			Tag:       g.internSpan(line, p.Tag, p.TagEsc),
-			Timestamp: p.Timestamp,
-			Value:     p.Value,
-		}); err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("read body: %w", err))
-		return
 	}
 	written, err := g.Finish()
 	if err != nil {

@@ -93,10 +93,19 @@ func spanEq(line []byte, s tokenSpan, esc bool, want string) bool {
 	return true
 }
 
+// lineSepMask 是 Line Protocol 全部分隔符的位掩码（ASCII 均 < 64）。
+// scanToken 用单次位测试替代逐分隔符循环（pprof 中该循环是解析 CPU 热点）。
+const lineSepMask = 1<<byte(',') | 1<<byte(' ') | 1<<byte('=')
+
 // scanToken 从 *pos 扫描到任意分隔符（seps）或行尾，返回 token 区间（零分配）。
 // 遇转义时校验转义合法性并置 *esc=true（区间仍为原始文本，由 spanString
 // 解码）。返回后 *pos 指向分隔符（未消费）或行尾。
 func scanToken(line []byte, pos *int, esc *bool, seps ...byte) (tokenSpan, error) {
+	// 分隔符集合很小（',', ' ', '='），按调用点固定为位掩码。
+	var mask uint64
+	for _, s := range seps {
+		mask |= 1 << s
+	}
 	start := *pos
 	hasEsc := false
 	for *pos < len(line) {
@@ -115,14 +124,7 @@ func scanToken(line []byte, pos *int, esc *bool, seps ...byte) (tokenSpan, error
 				return tokenSpan{}, errors.New("invalid escape")
 			}
 		}
-		isSep := false
-		for _, s := range seps {
-			if c == s {
-				isSep = true
-				break
-			}
-		}
-		if isSep {
+		if c < 64 && mask&(1<<c) != 0 {
 			break
 		}
 		*pos++

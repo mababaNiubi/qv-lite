@@ -2,15 +2,26 @@
 
 ## v1.3.0 (2026-08-31)
 
-本次发布合并 `feature/tsdb-server-query` 分支，共 27 个提交，覆盖查询读路径
-正确性修复、查询/写入性能优化与 server 端 Line 协议提速。
+本次发布合并 `feature/tsdb-server-query` 分支，共 28 个提交，新增 server 端
+（Beta）与流式查询能力，修复查询读路径正确性问题，并大幅优化查询/写入性能
+（server Line 协议写入提速约 2.5 倍）。
 
 ### 新功能
 
+- **新增 server 端（Beta）**：全新 HTTP 服务与 Go 客户端库（详见 `server/README.md`）
+  - HTTP API：`/api/v1/health`、`/api/v1/tables`（建表/列表）、`/api/v1/write`
+    （JSON 单点）、`/api/v1/write/line`（Line 协议）、`/api/v1/batch`（JSON/
+    二进制批量）、`/api/v1/query`（原始/窗口聚合）、`/api/v1/query/latest`、
+    `/debug/pprof/*`（性能剖析）
+  - 流式入库 `StreamIngestor`：边解码边分批（50K 点/批）写入引擎，内存峰值
+    恒定，不随请求体量增长；Line/JSON/二进制三种协议共用同一管线
+  - Go 客户端库（`server/client`）与命令行入口（`server/cmd`）、配置文件示例
+- **流式查询**：引擎层新增 `QueryIter`/`PointIter` 拉取式流接口——disk→WAL
+  两相流逐点输出，不物化全量结果，支持条件过滤、offset/limit、ctx 取消与
+  查询超时；server 端 `POST /api/v1/query` 以增量编码的 JSON 流
+  （`{"points":[...],"count":N}`）下发结果，超大结果集内存恒定
 - 查询超时（`QueryTimeout`）与结果点数上限（`MaxQueryPoints`）：
   物化与流式查询路径均支持，每 4096 点批量检查 ctx，超时响应延迟有界
-- 查询读路径流式化：disk→WAL 两相流，全程不物化全量结果，支持流式迭代接口
-  （`QueryIter`）、条件过滤、offset/limit
 - server 写入管线优化：批通道流式化（恒定内存）、缓存与预处理降低内存占用与
   GC 压力、tagCode 缓存命中率提升、列 map 改数组
 

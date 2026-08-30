@@ -228,6 +228,56 @@ func TestQueryWindow_SpansFlushBoundary(t *testing.T) {
 	}
 }
 
+// TestQueryWindow_TmsZeroStart verifies windows whose first point has
+// timestamp 0 are not dropped: the old lastTms==0 sentinel misread a zero
+// window start as "uninitialized" and shifted every window by one point.
+func TestQueryWindow_TmsZeroStart(t *testing.T) {
+	db, _ := openQueryTestDB(t, ColumnTypeInt)
+	for i := int64(0); i < 100; i++ {
+		if _, err := db.Write("it", "cpu", i, variant.NewInt64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pts, err := db.Query("it", "cpu", -1, 200, 10, MaxFusion, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) != 10 {
+		t.Fatalf("windows = %d, want 10", len(pts))
+	}
+	for k, p := range pts {
+		want := int64(k*10 + 9)
+		if v, _ := p.V.AsInt64(); v != want {
+			t.Fatalf("window %d value = %d, want %d (ts=%d)", k, v, want, p.Tms)
+		}
+	}
+}
+
+// TestQueryWindow_NonNumericSampling verifies non-numeric windows keep the
+// first value of each window (sampling semantics): aggregation is skipped and
+// the window's leading value is emitted unchanged.
+func TestQueryWindow_NonNumericSampling(t *testing.T) {
+	db, _ := openQueryTestDB(t, ColumnTypeString)
+	for i := int64(0); i < 20; i++ {
+		if _, err := db.Write("it", "cpu", i, variant.NewString(fmt.Sprintf("s%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pts, err := db.Query("it", "cpu", -1, 100, 10, AvgFusion, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) != 2 {
+		t.Fatalf("windows = %d, want 2", len(pts))
+	}
+	for k, p := range pts {
+		want := fmt.Sprintf("s%d", k*10)
+		if v := p.V.AsString(); v != want {
+			t.Fatalf("window %d value = %q, want %q", k, v, want)
+		}
+	}
+}
+
 // TestQueryAll_LateDataSorted exercises the WAL needsSort fallback through the
 // merged iterator: late points are sorted with the rest.
 func TestQueryAll_LateDataSorted(t *testing.T) {

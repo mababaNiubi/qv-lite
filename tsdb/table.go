@@ -630,13 +630,15 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 	points := make([]Point, 0, 64)
 	var aggErr error
 	var limitErr error
+	initialized := false
 	err := s.forEachQueryPoint(s.ctx, code, startTime, endTime, compileCond(cond), nil, func(p Point) bool {
 		if aggErr != nil {
 			return false
 		}
 		tms, v := p.Tms, p.V
-		if lastTms == 0 {
+		if !initialized {
 			resetWindow(tms, v)
+			initialized = true
 			return true
 		}
 		if tms-lastTms >= interval {
@@ -711,7 +713,7 @@ func (s *ssTable) QueryWindow(tag string, startTime int64, endTime int64, window
 	if err != nil {
 		return points, err
 	}
-	if lastTms != 0 {
+	if initialized {
 		if s.maxQueryPoints > 0 && int64(len(points)) >= s.maxQueryPoints {
 			return points, ErrorQueryResultLimitExceeded
 		}

@@ -15,6 +15,7 @@
 ## 目录
 
 - [特性](#特性)
+- [组件](#组件)
 - [安装](#安装)
 - [使用方法](#使用方法)
   - [打开与关闭](#打开与关闭)
@@ -41,6 +42,17 @@
 - **数据过期** — 可配置的基于时间的数据自动清理。
 - **去重与最小间隔** — 可配置的去重窗口和最小写入间隔，防止重复数据。
 - **块级索引** — 基于二分搜索的块索引，快速过滤时间范围，无需扫描无关数据。
+
+## 组件
+
+qv-lite 以嵌入式引擎为核心，另有两个可选接入层。各组件均有独立 README，
+本文档只聚焦嵌入式引擎本身。
+
+| 组件 | 说明 | 文档 |
+|------|------|------|
+| `tsdb` | 嵌入式时序引擎（本文档） | — |
+| `server` | 独立网络服务（Beta）：HTTP/JSON 与 Line Protocol 写入、流式查询、窗口聚合、Go 客户端库、命令行入口 | [server/README.md](./server/README.md) |
+| `plugin` | CGO 桥接，把引擎打包为原生 C 共享/静态库（`qv_write` / `qv_query` 等） | [plugin/README.md](./plugin/README.md) |
 
 ## 安装
 
@@ -216,9 +228,10 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 |------|------|--------|-----------------------------------------------------|
 | `Path` | `string` | `"./qvLite-data"` | 数据库数据存储路径                                           |
 | `WalConfig` | `WalConfig` | — | WAL 配置（见下）                                          |
+| `IngestConfig` | `IngestConfig` | — | 分片表级攒批配置（见下）                                        |
 | `MaxSegmentSize` | `int64` | `67108864` (64MB) | 单个段文件最大大小（字节）                                       |
 | `MaxSegmentTimeInterval` | `int64` | `0`（不限制） | 单个段文件最大时间跨度（秒）                                      |
-| `MaxStorageTime` | `int64` | `3600`（1 小时） | 拒绝时间戳远超当前时间的数据写入                                      |
+| `MaxStorageTime` | `int64` | `0`（不限制） | 拒绝时间戳远超当前时间的数据写入                                      |
 | `ExpirationMinuteTime` | `int64` | `0`（禁用） | 数据过期时间（分钟），每次写入时自动清理超出时间的数据 |
 | `DedupWindowMs` | `int64` | `0`（禁用） | 去重窗口（毫秒），同一 tag 相同值在此窗口内重复写入时跳过                            |
 | `MinIntervalMs` | `int64` | `0`（禁用） | 最小写入间隔（毫秒），两次写入间隔小于该值时跳过                               |
@@ -227,25 +240,31 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `AsyncCleanup` | `bool` | `false` | 过期段文件由后台 goroutine 定期清理，而非每次写入时内联清理 |
 | `CleanupIntervalSeconds` | `int64` | `60` | 异步清理的间隔（秒），启动时会立即执行一次初始清理 |
 
+### IngestConfig
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `Shards` | `int` | `16` | 独立加锁的原始 tag 分片数，自动向上取整为 2 的幂 |
+| `MaxBatchSize` | `int` | `4096` | 活动点数达到该值时交换并异步提交一个批次 |
+| `FlushIntervalMs` | `int64` | `5` | 点停留在活动批次中的最大时长（毫秒），到期强制交换 |
+| `QueueSize` | `int` | `8` | 等待 WAL worker 的冻结批次数上限；常规写入只在活动缓冲超过紧急水位时等待 |
+
+写入在分片锁下追加原始 tag 点；后台 worker 对每个 tag 解析一次 tagCode、按
+tag 排序时间戳、先持久化 Meta，再把准备好的批次追加到 WAL——期间新写入继续
+使用新缓冲。查询与关闭会建立提交屏障。
+
 ### WalConfig
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `MaxFileSize` | `int64` | `67108864` (64MB) | WAL 内存缓存最大大小（字节） |
 | `MaxFileNumber` | `int` | — | 最大 WAL 文件数量 |
-| `CloseBuffer` | `bool` | `false` | 是否关闭内存 WAL 缓冲 |
-| `MaxBufferBatchSize` | `int` | `4096` | 排序刷盘前的最大缓冲条目数 |
+| `CloseBuffer` | `bool` | `false` | 是否关闭内存 WAL 读缓存 |
+| `MaxBufferBatchSize` | `int` | `4096` | WAL 读缓存 chunk 容量（非写批阈值） |
 
-**`CloseBuffer` 行为说明：**
-
-| 场景 | `CloseBuffer = true` | `CloseBuffer = false` |
-|------|---------------------|----------------------|
-| 乱序写入 | 同 key 下禁止乱序时间写入 | `MaxBufferBatchSize` 批处理范围内允许乱序写入 |
-| 写入/查询性能 | 较低 | 较高 |
-| 异常中断 | 数据安全 | 可能丢失部分缓冲数据 |
-| 内存占用 | 通常在 `MaxFileSize` 范围内 | 约 `MaxFileSize` 的 3~4 倍 |
-
-> 可通过限制 `MaxFileSize` 大小来控制数据库内存使用。
+`CloseBuffer` 不再改变写入的持久性/攒批行为：WAL 批次在查询/关闭的可见性屏障
+完成前都会刷盘；该选项只在「查询直接重读 WAL 文件（省内存）与读内存缓存
+（更快）」之间做取舍。
 
 ## 压缩算法
 

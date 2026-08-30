@@ -1,14 +1,19 @@
 # tsdb-server — qv-lite 时序数据库服务端
 
+> **状态：Beta**（API 可能随版本演进调整）
+>
+> 组件总览见仓库根目录 [README](../README.md)；服务端只是 qv-lite 的一个接入
+> 方式，嵌入式引擎能力以 [`tsdb`](../tsdb) 包为准。
+
 `tsdb-server` 把 qv-lite 的嵌入式时序引擎（`tsdb` 包）包装成一个**独立运行的网络服务进程**，
-对外提供基于 HTTP/JSON 的时序数据读写能力。服务端内置了为读写性能优化的默认参数，
-也允许通过命令行参数或配置文件逐项调优。
+对外提供基于 HTTP/JSON 的时序数据读写能力（含流式查询与 Line Protocol 写入）。
+服务端内置了为读写性能优化的默认参数，也允许通过命令行参数或配置文件逐项调优。
 
 ## 构建与运行
 
 ```bash
-# 构建
-go build -o bin/tsdb-server ./cmd/server/cmd
+# 构建（在仓库根目录执行）
+go build -o bin/tsdb-server ./server/cmd
 
 # 默认运行（数据目录 ./qvLite-data，监听 :8686）
 ./bin/tsdb-server
@@ -135,7 +140,7 @@ sensor,tag=cpu msg="hello" 1700000003000000000
 - 类型由字面量推断：`42i` int64、`1.5`/`1e3` float64、`true/false` bool、`"str"` string
 - 时间戳缺省用服务器时间；注释行以 `#` 开头
 
-### 查询
+### 查询（流式响应）
 
 ```
 POST /api/v1/query
@@ -146,6 +151,8 @@ POST /api/v1/query
   "end": 1700000060000,
   "window": 0,          // >0 时按该毫秒窗口降采样
   "aggregation": 0,     // 0=avg 1=min 2=max（window>0 时生效）
+  "limit": 0,           // 可选：>0 时最多返回 limit 个点
+  "offset": 0,          // 可选：按时间序跳过前 offset 个点（仅与 limit 配合有意义）
   "condition": {        // 可选：单条件或逻辑条件
     "column": "",       // 空 = 对点值本身过滤；结构化数据可填 "a.b"
     "op": ">",
@@ -154,6 +161,12 @@ POST /api/v1/query
 }
 → {"points":[{"timestamp":...,"value":36.5}],"count":N}
 ```
+
+**流式下发**：`window<=0`（原始点）时，响应体由引擎的 `QueryIter` 流式迭代器
+逐点增量编码（`{"points":[...],"count":N}`，`count` 在最后补写），超大结果集
+不会在内存中物化，响应按块刷新边查边发；`window>0`（窗口聚合）输出天然有界
+（≤ 范围/窗口数），同样以流式形状输出。`limit`/`offset` 作用于原始点查询，
+对应引擎 `QueryIter` + `QueryOptions`。
 
 逻辑条件（AND/OR）：
 
@@ -227,17 +240,9 @@ int64 **超过 2^53** 时 JSON number 会丢精度，改用**可选字段 `value
 需要让超大请求的解码与入库重叠的场景。它默认关闭，因为单后台 goroutine 会把
 多个请求重新串行化，并与引擎自身攒批重复。
 
-**实测结论（本机，HTTP 批量 10 点/请求、32 并发）**：
-
-| 配置 | 吞吐 |
-|---|---|
-| 直接进入引擎分片批次（`-write-buffer-ms 0`） | ~44K pts/s（旧数据，瓶颈为 HTTP 请求往返/连接池） |
-| 旧 server 流水线（100ms 合并） | ~44K pts/s（旧数据，无净增加） |
-| 客户端合并（1000 点/批） | ~480K pts/s（25×） |
-
-在「小请求高频接入」场景，优先让请求并发进入引擎分片；在「客户端无法批量
-合并、单连接流式上传超大请求」的场景，可压测后再开启 server 流水线。上表是
-改造前的历史数据，不能直接视为新分片路径的最终基准。
+吞吐基准（批量写 / Line 协议 / 查询 / 并发）见 `server/bench_test.go` 与
+`server/client/client_test.go`；E2E 基准见 `tsdb/db_bench_test.go` 的
+`BenchmarkE2E_*`。
 
 ## Go 客户端
 
@@ -264,7 +269,9 @@ points, err := c.Query(ctx, "sensor", "cpu", start, end, 0, 0, nil)
 agg, err := c.Query(ctx, "sensor", "cpu", start, end, 1000, 0, nil)
 ```
 
-完整示例见 `../../cmd/perfcheck/main.go`（吞吐测量）。
+完整 API 见 `server/client/client.go`（`Write`/`WriteBatch`/`WriteBatchJSON`/
+`WriteLine`/`Query`/`QueryLatest`/`CreateTable`/`ListTables`/`Health`），用法示例
+见 `server/client/client_test.go` 与 `server/server_test.go`。
 
 ## 性能保障要点
 

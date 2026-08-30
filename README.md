@@ -15,6 +15,7 @@
 ## Table of Contents
 
 - [Features](#features)
+- [Components](#components)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Open & Close](#open--close)
@@ -41,6 +42,17 @@
 - **Data Expiration** — Configurable time-based automatic data eviction.
 - **Dedup & Min Interval** — Configurable deduplication window and minimum write interval to prevent duplicate data.
 - **Block-Level Index** — Binary-search block index for fast time-range filtering without scanning irrelevant data.
+
+## Components
+
+qv-lite ships as an embedded engine plus two optional access layers. Each
+component has its own README; this document focuses on the embedded engine.
+
+| Component | Description | Docs |
+|-----------|-------------|------|
+| `tsdb` | Embedded time-series engine (this document) | — |
+| `server` | Standalone network service (Beta): HTTP/JSON + Line Protocol writes, streaming queries, window aggregation, Go client library, CLI | [server/README.md](./server/README.md) |
+| `plugin` | CGO bridge packaging the engine as a native C shared/static library (`qv_write` / `qv_query` / ...) | [plugin/README.md](./plugin/README.md) |
 
 ## Installation
 

@@ -141,10 +141,11 @@ type walPointIter struct {
 	positions []int32 // indexed positions within the current chunk (nil = scan mode)
 
 	// closeBuffer (file re-read) streaming state.
-	f         *os.File
-	br        *bufio.Reader
-	remaining int64
-	dataBuf   []byte
+	f           *os.File
+	br          *bufio.Reader
+	curFileName string
+	remaining   int64
+	dataBuf     []byte
 
 	err error
 }
@@ -357,9 +358,15 @@ func (w *walPointIter) walk(evalCond ConditionFilter, limit int, offset int64, e
 
 // nextFromFile streams records from a WAL file (CloseBuffer mode), reading
 // only up to the snapshot length so a concurrent writer's partial tail record
-// is never observed.
+// is never observed. Each file is opened independently: the iterator advances
+// to the next snapshot file once the current one is exhausted, and a stale
+// handle must never be reused for a different file.
 func (w *walPointIter) nextFromFile(file *walTagFileSnapshot) (Point, bool, error) {
-	if w.f == nil {
+	if w.f == nil || w.curFileName != file.fileName {
+		if w.f != nil {
+			_ = w.f.Close()
+			w.f = nil
+		}
 		f, err := os.Open(file.fileName)
 		if err != nil {
 			return Point{}, false, err
@@ -367,6 +374,7 @@ func (w *walPointIter) nextFromFile(file *walTagFileSnapshot) (Point, bool, erro
 		w.f = f
 		w.br = bufio.NewReader(f)
 		w.remaining = file.length
+		w.curFileName = file.fileName
 		if cap(w.dataBuf) < 64*1024 {
 			w.dataBuf = make([]byte, 64*1024)
 		}

@@ -34,7 +34,7 @@ func benchOpen(b *testing.B, tableName string, walSize int64) (*DB, string) {
 	dir := benchDir(b)
 	db, err := Open(Config{
 		Path:           dir,
-		WalConfig:      WalConfig{MaxFileSize: walSize, CloseBuffer: false},
+		WalConfig:      WalConfig{MaxFileSize: walSize, CloseBuffer: true},
 		AsyncFlush:     true,
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())

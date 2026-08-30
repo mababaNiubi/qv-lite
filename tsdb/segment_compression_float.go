@@ -245,7 +245,6 @@ func (s *ZFloatEncoder) Reset() {
 	s.bw.Reset()
 	s.finished = false
 	s.hasFirst = false
-	s.decimalQuantity = 0
 }
 
 type FloatDecoder struct {

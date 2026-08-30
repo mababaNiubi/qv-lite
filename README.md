@@ -118,11 +118,14 @@ if point != nil {
 
 | Method | Description |
 |--------|-------------|
-| `Query(tableName, tag, startTime, endTime, maxNumber, polymerization, cond)` | Range query. For spans > 1 hour, returns up to `maxNumber` downsampled points. For spans ≤ 1 hour, returns all raw points directly. |
-| `QueryAll(tableName, tag, startTime, endTime, cond)` | Returns all raw data points in the range without limit. |
+| `Query(tableName, tag, startTime, endTime, windowSize, polymerization, cond)` | Range query. `windowSize` is the aggregation window in nanoseconds (> 0 downsamples by window, 0 = return all raw points); `polymerization` is the fusion mode (0 avg / 1 min / 2 max). |
+| `QueryAll(tableName, tag, startTime, endTime, cond)` | Returns all raw data points in the range without limit (use with care for wide ranges). |
+| `QueryIter(ctx, tableName, tag, startTime, endTime, cond, opts)` | **Streaming query**: emits points one at a time in time order without materializing the full result set, keeping peak memory far below `QueryAll`. `opts` (`*tsdb.QueryOptions`) supports `Limit` (max points) and `Offset` (points to skip). The returned iterator must be `Close()`d. |
 | `QueryLatest(tableName, tag)` | Returns the most recent point for the given tag. |
 
-All timestamps are in **nanoseconds** (UnixNano). `maxNumber` defaults to 10000 when set to 0.
+All timestamps are in **nanoseconds** (UnixNano). Always pair raw-point queries with a `limit` or an aggregation window so a single query cannot pull the whole dataset.
+
+> Note: the 5th parameter of `Query` is `windowSize` (the aggregation window), **not** a result-count cap; cap results with `QueryIter` + `QueryOptions.Limit` (the HTTP `limit`/`offset` fields use this path).
 
 ### Table Management
 
@@ -214,9 +217,10 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 |-------|------|---------|-------------|
 | `Path` | `string` | `"./qvLite-data"` | Database data storage path |
 | `WalConfig` | `WalConfig` | — | WAL settings (see below) |
+| `IngestConfig` | `IngestConfig` | — | Sharded table-level accumulation settings (see below) |
 | `MaxSegmentSize` | `int64` | `67108864` (64MB) | Maximum segment file size in bytes |
 | `MaxSegmentTimeInterval` | `int64` | `0` (unlimited) | Maximum segment time span in seconds |
-| `MaxStorageTime` | `int64` | `3600` (1 hour) | Reject writes whose timestamps are too far ahead of current time |
+| `MaxStorageTime` | `int64` | `0` (unlimited) | Reject writes whose timestamps are too far ahead of current time |
 | `ExpirationMinuteTime` | `int64` | `0` (disabled) | Auto-evict data older than this many minutes (checked on each write) |
 | `DedupWindowMs` | `int64` | `0` (disabled) | Dedup window in ms — skips writes with the same value for the same tag within this window |
 | `MinIntervalMs` | `int64` | `0` (disabled) | Minimum interval between consecutive writes in ms — writes arriving too quickly are skipped |
@@ -225,25 +229,32 @@ points, err := db.QueryAll("default", "cpu", startTs, endTs, logicalCond)
 | `AsyncCleanup` | `bool` | `false` | Remove expired segments via a background goroutine on a fixed interval instead of inline during writes |
 | `CleanupIntervalSeconds` | `int64` | `60` | Interval (seconds) between async cleanup sweeps; an initial sweep runs on startup |
 
+### IngestConfig
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `Shards` | `int` | `16` | Number of independently locked raw-tag shards; rounded up to a power of two |
+| `MaxBatchSize` | `int` | `4096` | Active point count that swaps and asynchronously commits a batch |
+| `FlushIntervalMs` | `int64` | `5` | Maximum time points remain in the active batch before a swap |
+| `QueueSize` | `int` | `8` | Frozen batches allowed ahead of the ordered WAL worker; normal writes wait only if active buffers exceed the emergency high-water mark |
+
+Writes append the original string tag under a shard lock. The background worker
+resolves tag codes once per distinct tag, sorts per-tag timestamps, persists Meta,
+then appends the prepared batch to WAL while new writes continue in fresh buffers.
+Queries and shutdown establish a commit barrier.
+
 ### WalConfig
 
 | Field | Type | Default           | Description |
 |-------|------|-------------------|-------------|
 | `MaxFileSize` | `int64` | `67108864` (64MB) | Maximum WAL in-memory cache size in bytes |
 | `MaxFileNumber` | `int` | —                 | Maximum number of WAL files |
-| `CloseBuffer` | `bool` | `false`           | Whether to disable in-memory WAL buffering |
-| `MaxBufferBatchSize` | `int` | `4096`            | Max entries to buffer before sorting and flushing |
+| `CloseBuffer` | `bool` | `false`           | Disable the WAL read cache and query WAL files directly |
+| `MaxBufferBatchSize` | `int` | `4096`            | WAL read-cache chunk capacity (not a write-batch threshold) |
 
-**`CloseBuffer` behavior:**
-
-| Scenario | `CloseBuffer = true` | `CloseBuffer = false` |
-|----------|---------------------|----------------------|
-| Out-of-order writes | Rejected for the same key | Allowed within `MaxBufferBatchSize` batch window |
-| Write/query performance | Lower | Higher |
-| Crash safety | Data safe | May lose buffered data |
-| Memory usage | Typically within `MaxFileSize` | ~3–4× `MaxFileSize` |
-
-> Control database memory usage by tuning `MaxFileSize`.
+`CloseBuffer` no longer changes write durability or batching. WAL batches are
+flushed before a query/shutdown visibility barrier completes; the option only
+trades query speed for lower memory usage.
 
 ## Compression Algorithms
 

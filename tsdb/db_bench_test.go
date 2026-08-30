@@ -4,17 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mababaNiubi/variant"
 )
-
-// ==================== 辅助 ====================
 
 func benchDir(b *testing.B) string {
 	dir, err := os.MkdirTemp("", "tsdb_bench_*")
@@ -34,7 +34,7 @@ func benchOpen(b *testing.B, tableName string, walSize int64) (*DB, string) {
 	dir := benchDir(b)
 	db, err := Open(Config{
 		Path:           dir,
-		WalConfig:      WalConfig{MaxFileSize: walSize},
+		WalConfig:      WalConfig{MaxFileSize: walSize, CloseBuffer: true},
 		AsyncFlush:     true,
 		MaxStorageTime: 24 * 60 * 60 * 365,
 	}, context.Background())
@@ -152,16 +152,32 @@ func BenchmarkWriteParallel(b *testing.B) {
 		b.Run(fmt.Sprintf("g%d", goroutines), func(b *testing.B) {
 			db, _ := benchOpen(b, "t", 256<<20)
 			base := time.Now().UnixNano()
-			var seq atomic.Int64
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			errCh := make(chan error, goroutines)
 			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					i := seq.Add(1) - 1
-					if _, err := db.Write("t", "CPU", base+i*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
-						b.Fatal(err)
+			wg.Add(goroutines)
+			for range goroutines {
+				go func() {
+					defer wg.Done()
+					for {
+						i := next.Add(1) - 1
+						if i >= int64(b.N) {
+							return
+						}
+						if _, err := db.Write("t", "CPU", base+i*1e6, variant.NewFloat64(float64(i)*0.01)); err != nil {
+							errCh <- err
+							return
+						}
 					}
-				}
-			})
+				}()
+			}
+			wg.Wait()
+			select {
+			case err := <-errCh:
+				b.Fatal(err)
+			default:
+			}
 		})
 	}
 }
@@ -256,6 +272,47 @@ func BenchmarkReadScan(b *testing.B) {
 					b.Fatalf("scan: got %d want %d", len(all), points)
 				}
 			}
+		})
+	}
+}
+
+// BenchmarkWALReadTagScale measures the decoded in-memory WAL cache directly.
+// It queries one tag while the same total point count is distributed across
+// increasing tag cardinality, exposing key-scan and result-capacity costs
+// without segment decode I/O.
+func BenchmarkWALReadTagScale(b *testing.B) {
+	const totalPoints = 1_000_000
+	for _, numTags := range []int{1, 100, 10_000} {
+		b.Run(fmt.Sprintf("tags%d", numTags), func(b *testing.B) {
+			db, _ := benchOpen(b, "t", 256<<20)
+			tags := prebuiltTags(numTags)
+			base := time.Now().UnixNano()
+			for i := 0; i < totalPoints; i++ {
+				if _, err := db.Write("t", tags[i%numTags], base+int64(i), variant.NewFloat64(float64(i))); err != nil {
+					b.Fatal(err)
+				}
+			}
+			table, ok := db.ssTables.Load("t")
+			if !ok {
+				b.Fatal("table missing")
+			}
+			if err := table.batcher.Flush(); err != nil {
+				b.Fatal(err)
+			}
+
+			target := tags[numTags-1]
+			want := totalPoints / numTags
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				points, err := db.QueryAll("t", target, base-1, base+totalPoints, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(points) != want {
+					b.Fatalf("points=%d, want %d", len(points), want)
+				}
+			}
+			b.ReportMetric(totalPoints, "wal-points-scanned/op")
 		})
 	}
 }
@@ -408,5 +465,117 @@ func fileDirSize(dir string, tableName string) string {
 		return fmt.Sprintf("%.2fMB", float64(total)/(1024*1024))
 	} else {
 		return fmt.Sprintf("%.2fGB", float64(total)/(1024*1024*1024))
+	}
+}
+
+// BenchmarkE2E_TagScaleWriteAndQuery 多点写入版 E2E 基准:
+// 固定总量、多 tag 均匀分布(轮询), 写后逐 tag 全量查询, 显式 Close 排空
+// async flush 后量落盘大小 —— 与 BenchmarkE2E_WriteAndQuery(单 tag)对标,
+// 用于观察"tag 数量 × 写路径 × 落盘体积"在真实形态下的表现。
+// mode = single: 单点逐写(与 BenchmarkE2E_WriteAndQuery 一致, 仅 tag 数不同)
+//
+//	batch : WriteBatch 分批写(4096/批), 对比批量写路径。
+//
+// 总量固定不可重复,请用 -benchtime=1x 运行;调整 totalPoints 可测更大规模。
+// 进度通过 fmt.Printf 流式输出([E2E] 前缀):长跑期间实时可见,不会被误判为
+// 死循环(默认 benchtime 下单个配置可能静默数分钟)。
+func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
+	const totalPoints = 10_000_000 * 5 // 1000 万点(1ms 步长 ≈ 2.8h 跨度)
+	tableName := "eu12"
+	modes := []string{"single"}
+	tagList := []int{1, 100, 1000, 10000}
+	scaleBatchSize := 4096
+	for _, numTags := range tagList {
+		for _, mode := range modes {
+			b.Run(fmt.Sprintf("tags%d_%s", numTags, mode), func(b *testing.B) {
+				// 32MB 小 WAL:强制写入过程旋转落盘,Close 后 data 目录才有
+				// 压缩段文件可量(与 BenchmarkE2E_WriteAndQuery 的大 WAL 不同,
+				// 后者靠 8640 万点的体量自然触发旋转)。
+				//
+				// 进度直接 fmt.Printf 流式输出(不走 benchmark 输出缓冲):
+				// 长跑(如 tags10000 读阶段可达数分钟)期间必须实时可见,否则
+				// 静默期会被误判为死循环。每行带 [E2E] 前缀便于区分。
+				fmt.Printf("[E2E] tags%d: writing %d points...\n", numTags, totalPoints)
+				db, dir := benchOpen(b, tableName, 32*1024*1024)
+				tags := prebuiltTags(numTags)
+
+				writeStart := time.Now()
+				baseTime := writeStart.UnixNano()
+				written := 0
+				if mode == "single" {
+					for i := 0; i < totalPoints; i++ {
+						if _, err := db.Write(tableName, tags[i%numTags], baseTime+int64(i)*int64(time.Millisecond), variant.NewFloat64(123+float64(i)*0.01)); err != nil {
+							b.Fatalf("write %d failed: %v", i, err)
+						}
+					}
+					written = totalPoints
+				} else {
+					batch := make([]TagPoint, 0, scaleBatchSize)
+					for i := 0; i < totalPoints; i++ {
+						batch = append(batch, TagPoint{
+							Tag:       tags[i%numTags],
+							Timestamp: baseTime + int64(i)*int64(time.Millisecond),
+							Value:     variant.NewFloat64(123 + float64(i)*0.01),
+						})
+						if len(batch) == scaleBatchSize {
+							n, err := db.WriteBatch(tableName, batch)
+							if err != nil {
+								b.Fatalf("WriteBatch failed: %v", err)
+							}
+							written += n
+							batch = batch[:0]
+						}
+					}
+					if len(batch) > 0 {
+						n, err := db.WriteBatch(tableName, batch)
+						if err != nil {
+							b.Fatalf("WriteBatch tail failed: %v", err)
+						}
+						written += n
+					}
+				}
+				writeElapsed := time.Since(writeStart)
+				fmt.Printf("[E2E] tags%d: write done %v (%.0f pts/s), querying %d tags...\n",
+					numTags, writeElapsed, float64(written)/writeElapsed.Seconds(), numTags)
+
+				// 逐 tag 全量查询,累加总点数。进度每 10% 打一行。
+				queryStart := time.Now()
+				total := 0
+				progressStep := numTags / 10
+				if progressStep < 1 {
+					progressStep = 1
+				}
+				for i, tag := range tags {
+					all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					total += len(all)
+					if (i+1)%progressStep == 0 {
+						elapsed := time.Since(queryStart)
+						fmt.Printf("[E2E] tags%d: query %d/%d tags, %d pts (%v, %.0f pts/s)\n",
+							numTags, i+1, numTags, total, elapsed, float64(total)/elapsed.Seconds())
+					}
+				}
+				queryElapsed := time.Since(queryStart)
+				if total != written {
+					b.Fatalf("query count %d != written %d", total, written)
+				}
+
+				// 显式 Close 排空 async flush 未落的段,再量 size,得到真实落盘大小。
+				if err := db.Close(); err != nil {
+					b.Fatal(err)
+				}
+				fmt.Printf("[E2E] tags%d: done — write %v, read %v, count %d/%d, size %v\n",
+					numTags, writeElapsed, queryElapsed, total, written, fileDirSize(dir, tableName))
+				b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d, size: %v",
+					writeElapsed, float64(written)/writeElapsed.Seconds(),
+					queryElapsed, float64(total)/queryElapsed.Seconds(),
+					total, fileDirSize(dir, tableName))
+			})
+		}
 	}
 }

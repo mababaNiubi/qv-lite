@@ -110,9 +110,15 @@ func TestDB_AsyncFlush_RunsInBackground(t *testing.T) {
 	if !ok {
 		t.Fatal("table not found")
 	}
+	// The table-level ingest buffer now sits in front of the WAL. Establish a
+	// commit barrier first; after it returns, any remaining work is the async
+	// WAL-to-segment flush this test is intended to observe.
+	if err := table.batcher.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if !table.walFile.NeedFlush() {
+		if !table.walFile.NeedFlush() && countDataFiles(t, dir, "af2") > 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)

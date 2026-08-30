@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -15,6 +16,36 @@ func allCompressors() map[string]BlockCompressor {
 		"gzip":   GzipCompressor{},
 		"zstd":   ZstdCompressor{},
 		"none":   NoCompressor{},
+	}
+}
+
+func TestZstdCompressorConcurrentRoundTrip(t *testing.T) {
+	compressor := ZstdCompressor{}
+	payload := bytes.Repeat([]byte("concurrent-zstd-block-"), 1024)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for worker := 0; worker < cap(errs); worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				encoded := compressor.Encode(payload)
+				decoded, err := compressor.Decode(encoded)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(decoded, payload) {
+					errs <- fmt.Errorf("concurrent zstd round-trip mismatch")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

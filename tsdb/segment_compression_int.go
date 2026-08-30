@@ -10,7 +10,7 @@ import (
 	"github.com/mababaNiubi/variant"
 )
 
-// IntegerEncoder encoding: delta + zigzag + simple8b (or RLE, or raw).
+// IntegerEncoder encodes int64 values: delta + zigzag + simple8b (or RLE, or raw).
 //
 // Encoding pipeline:
 //  1. Delta-encode: each value is stored as (value - previous).
@@ -37,6 +37,7 @@ import (
 //	uncompressed (intUncompressed):
 //	  [0]    marker: intUncompressed (1 byte)
 //	  [1..]  N × uint64 BE — each zigzag-encoded delta value
+
 type IntegerEncoder struct {
 	prev   int64
 	rle    bool
@@ -60,6 +61,7 @@ func (e *IntegerEncoder) Reset() {
 	e.prev = 0
 	e.rle = true
 	e.values = e.values[:0]
+	e.err = nil
 }
 
 // Write encodes v to the underlying buffers.

@@ -57,6 +57,14 @@ type AdaptColumnEncoder struct {
 	// Non-struct mode
 	vt      variant.Type
 	encoder Encoder
+
+	// A scalar tag normally keeps the same value type across WAL segments.
+	// Reset makes the next segment rediscover its type, but retaining one reset
+	// sub-encoder preserves its grown buffers instead of allocating a new float
+	// encoder and BitWriter backing store for every segment.
+	spareVT      variant.Type
+	spareEncoder Encoder
+	nonStructBuf []byte
 }
 
 // colIdx returns the index of a column name in columnOrder, or -1.
@@ -99,7 +107,7 @@ func (m *AdaptColumnEncoder) writeNonStruct(v variant.Variant) bool {
 			m.isNotStruct = false
 			return m.writeStruct(v)
 		}
-		m.encoder = m.findColumnEncoder(vt)
+		m.encoder = m.takeNonStructEncoder(vt)
 		m.vt = vt
 		m.encoder.Write(v)
 		m.length++
@@ -116,6 +124,24 @@ func (m *AdaptColumnEncoder) writeNonStruct(v variant.Variant) bool {
 	}
 	m.length++
 	return true
+}
+
+func (m *AdaptColumnEncoder) takeNonStructEncoder(vt variant.Type) Encoder {
+	if m.spareEncoder != nil && sameEncoderType(m.spareVT, vt) {
+		encoder := m.spareEncoder
+		m.spareEncoder = nil
+		m.spareVT = variant.TypeEmpty
+		return encoder
+	}
+	return m.findColumnEncoder(vt)
+}
+
+func sameEncoderType(a, b variant.Type) bool {
+	if a == b {
+		return true
+	}
+	return (a == variant.TypeInt64 || a == variant.TypeUInt64) &&
+		(b == variant.TypeInt64 || b == variant.TypeUInt64)
 }
 
 // writeStruct uses a two-phase approach to ensure atomic row writes:
@@ -217,7 +243,13 @@ func (m *AdaptColumnEncoder) encodeNonStruct() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := make([]byte, 10+len(data))
+	sz := 10 + len(data)
+	if cap(m.nonStructBuf) < sz {
+		m.nonStructBuf = make([]byte, sz)
+	} else {
+		m.nonStructBuf = m.nonStructBuf[:sz]
+	}
+	b := m.nonStructBuf
 	b[0] = adaptColumnCompressed                              // [0] marker
 	b[1] = 0x01                                               // [1] flags: non-struct
 	binary.LittleEndian.PutUint64(b[2:10], uint64(len(data))) // [2:10] row count
@@ -282,6 +314,7 @@ func (m *AdaptColumnEncoder) encodeStruct() ([]byte, error) {
 }
 
 func (m *AdaptColumnEncoder) Reset() {
+	wasNonStruct := m.isNotStruct
 	m.isNotStruct = false
 	m.length = 0
 	for _, enc := range m.columnEncoders {
@@ -291,8 +324,14 @@ func (m *AdaptColumnEncoder) Reset() {
 	m.columnEncoders = m.columnEncoders[:0]
 	m.columnTypes = m.columnTypes[:0]
 	m.seenColumns = m.seenColumns[:0]
+	if wasNonStruct && m.encoder != nil {
+		m.encoder.Reset()
+		m.spareVT = m.vt
+		m.spareEncoder = m.encoder
+	}
 	m.vt = variant.TypeEmpty
 	m.encoder = nil
+	m.nonStructBuf = m.nonStructBuf[:0]
 }
 
 // AdaptColumnDecoder reconstructs values from the self-describing binary

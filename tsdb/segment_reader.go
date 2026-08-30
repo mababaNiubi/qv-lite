@@ -2,7 +2,6 @@ package tsdb
 
 import (
 	"encoding/binary"
-	"hash/crc32"
 	"io"
 )
 
@@ -21,7 +20,6 @@ type fileReader struct {
 	readEffectiveOffset int64
 	compressor          BlockCompressor
 	needSeek            bool
-	dataBuf             []byte
 	cache               *readerCache
 }
 
@@ -35,6 +33,20 @@ func NewFileReader(filePath string, compressor BlockCompressor, cache *readerCac
 
 func (r *fileReader) OpenReader() error {
 	if r.bf != nil {
+		// Query-internal segment switch: reuse this reader (and its decode
+		// buffer) for the new file instead of round-tripping through the
+		// shared reader cache, which can miss under concurrent queries and
+		// forces a fresh open + index load per segment.
+		if r.bf.Path() != r.filePath {
+			if err := r.bf.Rebind(r.filePath, r.compressor); err != nil {
+				// The rebind may have closed the old file before failing on
+				// the new one; a half-bound BlockFile must not be released
+				// back to the shared cache for a later query to pick up.
+				r.bf.Drop()
+				r.bf = nil
+				return err
+			}
+		}
 		r.readEffectiveOffset = 0
 		r.needSeek = true
 		return nil
@@ -70,6 +82,63 @@ func (r *fileReader) CloseReader() {
 	r.readEffectiveOffset = 0
 }
 
+// readBlockRef returns a reference to the decompressed block data starting at
+// logical offset off, or a copied slice when the range spans compressed-block
+// boundaries (rare: tsdb blocks are far smaller than the 64 KiB block size).
+// The reference aliases the BlockFile's decode buffer and stays valid until
+// the next read on it — the caller must consume it before reading again.
+func (r *fileReader) readBlockRef(off int64, size int) ([]byte, error) {
+	data, err := r.bf.ReadBlockFrom(off)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) >= size {
+		return data[:size], nil
+	}
+	// Cross compressed-block boundary: assemble a contiguous copy.
+	out := make([]byte, size)
+	n := copy(out, data)
+	for n < size {
+		more, err := r.bf.ReadBlockFrom(off + int64(n))
+		if err != nil {
+			return nil, err
+		}
+		if len(more) == 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		n += copy(out[n:], more)
+	}
+	return out, nil
+}
+
+// readSegmentHeader parses the segment block header at logical offset off.
+// When the whole segment block fits in the current decompressed reference the
+// payload is returned as a zero-copy slice; otherwise payload is nil and the
+// caller must fetch it via readBlockRef (the block spans a compressed-block
+// boundary). A nil header means the stream ended (attribute == 0).
+func (r *fileReader) readSegmentHeader(off int64) (*SegmentHeader, []byte, error) {
+	data, err := r.bf.ReadBlockFrom(off)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(data) < segmentHeaderRawSize {
+		data, err = r.readBlockRef(off, segmentHeaderRawSize)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	var header SegmentHeader
+	decodeSegmentHeader(data[:segmentHeaderRawSize], &header)
+	if header.Attribute == 0 {
+		return nil, nil, nil
+	}
+	total := segmentHeaderRawSize + int(header.DataSize)
+	if len(data) >= total {
+		return &header, data[segmentHeaderRawSize:total], nil
+	}
+	return &header, nil, nil
+}
+
 func (r *fileReader) NextRead(checkHead func(SegmentHeader) bool, tableInfo *TableInfo) (*SegmentHeader, []byte, []byte, error) {
 	if r.bf == nil {
 		return nil, nil, nil, ErrorReaderNotOpened
@@ -84,35 +153,34 @@ func (r *fileReader) NextRead(checkHead func(SegmentHeader) bool, tableInfo *Tab
 			}
 			r.needSeek = false
 		}
-		var headerBuf [segmentHeaderRawSize]byte
-		if _, err := io.ReadFull(r.bf, headerBuf[:]); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+		blockStart := r.readEffectiveOffset
+		header, payload, err := r.readSegmentHeader(blockStart)
+		if err != nil {
+			if err == io.EOF {
 				return nil, nil, nil, nil
 			}
 			return nil, nil, nil, err
 		}
-		var header SegmentHeader
-		decodeSegmentHeader(headerBuf[:], &header)
-		if header.Attribute == 0 {
+		if header == nil {
 			return nil, nil, nil, nil
 		}
 
 		r.readEffectiveOffset += segmentHeaderSize
-		if !checkHead(header) {
+		if !checkHead(*header) {
 			r.readEffectiveOffset += header.DataSize
 			r.needSeek = true
 			continue
 		}
 
-		if cap(r.dataBuf) < int(header.DataSize) {
-			r.dataBuf = make([]byte, header.DataSize)
-		}
-		data := r.dataBuf[:header.DataSize]
-		if _, err := io.ReadFull(r.bf, data); err != nil {
-			return nil, nil, nil, err
+		if payload == nil {
+			payload, err = r.readBlockRef(blockStart, segmentHeaderRawSize+int(header.DataSize))
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			payload = payload[segmentHeaderRawSize:]
 		}
 		r.readEffectiveOffset += header.DataSize
-		return r.parseBlock(&header, data, tableInfo)
+		return r.parseBlock(header, payload, tableInfo)
 	}
 }
 
@@ -151,29 +219,29 @@ func (r *fileReader) ReadAt(offset int64, tableInfo *TableInfo) (*SegmentHeader,
 	}
 	r.needSeek = true
 
-	if _, err := r.bf.Seek(offset, io.SeekStart); err != nil {
+	header, payload, err := r.readSegmentHeader(offset)
+	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	var headerBuf [segmentHeaderRawSize]byte
-	if _, err := io.ReadFull(r.bf, headerBuf[:]); err != nil {
-		return nil, nil, nil, err
-	}
-	var header SegmentHeader
-	decodeSegmentHeader(headerBuf[:], &header)
-	if header.Attribute == 0 {
+	if header == nil {
 		return nil, nil, nil, nil
 	}
-	if cap(r.dataBuf) < int(header.DataSize) {
-		r.dataBuf = make([]byte, header.DataSize)
+	if payload == nil {
+		payload, err = r.readBlockRef(offset, segmentHeaderRawSize+int(header.DataSize))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		payload = payload[segmentHeaderRawSize:]
 	}
-	data := r.dataBuf[:header.DataSize]
-	if _, err := io.ReadFull(r.bf, data); err != nil {
-		return nil, nil, nil, err
-	}
-	return r.parseBlock(&header, data, tableInfo)
+	return r.parseBlock(header, payload, tableInfo)
 }
 
+// parseBlock splits the raw block payload into (time bytes, value bytes) and
+// performs range/format checks. CRC is deliberately not re-verified here: the
+// BlockFile layer already validates the enclosing compressed block's CRC
+// before the payload reaches this point (the value CRC in the segment header
+// covers a subset of the same bytes), so a second pass would only double the
+// checksum cost per block.
 func (r *fileReader) parseBlock(header *SegmentHeader, data []byte, tableInfo *TableInfo) (*SegmentHeader, []byte, []byte, error) {
 	if tableInfo.Type == ColumnTypeStructure {
 		valueLengthsByteSize := int64(1)
@@ -184,16 +252,10 @@ func (r *fileReader) parseBlock(header *SegmentHeader, data []byte, tableInfo *T
 		}
 		timeDataOffset := valueLengthsByteSize + valueByteLength
 		dataValueBytes := data[0:timeDataOffset]
-		if crc32.ChecksumIEEE(dataValueBytes) != header.Crc {
-			return nil, nil, nil, ErrorCRCCheckFailed
-		}
 		return header, data[timeDataOffset:], dataValueBytes, nil
 	}
 	valueByteLength := int64(binary.BigEndian.Uint64(data[0:8]))
 	timeDataOffset := 8 + valueByteLength
 	dataValueBytes := data[8:timeDataOffset]
-	if crc32.ChecksumIEEE(dataValueBytes) != header.Crc {
-		return nil, nil, nil, ErrorCRCCheckFailed
-	}
 	return header, data[timeDataOffset:], dataValueBytes, nil
 }

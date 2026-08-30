@@ -52,6 +52,7 @@ func (e *BooleanEncoder) Reset() {
 	e.b = 0
 	e.i = 0
 	e.number = 0
+	e.err = nil
 }
 
 func (e *BooleanEncoder) Write(bv variant.Variant) bool {

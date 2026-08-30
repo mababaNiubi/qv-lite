@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/mababaNiubi/variant"
 )
@@ -29,80 +30,206 @@ type walDataEntry struct {
 	Value       variant.Variant
 }
 
-// walReadBuffer stores WAL entries in chunks.
-// All chunks except the last are flushed (immutable).
-// chunks[last] is the active unflushed chunk where new writes land.
-type walReadBuffer struct {
-	chunks   [][]walDataEntry
-	total    int
-	chunkCap int
+// walDataRun is the prepared unit handed from tableBatcher to the WAL. Points
+// stay in their pooled per-tag buffer; only this small run descriptor is built.
+type walDataRun struct {
+	Key    tagCode
+	Points []rawWritePoint
 }
 
+// Meta allocates tagCode densely from 1, so the normal lookup path can avoid
+// Go map hashing. Codes above this bound retain the map fallback: besides
+// supporting exceptionally large tables, that prevents a corrupt WAL key from
+// forcing an unbounded slice allocation during recovery.
+const maxDenseWALTagCode = tagCode(1 << 20)
+
+type walTagState struct {
+	maxTimestamp int64
+	lastValue    variant.Variant
+	known        bool
+}
+
+type flushEntry struct {
+	tag       tagCode
+	timestamp int64
+	value     variant.Variant
+}
+
+type walReadChunk struct {
+	keys       []tagCode
+	timestamps []int64
+	values     []variant.Variant
+}
+
+// walReadChunkIndex maps a tag to entry positions within one immutable WAL
+// read chunk. It is built lazily on the first read that needs it and kept
+// until the buffer is reset, so repeated queries of a sparse tag skip the
+// per-entry key scan of every chunk. Only full (immutable) chunks are
+// indexed; the active chunk keeps growing and is always scanned directly.
+type walReadChunkIndex map[tagCode][]int32
+
+// maxWALTagIndexBytes caps the total estimated size of per-chunk tag indexes
+// in one read buffer. Beyond it, no new indexes are built and queries fall
+// back to scanning, keeping the read-side memory cost bounded.
+const maxWALTagIndexBytes = 8 << 20
+
+// minIndexedChunkEntries skips indexing tiny chunks where a scan is cheaper
+// than the map overhead.
+const minIndexedChunkEntries = 512
+
+// walReadBuffer is an in-memory, already-decoded read cache for values appended
+// to the WAL. Its struct-of-arrays layout avoids walDataEntry's alignment and
+// write-only EndPosition cost. It also lets a tag query scan compact keys before
+// touching timestamps and Variants. Chunks only bound slice growth; write
+// batching remains owned by tableBatcher.
+type walReadBuffer struct {
+	chunks        []walReadChunk
+	activeChunks  int
+	total         int
+	chunkCap      int
+	hasReferences bool
+
+	// tagIndexes/tagIndexSize are read-path caches (see tagIndex). All access
+	// is guarded by tagIndexMu; the write path never touches them.
+	tagIndexMu   sync.Mutex
+	tagIndexes   []walReadChunkIndex
+	tagIndexSize int
+}
+
+// Keep WAL rotation reuse useful without pinning an entire decoded default
+// (64 MiB) WAL per table. CloseBuffer remains the zero-cache option.
+const maxRetainedWALReadBufferBytes int64 = 12 << 20
+
 func newWalReadBuffer(chunkCap int) *walReadBuffer {
-	return &walReadBuffer{
-		chunkCap: chunkCap,
-		chunks:   [][]walDataEntry{make([]walDataEntry, 0, chunkCap)},
-	}
+	return &walReadBuffer{chunkCap: chunkCap}
 }
 
 func (b *walReadBuffer) append(e walDataEntry) {
-	n := len(b.chunks)
-	if n == 0 || len(b.chunks[n-1]) >= b.chunkCap {
-		b.chunks = append(b.chunks, make([]walDataEntry, 0, b.chunkCap))
+	b.appendValue(e.Key, e.Timestamp, e.Value)
+}
+
+func (b *walReadBuffer) appendValue(key tagCode, timestamp int64, value variant.Variant) {
+	if b.activeChunks == 0 || len(b.chunks[b.activeChunks-1].keys) >= b.chunkCap {
+		if b.activeChunks == len(b.chunks) {
+			b.chunks = append(b.chunks, walReadChunk{
+				keys:       make([]tagCode, 0, b.chunkCap),
+				timestamps: make([]int64, 0, b.chunkCap),
+				values:     make([]variant.Variant, 0, b.chunkCap),
+			})
+		}
+		b.activeChunks++
 	}
-	b.chunks[len(b.chunks)-1] = append(b.chunks[len(b.chunks)-1], e)
+	chunk := &b.chunks[b.activeChunks-1]
+	chunk.keys = append(chunk.keys, key)
+	chunk.timestamps = append(chunk.timestamps, timestamp)
+	chunk.values = append(chunk.values, value)
+	if !b.hasReferences {
+		switch value.Type() {
+		case variant.TypeString, variant.TypeList, variant.TypeMap:
+			b.hasReferences = true
+		}
+	}
 	b.total++
 }
 
-func (b *walReadBuffer) forEach(fn func(entry walDataEntry) bool) {
-	for _, chunk := range b.chunks {
-		for i := range chunk {
-			if !fn(chunk[i]) {
-				return
+// tagIndex returns the lazy tag→positions index for the immutable chunk at c,
+// building it from the caller's snapshot of the chunk's keys (the caller
+// passes its own copy, so the build never touches write-path state). Returns
+// nil for chunks below the size threshold or when the byte budget is spent —
+// callers then scan the chunk directly. Positions are valid within the
+// caller's snapshot of the chunk, which is immutable once full.
+func (b *walReadBuffer) tagIndex(c int, keys []tagCode) walReadChunkIndex {
+	b.tagIndexMu.Lock()
+	defer b.tagIndexMu.Unlock()
+	if c < len(b.tagIndexes) && b.tagIndexes[c] != nil {
+		return b.tagIndexes[c]
+	}
+	if len(keys) < minIndexedChunkEntries || b.tagIndexSize >= maxWALTagIndexBytes {
+		return nil
+	}
+	// No map prealloc: a chunk with few distinct tags (the common case) keeps
+	// a tiny map, while high-cardinality chunks grow geometrically. A large
+	// fixed hint would waste ~4KB per chunk for single-tag buffers.
+	idx := make(map[tagCode][]int32)
+	for j, key := range keys {
+		idx[key] = append(idx[key], int32(j))
+	}
+	for len(b.tagIndexes) <= c {
+		b.tagIndexes = append(b.tagIndexes, nil)
+	}
+	b.tagIndexes[c] = idx
+	// Rough estimate: map entry overhead plus 4 bytes per position.
+	b.tagIndexSize += len(idx)*56 + len(keys)*4
+	return idx
+}
+
+// resetForReuse releases values that may own heap data and keeps a bounded
+// prefix of fixed-size struct-of-arrays chunks for the next WAL rotation.
+func (b *walReadBuffer) resetForReuse(maxRetainedBytes int64) {
+	b.tagIndexMu.Lock()
+	clear(b.tagIndexes)
+	b.tagIndexes = nil
+	b.tagIndexSize = 0
+	b.tagIndexMu.Unlock()
+	for i := 0; i < b.activeChunks; i++ {
+		chunk := &b.chunks[i]
+		if b.hasReferences {
+			clear(chunk.values)
+		}
+		chunk.keys = chunk.keys[:0]
+		chunk.timestamps = chunk.timestamps[:0]
+		chunk.values = chunk.values[:0]
+	}
+	chunkBytes := int64(b.chunkCap) * int64(unsafe.Sizeof(tagCode(0))+unsafe.Sizeof(int64(0))+unsafe.Sizeof(variant.Variant{}))
+	maxChunks := 0
+	if chunkBytes > 0 && maxRetainedBytes > 0 {
+		maxChunks = min(len(b.chunks), int(maxRetainedBytes/chunkBytes))
+	}
+	for i := maxChunks; i < len(b.chunks); i++ {
+		b.chunks[i] = walReadChunk{}
+	}
+	b.chunks = b.chunks[:maxChunks:maxChunks]
+	b.activeChunks = 0
+	b.total = 0
+	b.hasReferences = false
+}
+
+func (b *walReadBuffer) forEach(fn func(key tagCode, timestamp int64, value variant.Variant) bool) bool {
+	for i := 0; i < b.activeChunks; i++ {
+		chunk := &b.chunks[i]
+		for j := range chunk.keys {
+			if !fn(chunk.keys[j], chunk.timestamps[j], chunk.values[j]) {
+				return false
 			}
 		}
 	}
-}
-
-func (b *walReadBuffer) unflushedCount() int {
-	return len(b.chunks[len(b.chunks)-1])
-}
-
-// sortedChunk reports whether chunk is already ordered by (Key, Timestamp).
-// Cheap adjacent check; the common single-tag stream short-circuits here.
-func sortedChunk(chunk []walDataEntry) bool {
-	for i := 1; i < len(chunk); i++ {
-		ci, pi := &chunk[i], &chunk[i-1]
-		if ci.Key < pi.Key || (ci.Key == pi.Key && ci.Timestamp < pi.Timestamp) {
-			return false
-		}
-	}
 	return true
 }
 
-// perTagMonotonic reports whether every tag's timestamps in chunk are
-// non-decreasing (i.e. the data is in-order per tag, even if interleaved).
-// This is the invariant that matters for encoding correctness and for keeping
-// out-of-order points: a full reorder is unnecessary when it holds.
-func perTagMonotonic(chunk []walDataEntry) bool {
-	if len(chunk) < 2 {
-		return true
-	}
-	lastTs := make(map[tagCode]int64, 8)
-	for i := range chunk {
-		e := &chunk[i]
-		if prev, ok := lastTs[e.Key]; ok && e.Timestamp < prev {
-			return false
+func (b *walReadBuffer) appendMatching(dst []Point, tag tagCode, startTime, endTime int64) []Point {
+	for i := 0; i < b.activeChunks; i++ {
+		chunk := &b.chunks[i]
+		for j, key := range chunk.keys {
+			if key != tag {
+				continue
+			}
+			timestamp := chunk.timestamps[j]
+			if timestamp >= startTime && timestamp <= endTime {
+				dst = append(dst, Point{Tms: timestamp, V: chunk.values[j]})
+			}
 		}
-		lastTs[e.Key] = e.Timestamp
 	}
-	return true
+	return dst
 }
 
 type walFileEnty struct {
 	fileName   string
 	length     int64
 	readBuffer *walReadBuffer
+	// needsSort records that this file retained a timestamp older than the
+	// previously accepted timestamp for the same tag. Ordered files can be
+	// streamed directly into segment encoders without a flush-time copy/sort.
+	needsSort bool
 }
 
 // WalFile is the File-like interface for the write-ahead log cache.
@@ -110,16 +237,15 @@ type WalFile interface {
 	updateWalConfig(walConfig WalConfig)
 	Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error)
 	WriteBatch(entries []walDataEntry) (int, error)
+	WriteRuns(runs []walDataRun) (int, error)
 	ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error)
+	snapshotTagTime() walTagSnapshot
 	GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool)
 	SetLastPoint(key tagCode, ts int64, value variant.Variant)
 	NeedFlush() bool
 	FlushPending() error
-	// SetPreFlush registers a hook invoked before any WAL bytes are written to
-	// the OS. It is used to persist tag metadata ahead of the points that
-	// reference those tags (durability ordering: codes before data).
-	SetPreFlush(fn func() error)
-	forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
+	completeFileState() (count int, needsSort bool)
+	forEachCompleteFile(limit int, fc func(fileIndex int, tag tagCode, timestamp int64, value variant.Variant, offset int64) bool) (int, error)
 	retainWalFilePrefix(index int, truncateSize int64) error
 	truncate(n int)
 	removeOrphanedFiles()
@@ -129,8 +255,11 @@ type WalFile interface {
 type walFile struct {
 	mutex           sync.Mutex
 	walFiles        []walFileEnty
+	spareReadBuffer *walReadBuffer
+	tagStates       []walTagState
 	tagMaxTimestamp map[tagCode]int64
 	tagLastValue    map[tagCode]variant.Variant
+	tagStateCount   int
 
 	writeFile   *os.File
 	writeBuffer *bufio.Writer
@@ -139,7 +268,7 @@ type walFile struct {
 	dedupWindowMs int64
 	minIntervalMs int64
 	config        WalConfig
-	preFlush      func() error // durability hook: persist tag metadata before WAL bytes reach the OS
+	policyEntries []walDataEntry
 }
 
 func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig WalConfig) (WalFile, error) {
@@ -159,6 +288,8 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 		_ = createF.Close()
 	}
 	walFiles := make([]walFileEnty, len(tms))
+	tagMaxTimestamp := make(map[tagCode]int64)
+	tagLastValue := make(map[tagCode]variant.Variant)
 	for i, t := range tms {
 		walFiles[i].fileName = filepath.Join(filePath, strconv.FormatInt(t, 10)+".wal")
 		walFiles[i].readBuffer, walFiles[i].length, err = getAllData(walFiles[i].fileName, walConfig.MaxBufferBatchSize)
@@ -168,23 +299,20 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 				return nil, err
 			}
 		}
-		if walConfig.CloseBuffer {
-			walFiles[i].readBuffer = newWalReadBuffer(walConfig.MaxBufferBatchSize)
-		}
-	}
-	lastRB := walFiles[len(walFiles)-1].readBuffer
-	lastRB.chunks = append(lastRB.chunks, make([]walDataEntry, 0, walConfig.MaxBufferBatchSize))
-
-	tagMaxTimestamp := make(map[tagCode]int64)
-	tagLastValue := make(map[tagCode]variant.Variant)
-	for i := range walFiles {
-		walFiles[i].readBuffer.forEach(func(entry walDataEntry) bool {
-			if maxTs, ok := tagMaxTimestamp[entry.Key]; !ok || entry.Timestamp > maxTs {
-				tagMaxTimestamp[entry.Key] = entry.Timestamp
-				tagLastValue[entry.Key] = entry.Value
+		walFiles[i].readBuffer.forEach(func(key tagCode, timestamp int64, value variant.Variant) bool {
+			maxTs, ok := tagMaxTimestamp[key]
+			if ok && timestamp < maxTs {
+				walFiles[i].needsSort = true
+			}
+			if !ok || timestamp > maxTs {
+				tagMaxTimestamp[key] = timestamp
+				tagLastValue[key] = value
 			}
 			return true
 		})
+		if walConfig.CloseBuffer {
+			walFiles[i].readBuffer = newWalReadBuffer(walConfig.MaxBufferBatchSize)
+		}
 	}
 
 	file, err := os.OpenFile(walFiles[len(walFiles)-1].fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
@@ -203,265 +331,300 @@ func NewWalFile(dirPath string, dedupWindowMs, minIntervalMs int64, walConfig Wa
 		minIntervalMs:   minIntervalMs,
 		config:          walConfig,
 	}
+	// Move normal dense codes out of the recovery maps once. Subsequent grouped
+	// batches use direct indexed state reads and writes.
+	for key, maxTs := range tagMaxTimestamp {
+		if key > maxDenseWALTagCode {
+			continue
+		}
+		wls.storeTagState(key, maxTs, tagLastValue[key])
+		delete(tagMaxTimestamp, key)
+		delete(tagLastValue, key)
+	}
+	wls.tagStateCount += len(tagMaxTimestamp)
 	return wls, err
+}
+
+func (ws *walFile) loadTagState(key tagCode) (int64, variant.Variant, bool) {
+	if key <= maxDenseWALTagCode {
+		index := int(key)
+		if index < len(ws.tagStates) {
+			state := &ws.tagStates[index]
+			if state.known {
+				return state.maxTimestamp, state.lastValue, true
+			}
+		}
+	}
+	maxTs, ok := ws.tagMaxTimestamp[key]
+	if !ok {
+		return 0, variant.Variant{}, false
+	}
+	return maxTs, ws.tagLastValue[key], true
+}
+
+func (ws *walFile) storeTagState(key tagCode, maxTs int64, lastValue variant.Variant) {
+	if key <= maxDenseWALTagCode {
+		index := int(key)
+		known := index < len(ws.tagStates) && ws.tagStates[index].known
+		if index >= len(ws.tagStates) {
+			newLength := len(ws.tagStates) * 2
+			if newLength < 64 {
+				newLength = 64
+			}
+			for newLength <= index {
+				newLength *= 2
+			}
+			limit := int(maxDenseWALTagCode) + 1
+			if newLength > limit {
+				newLength = limit
+			}
+			states := make([]walTagState, newLength)
+			copy(states, ws.tagStates)
+			ws.tagStates = states
+		}
+		ws.tagStates[index] = walTagState{
+			maxTimestamp: maxTs,
+			lastValue:    lastValue,
+			known:        true,
+		}
+		if !known {
+			ws.tagStateCount++
+		}
+		return
+	}
+	if ws.tagMaxTimestamp == nil {
+		ws.tagMaxTimestamp = make(map[tagCode]int64)
+		ws.tagLastValue = make(map[tagCode]variant.Variant)
+	}
+	if _, known := ws.tagMaxTimestamp[key]; !known {
+		ws.tagStateCount++
+	}
+	ws.tagMaxTimestamp[key] = maxTs
+	ws.tagLastValue[key] = lastValue
 }
 
 func (s *walFile) updateWalConfig(walConfig WalConfig) {
 	walConfig.setDefaultValues()
-	s.config = walConfig
-}
-
-// SetPreFlush registers the durability hook invoked before WAL bytes reach the
-// OS (see flushPending).
-func (s *walFile) SetPreFlush(fn func() error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	s.preFlush = fn
+	s.config = walConfig
+	if walConfig.CloseBuffer || (s.spareReadBuffer != nil && s.spareReadBuffer.chunkCap != walConfig.MaxBufferBatchSize) {
+		s.spareReadBuffer = nil
+	}
 }
 
 func (ws *walFile) Write(key tagCode, timestamp int64, value variant.Variant) (bool, int, error) {
-	if ws.writeFile == nil || ws.writeBuffer == nil {
-		return false, 0, ErrorWALClose
-	}
-
+	entry := []walDataEntry{{Key: key, Timestamp: timestamp, Value: value}}
+	written, err := ws.WriteBatch(entry)
 	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
-
 	fileIndex := len(ws.walFiles) - 1
-	if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
-		return false, 0, ErrorWALCacheFull
-	}
-
-	if ws.config.CloseBuffer {
-		// Immediate write: require monotonic timestamps, write directly to disk.
-		maxTimestamp, ok := ws.tagMaxTimestamp[key]
-		if ok && timestamp < maxTimestamp {
-			return false, 0, ErrorWALClose
-		}
-		if ws.skipDedup(key, timestamp, value) {
-			return false, 0, nil
-		}
-
-		buf, dataLen, err := appendSerialized(nil, key, timestamp, value)
-		if err != nil {
-			return false, 0, err
-		}
-		if _, err = ws.writeBuffer.Write(buf); err != nil {
-			return false, 0, err
-		}
-
-		ent := &ws.walFiles[fileIndex]
-		ent.length += dataLen
-		ws.tagMaxTimestamp[key] = timestamp
-		ws.tagLastValue[key] = value
-
-		if err := ws.rotateIfFull(); err != nil {
-			return false, 0, err
-		}
-		return true, fileIndex, nil
-	}
-
-	ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
-		Key:       key,
-		Timestamp: timestamp,
-		Value:     value,
-	})
-	// Batched mode: buffer in memory, flush when threshold reached.
-	if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
-		if err := ws.flushPending(); err != nil {
-			return false, 0, err
-		}
-		fileIndex = len(ws.walFiles) - 1
-	}
-
-	return true, fileIndex, nil
+	ws.mutex.Unlock()
+	return written == 1, fileIndex, err
 }
 
-// WriteBatch writes multiple entries under a single mutex lock, reducing lock
-// contention compared to calling Write repeatedly.
+// WriteBatch appends a prepared batch directly to the physical WAL. The caller
+// guarantees one contiguous, timestamp-ordered run per tag; runs do not need
+// to be ordered by tagCode. tableBatcher owns buffering, tag resolution and
+// batch-internal sorting.
 func (ws *walFile) WriteBatch(entries []walDataEntry) (int, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+	return ws.writeBatchLocked(entries)
+}
+
+func (ws *walFile) writeBatchLocked(entries []walDataEntry) (int, error) {
 	if ws.writeFile == nil || ws.writeBuffer == nil {
 		return 0, ErrorWALClose
 	}
-
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
-
-	results := 0
-	fileIndex := len(ws.walFiles) - 1
-
-	if ws.config.CloseBuffer {
-		sort.Slice(entries, func(i, j int) bool {
-			if entries[i].Key != entries[j].Key {
-				return entries[i].Key < entries[j].Key
-			}
-			return entries[i].Timestamp < entries[j].Timestamp
-		})
-		for i := range entries {
-			e := &entries[i]
-			if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
-				return results, ErrorWALCacheFull
-			}
-			maxTimestamp, ok := ws.tagMaxTimestamp[e.Key]
-			if ok && e.Timestamp < maxTimestamp {
-				continue
-			}
-			if ws.skipDedup(e.Key, e.Timestamp, e.Value) {
-				continue
-			}
-			buf, dataLen, err := appendSerialized(nil, e.Key, e.Timestamp, e.Value)
-			if err != nil {
-				return results, err
-			}
-			if _, err = ws.writeBuffer.Write(buf); err != nil {
-				return results, err
-			}
-			ent := &ws.walFiles[fileIndex]
-			ent.length += dataLen
-			ws.tagMaxTimestamp[e.Key] = e.Timestamp
-			ws.tagLastValue[e.Key] = e.Value
-			if err := ws.rotateIfFull(); err != nil {
-				return results, err
-			}
-			fileIndex = len(ws.walFiles) - 1
-			results++
-		}
-		return results, nil
+	if len(entries) == 0 {
+		return 0, nil
 	}
 
-	// Buffered mode: append all entries, flushing when threshold is reached.
-	for i := range entries {
-		e := &entries[i]
-		if ws.config.MaxFileNumber > 0 && ws.walFiles[fileIndex].length >= ws.config.MaxFileSize && len(ws.walFiles) >= ws.config.MaxFileNumber {
-			return results, ErrorWALCacheFull
-		}
-		ws.walFiles[fileIndex].readBuffer.append(walDataEntry{
-			Key:       e.Key,
-			Timestamp: e.Timestamp,
-			Value:     e.Value,
-		})
-		if ws.walFiles[fileIndex].readBuffer.unflushedCount() >= ws.config.MaxBufferBatchSize {
-			if err := ws.flushPending(); err != nil {
-				return results, err
-			}
-			fileIndex = len(ws.walFiles) - 1
-		}
-		results++
-	}
-	return results, nil
-}
-
-// flushPending sorts the last chunk by (Key, Timestamp), batch-writes
-// all entries to the physical WAL file, then promotes the chunk to flushed.
-// Must be called with ws.mutex held.
-func (ws *walFile) flushPending() error {
 	fileIndex := len(ws.walFiles) - 1
+	if ws.config.MaxFileNumber > 0 &&
+		ws.walFiles[fileIndex].length >= ws.config.MaxFileSize &&
+		len(ws.walFiles) >= ws.config.MaxFileNumber {
+		return 0, ErrorWALCacheFull
+	}
+
 	ent := &ws.walFiles[fileIndex]
-	rb := ent.readBuffer
-	chunkIdx := len(rb.chunks) - 1
-	chunk := rb.chunks[chunkIdx]
-
-	if len(chunk) == 0 {
-		return nil
+	startLength := ent.length
+	for i := range entries {
+		entries[i].EndPosition = 0
 	}
-
-	// Durability ordering: persist tag metadata before this batch's bytes can
-	// reach the OS. Tag codes must be durable ahead of the points referencing
-	// them so a crash can never orphan a code and have it reused for another tag.
-	if ws.preFlush != nil {
-		if err := ws.preFlush(); err != nil {
-			return err
-		}
-	}
-
-	// Sort + dedup + serialize into a single batch buffer, advancing ent.length
-	// and setting each kept entry's EndPosition.
 	batchPtr := batchWritePool.Get().(*[]byte)
 	batchBuf := (*batchPtr)[:0]
+	defer func() {
+		*batchPtr = batchBuf[:0]
+		batchWritePool.Put(batchPtr)
+	}()
+	newLength := startLength
 	var err error
-	batchBuf, ent.length, err = ws.processDedupChunk(chunk, batchBuf, ent.length)
+	batchBuf, newLength, err = ws.dedupRuns(entries, batchBuf, startLength, &ent.needsSort)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if len(batchBuf) > 0 {
 		if _, err := ws.writeBuffer.Write(batchBuf); err != nil {
-			return err
+			return 0, err
+		}
+		if err := ws.writeBuffer.Flush(); err != nil {
+			return 0, err
 		}
 	}
-	*batchPtr = batchBuf[:0]
-	batchWritePool.Put(batchPtr)
 
-	if ws.config.CloseBuffer {
-		rb.chunks[chunkIdx] = rb.chunks[chunkIdx][:0]
-	} else {
-		rb.chunks = append(rb.chunks, make([]walDataEntry, 0, ws.config.MaxBufferBatchSize))
+	ent.length = newLength
+	written := 0
+	for i := range entries {
+		if entries[i].EndPosition <= startLength {
+			continue
+		}
+		written++
+		if !ws.config.CloseBuffer {
+			ent.readBuffer.append(entries[i])
+		}
 	}
-
-	return ws.rotateIfFull()
+	if err := ws.rotateIfFull(); err != nil {
+		return written, err
+	}
+	return written, nil
 }
 
-// processDedupChunk sorts (only when needed), dedups, and serializes a chunk
-// into batchBuf, returning the updated batch and the running WAL byte length.
-// Each kept entry's EndPosition is set. Must be called with ws.mutex held.
-//
-// The map-heavy dedup bookkeeping is batched instead of written per entry:
-// sorted chunks (each tag's entries contiguous) write the global max/last maps
-// once per tag run; interleaved-but-monotonic chunks accumulate in a pooled
-// local map merged once per chunk.
-func (ws *walFile) processDedupChunk(chunk []walDataEntry, batchBuf []byte, length int64) ([]byte, int64, error) {
-	// Ordering. A full (Key, Timestamp) reorder is only needed to retain
-	// genuinely out-of-order points (they would otherwise be dropped by
-	// dedup). The WAL file does not need per-tag grouping: columns accumulate
-	// independently during segment flush, and ReadByTime sorts its results.
-	// So when every tag's timestamps are already monotonic - the common
-	// in-order case - the expensive sort is skipped entirely.
-	sorted := sortedChunk(chunk)
-	if !sorted && !perTagMonotonic(chunk) {
-		sort.Slice(chunk, func(i, j int) bool {
-			if chunk[i].Key != chunk[j].Key {
-				return chunk[i].Key < chunk[j].Key
+// WriteRuns is the tableBatcher fast path. With no sampling/dedup policy (the
+// normal configuration), every prepared point is accepted, so the WAL can
+// serialize pooled tag runs directly and append them to the decoded read cache
+// after the file write succeeds. Explicit policies retain WriteBatch's exact
+// filtering semantics through a reusable compatibility buffer.
+func (ws *walFile) WriteRuns(runs []walDataRun) (int, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
+	if len(runs) == 0 {
+		return 0, nil
+	}
+	if ws.minIntervalMs > 0 || ws.dedupWindowMs > 0 {
+		entries := ws.policyEntries[:0]
+		for i := range runs {
+			run := &runs[i]
+			for j := range run.Points {
+				point := &run.Points[j]
+				entries = append(entries, walDataEntry{Key: run.Key, Timestamp: point.timestamp, Value: point.value})
 			}
-			return chunk[i].Timestamp < chunk[j].Timestamp
-		})
-		sorted = true
+		}
+		written, err := ws.writeBatchLocked(entries)
+		clear(entries)
+		ws.policyEntries = entries[:0]
+		return written, err
+	}
+	if ws.writeFile == nil || ws.writeBuffer == nil {
+		return 0, ErrorWALClose
 	}
 
-	if sorted {
-		return ws.dedupRuns(chunk, batchBuf, length)
+	fileIndex := len(ws.walFiles) - 1
+	if ws.config.MaxFileNumber > 0 &&
+		ws.walFiles[fileIndex].length >= ws.config.MaxFileSize &&
+		len(ws.walFiles) >= ws.config.MaxFileNumber {
+		return 0, ErrorWALCacheFull
 	}
-	return ws.dedupPerEntry(chunk, batchBuf, length)
+
+	ent := &ws.walFiles[fileIndex]
+	startLength := ent.length
+	batchPtr := batchWritePool.Get().(*[]byte)
+	batchBuf := (*batchPtr)[:0]
+	defer func() {
+		*batchPtr = batchBuf[:0]
+		batchWritePool.Put(batchPtr)
+	}()
+
+	newLength := startLength
+	written := 0
+	for i := range runs {
+		run := &runs[i]
+		maxTimestamp, lastValue, known := ws.loadTagState(run.Key)
+		for j := range run.Points {
+			point := &run.Points[j]
+			var dataLen int64
+			var err error
+			batchBuf, dataLen, err = appendSerialized(batchBuf, run.Key, point.timestamp, point.value)
+			if err != nil {
+				return 0, err
+			}
+			newLength += dataLen
+			written++
+			if known && point.timestamp < maxTimestamp {
+				ent.needsSort = true
+			}
+			if !known || point.timestamp >= maxTimestamp {
+				maxTimestamp, lastValue, known = point.timestamp, point.value, true
+			}
+		}
+		if known {
+			ws.storeTagState(run.Key, maxTimestamp, lastValue)
+		}
+	}
+
+	if len(batchBuf) > 0 {
+		if _, err := ws.writeBuffer.Write(batchBuf); err != nil {
+			return 0, err
+		}
+		if err := ws.writeBuffer.Flush(); err != nil {
+			return 0, err
+		}
+	}
+	ent.length = newLength
+	if !ws.config.CloseBuffer {
+		for i := range runs {
+			run := &runs[i]
+			for j := range run.Points {
+				point := &run.Points[j]
+				ent.readBuffer.appendValue(run.Key, point.timestamp, point.value)
+			}
+		}
+	}
+	if err := ws.rotateIfFull(); err != nil {
+		return written, err
+	}
+	return written, nil
 }
 
-// dedupRuns is the fast path for sorted chunks: each tag occupies a contiguous
-// run, so the running (maxTimestamp, lastValue) lives in locals and the global
-// maps are written once per run instead of once per entry.
-func (ws *walFile) dedupRuns(chunk []walDataEntry, batchBuf []byte, length int64) ([]byte, int64, error) {
-	curKey := tagCode(^uint32(0))
+// dedupRuns processes the prepared shape directly: each tag occupies one
+// contiguous timestamp-ordered run. Tag-code order itself is not required, so
+// the running (maxTimestamp, lastValue) lives in locals and global state is
+// written once per run instead of once per entry. Must be called with ws.mutex
+// held.
+func (ws *walFile) dedupRuns(chunk []walDataEntry, batchBuf []byte, length int64, needsSort *bool) ([]byte, int64, error) {
+	var curKey tagCode
 	var curMax int64
 	var curLast variant.Variant
 	prevKnown := false
+	haveRun := false
 	for i := range chunk {
 		e := &chunk[i]
-		if e.Key != curKey {
-			// Publish the previous run's final (max, last) to the global maps.
-			if i > 0 {
-				ws.tagMaxTimestamp[curKey] = curMax
-				ws.tagLastValue[curKey] = curLast
+		if !haveRun || e.Key != curKey {
+			// Publish the previous run's final state once.
+			if haveRun {
+				ws.storeTagState(curKey, curMax, curLast)
 			}
 			curKey = e.Key
-			curMax, prevKnown = ws.tagMaxTimestamp[curKey]
-			curLast = ws.tagLastValue[curKey]
+			curMax, curLast, prevKnown = ws.loadTagState(curKey)
+			haveRun = true
 		}
 		if prevKnown {
 			if e.Timestamp < curMax {
-				continue
-			}
-			if ws.minIntervalMs > 0 && e.Timestamp-curMax < ws.minIntervalMs {
-				continue
-			}
-			if ws.dedupWindowMs > 0 && e.Timestamp-curMax <= ws.dedupWindowMs && curLast.IsEqual(e.Value) {
-				continue
+				// With no sampling/dedup policy configured, retain late data.
+				// Mark the file so only this uncommon case pays for a global
+				// flush-time reorder. Under an explicit policy, preserve the
+				// historical behavior and reject older points.
+				if ws.minIntervalMs > 0 || ws.dedupWindowMs > 0 {
+					continue
+				}
+			} else {
+				if ws.minIntervalMs > 0 && e.Timestamp-curMax < ws.minIntervalMs {
+					continue
+				}
+				if ws.dedupWindowMs > 0 && e.Timestamp-curMax <= ws.dedupWindowMs && curLast.IsEqual(e.Value) {
+					continue
+				}
 			}
 		}
 		var dataLen int64
@@ -472,36 +635,15 @@ func (ws *walFile) dedupRuns(chunk []walDataEntry, batchBuf []byte, length int64
 		}
 		length += dataLen
 		e.EndPosition = length
-		curMax, curLast, prevKnown = e.Timestamp, e.Value, true
-	}
-	if len(chunk) > 0 {
-		ws.tagMaxTimestamp[curKey] = curMax
-		ws.tagLastValue[curKey] = curLast
-	}
-	return batchBuf, length, nil
-}
-
-// dedupPerEntry handles interleaved-but-per-tag-monotonic chunks (the no-sort,
-// high-cardinality case). A per-entry shared-map loop, matching the pre-P1
-// behavior: a local-accumulator variant was measured 1.5-2.3× slower because
-// its per-entry local map bookkeeping cost at least as much as the shared-map
-// writes it replaced.
-func (ws *walFile) dedupPerEntry(chunk []walDataEntry, batchBuf []byte, length int64) ([]byte, int64, error) {
-	for i := range chunk {
-		e := &chunk[i]
-		if ws.skipDedup(e.Key, e.Timestamp, e.Value) {
-			continue
+		if prevKnown && e.Timestamp < curMax && needsSort != nil {
+			*needsSort = true
 		}
-		var dataLen int64
-		var err error
-		batchBuf, dataLen, err = appendSerialized(batchBuf, e.Key, e.Timestamp, e.Value)
-		if err != nil {
-			return batchBuf, length, err
+		if !prevKnown || e.Timestamp >= curMax {
+			curMax, curLast, prevKnown = e.Timestamp, e.Value, true
 		}
-		length += dataLen
-		e.EndPosition = length
-		ws.tagMaxTimestamp[e.Key] = e.Timestamp
-		ws.tagLastValue[e.Key] = e.Value
+	}
+	if haveRun {
+		ws.storeTagState(curKey, curMax, curLast)
 	}
 	return batchBuf, length, nil
 }
@@ -525,27 +667,6 @@ func appendSerialized(dst []byte, key tagCode, timestamp int64, value variant.Va
 	return dst, int64(4 + totalDataLen), nil
 }
 
-// skipDedup returns true if the entry should be skipped due to minIntervalMs
-// or dedupWindowMs. For normal (batched) mode, only checks when ts >= prevTs.
-func (ws *walFile) skipDedup(key tagCode, ts int64, value variant.Variant) bool {
-	prevTs, ok := ws.tagMaxTimestamp[key]
-	if !ok {
-		return false
-	}
-	if ts < prevTs {
-		return true
-	}
-	if ws.minIntervalMs > 0 && ts-prevTs < ws.minIntervalMs {
-		return true
-	}
-	if ws.dedupWindowMs > 0 && ts-prevTs <= ws.dedupWindowMs {
-		if prevVal, ok := ws.tagLastValue[key]; ok && prevVal.IsEqual(value) {
-			return true
-		}
-	}
-	return false
-}
-
 // rotateIfFull flushes and rotates the WAL file when the size threshold is reached.
 func (ws *walFile) rotateIfFull() error {
 	fileIndex := len(ws.walFiles) - 1
@@ -553,11 +674,28 @@ func (ws *walFile) rotateIfFull() error {
 		if err := ws.writeBuffer.Flush(); err != nil {
 			return err
 		}
+		// Keep the full last file in place when the configured file limit has
+		// been reached. The next batch receives ErrorWALCacheFull, allowing the
+		// table to drain complete files before retrying without exceeding the
+		// configured bound.
+		if ws.config.MaxFileNumber > 0 && len(ws.walFiles) >= ws.config.MaxFileNumber {
+			return nil
+		}
 		if err := ws.addWalFile(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// flushPending only flushes bytes already accepted by WriteBatch. WAL no
+// longer owns an active accumulation chunk; tableBatcher is the sole batching
+// layer.
+func (ws *walFile) flushPending() error {
+	if ws.writeBuffer == nil {
+		return ErrorWALClose
+	}
+	return ws.writeBuffer.Flush()
 }
 
 func (ws *walFile) FlushPending() error {
@@ -570,18 +708,19 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 
-	maxTs, ok := ws.tagMaxTimestamp[key]
-	maxVal := ws.tagLastValue[key]
+	maxTs, maxVal, ok := ws.loadTagState(key)
 
 	// Also scan the unflushed last chunk for newer data.
 	fileIndex := len(ws.walFiles) - 1
-	lastChunk := ws.walFiles[fileIndex].readBuffer.chunks[len(ws.walFiles[fileIndex].readBuffer.chunks)-1]
-	for i := range lastChunk {
-		e := &lastChunk[i]
-		if e.Key == key && e.Timestamp >= maxTs {
-			maxTs = e.Timestamp
-			maxVal = e.Value
-			ok = true
+	readBuffer := ws.walFiles[fileIndex].readBuffer
+	if readBuffer.activeChunks > 0 {
+		lastChunk := &readBuffer.chunks[readBuffer.activeChunks-1]
+		for i, entryKey := range lastChunk.keys {
+			if entryKey == key && lastChunk.timestamps[i] >= maxTs {
+				maxTs = lastChunk.timestamps[i]
+				maxVal = lastChunk.values[i]
+				ok = true
+			}
 		}
 	}
 
@@ -594,9 +733,8 @@ func (ws *walFile) GetTagMaxTimestamp(key tagCode) (int64, variant.Variant, bool
 func (ws *walFile) SetLastPoint(key tagCode, ts int64, value variant.Variant) {
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
-	if lp, ok := ws.tagMaxTimestamp[key]; !ok || ts > lp {
-		ws.tagMaxTimestamp[key] = ts
-		ws.tagLastValue[key] = value
+	if lp, _, ok := ws.loadTagState(key); !ok || ts > lp {
+		ws.storeTagState(key, ts, value)
 	}
 }
 
@@ -620,10 +758,16 @@ func (ws *walFile) addWalFile() error {
 	if err != nil {
 		return err
 	}
+	readBuffer := ws.spareReadBuffer
+	if readBuffer == nil || readBuffer.chunkCap != ws.config.MaxBufferBatchSize {
+		readBuffer = newWalReadBuffer(ws.config.MaxBufferBatchSize)
+	} else {
+		ws.spareReadBuffer = nil
+	}
 	ws.walFiles = append(ws.walFiles, walFileEnty{
 		fileName:   fileName,
 		length:     0,
-		readBuffer: newWalReadBuffer(ws.config.MaxBufferBatchSize),
+		readBuffer: readBuffer,
 	})
 	ws.writeFile = file
 	ws.writeBuffer.Reset(file)
@@ -631,41 +775,38 @@ func (ws *walFile) addWalFile() error {
 }
 
 func (ws *walFile) NeedFlush() bool {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	return len(ws.walFiles) > 1
 }
 
 func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Point, error) {
+	ws.mutex.Lock()
+	defer ws.mutex.Unlock()
 	if ws.config.CloseBuffer && len(ws.walFiles) > 0 {
-		ws.mutex.Lock()
 		_ = ws.flushPending()
 		if ws.writeBuffer != nil {
 			_ = ws.writeBuffer.Flush()
 		}
-		ws.mutex.Unlock()
 	}
-
-	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
 	estCap := 512
 	if !ws.config.CloseBuffer {
 		total := 0
 		for i := range ws.walFiles {
 			total += ws.walFiles[i].readBuffer.total
 		}
-		if total > estCap {
-			estCap = total
+		if ws.tagStateCount > 0 {
+			perTag := total / ws.tagStateCount
+			if perTag > estCap {
+				estCap = perTag
+			}
 		}
 	}
 	var err error
 	entries := make([]Point, 0, estCap)
 	for i := range ws.walFiles {
 		if !ws.config.CloseBuffer {
-			ws.walFiles[i].readBuffer.forEach(func(p walDataEntry) bool {
-				if p.Key == tag && p.Timestamp >= starTime && p.Timestamp <= endTime {
-					entries = append(entries, Point{Tms: p.Timestamp, V: p.Value})
-				}
-				return true
-			})
+			entries = ws.walFiles[i].readBuffer.appendMatching(entries, tag, starTime, endTime)
 		} else {
 			err = forEachWalFile(ws.walFiles[i].fileName, func(key tagCode, timestamp int64, value variant.Variant, offset int64) bool {
 				if key == tag && timestamp >= starTime && timestamp <= endTime {
@@ -681,23 +822,55 @@ func (ws *walFile) ReadByTime(tag tagCode, starTime int64, endTime int64) ([]Poi
 	return entries, err
 }
 
-func (ws *walFile) forEachCompleteFile(fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
+// completeFileState snapshots the number of immutable WAL files and whether
+// any of them retained late data. The caller passes count back to
+// forEachCompleteFile so files rotated concurrently belong to the next flush.
+func (ws *walFile) completeFileState() (count int, needsSort bool) {
 	ws.mutex.Lock()
-	snapshot := ws.walFiles[:len(ws.walFiles)-1]
+	defer ws.mutex.Unlock()
+	count = len(ws.walFiles) - 1
+	for i := 0; i < count; i++ {
+		if ws.walFiles[i].needsSort {
+			return count, true
+		}
+	}
+	return count, false
+}
+
+func (ws *walFile) forEachCompleteFile(limit int, fc func(fileIndex int, tag tagCode, timestamp int64, data variant.Variant, offset int64) bool) (int, error) {
+	ws.mutex.Lock()
+	available := len(ws.walFiles) - 1
+	if limit < 0 || limit > available {
+		limit = available
+	}
+	snapshot := ws.walFiles[:limit]
+	closeBuffer := ws.config.CloseBuffer
 	ws.mutex.Unlock()
 
 	for i := 0; i < len(snapshot); i++ {
-		if ws.config.CloseBuffer {
+		if closeBuffer {
+			stopped := false
 			err := forEachWalFile(snapshot[i].fileName, func(tag tagCode, timestamp int64, data variant.Variant, offset int64) bool {
-				return fc(i, tag, timestamp, data, offset)
+				if !fc(i, tag, timestamp, data, offset) {
+					stopped = true
+					return false
+				}
+				return true
 			})
 			if err != nil {
 				return i, err
 			}
+			if stopped {
+				return i, nil
+			}
 		} else {
-			snapshot[i].readBuffer.forEach(func(e walDataEntry) bool {
-				return fc(i, e.Key, e.Timestamp, e.Value, e.EndPosition)
-			})
+			if !snapshot[i].readBuffer.forEach(func(tag tagCode, timestamp int64, value variant.Variant) bool {
+				// In-memory entries cannot fail while being traversed, so repair
+				// never needs a byte offset for this path.
+				return fc(i, tag, timestamp, value, 0)
+			}) {
+				return i, nil
+			}
 		}
 	}
 	return len(snapshot), nil
@@ -735,6 +908,12 @@ func (ws *walFile) truncate(n int) {
 	}
 	if n <= 0 {
 		return
+	}
+	if !ws.config.CloseBuffer && ws.spareReadBuffer == nil {
+		// The newest consumed file is normally the fullest candidate. Keep only
+		// a bounded prefix from one buffer; older files remain available to GC.
+		ws.spareReadBuffer = ws.walFiles[n-1].readBuffer
+		ws.spareReadBuffer.resetForReuse(maxRetainedWALReadBufferBytes)
 	}
 	for i := 0; i < n; i++ {
 		if err := os.Remove(ws.walFiles[i].fileName); err != nil {
@@ -790,6 +969,7 @@ func (ws *walFile) Close() error {
 		return err
 	}
 	ws.writeFile = nil
+	ws.spareReadBuffer = nil
 	return err
 }
 
@@ -822,7 +1002,7 @@ func getAllData(filePath string, chunkCap int) (*walReadBuffer, int64, error) {
 	if len(filePath) == 0 {
 		return nil, 0, ErrorFilePathEmpty
 	}
-	cacheBuffer := &walReadBuffer{chunkCap: chunkCap}
+	cacheBuffer := newWalReadBuffer(chunkCap)
 	offset := int64(0)
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {

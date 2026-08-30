@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/golang/snappy"
 )
 
 const (
@@ -48,11 +50,13 @@ type IndexEntry struct {
 type BlockFile struct {
 	mu              sync.RWMutex
 	file            *os.File
+	filePath        string
 	blockCompressor BlockCompressor
 	header          FileHeader
 	blockSize       int
 	buf             []byte
 	readBuf         []byte
+	decodeBuf       []byte
 	pos             int64
 	totalSize       int64
 	index           []IndexEntry
@@ -73,6 +77,7 @@ func OpenBlockFile(path string, blockCompressor BlockCompressor, blockSize int) 
 	}
 	bf := &BlockFile{
 		file:            f,
+		filePath:        path,
 		blockCompressor: blockCompressor,
 		blockSize:       blockSize,
 		buf:             make([]byte, 0, blockSize),
@@ -646,42 +651,17 @@ func (b *BlockFile) readAt(p []byte, off int64) (int, error) {
 			}
 		}
 
-		blockIdx := b.findBlock(off)
-		if blockIdx < 0 || blockIdx >= len(b.index) {
-			break
-		}
-		ent := b.index[blockIdx]
-
-		target := ent.CompOff + 4
-		if b.lastPhysicalPos != target {
-			if _, err := b.file.Seek(target, io.SeekStart); err != nil {
-				return totalRead, err
-			}
-		}
-		need := int(ent.CompLen - 4)
-		if cap(b.readBuf) < need {
-			b.readBuf = make([]byte, need)
-		}
-		rBuf := b.readBuf[:need]
-		if _, err := io.ReadFull(b.file, rBuf); err != nil {
-			return totalRead, err
-		}
-		b.lastPhysicalPos = ent.CompOff + ent.CompLen
-
-		decodeBuf, err := b.blockCompressor.Decode(rBuf)
+		data, rawOff, err := b.blockData(off)
 		if err != nil {
 			return totalRead, err
 		}
-		if ent.Crc32 != 0 && crc32.ChecksumIEEE(decodeBuf) != ent.Crc32 {
-			return totalRead, ErrorBlockCRCMismatch
-		}
 
-		start := off - ent.RawOff
-		if start >= int64(len(decodeBuf)) {
-			off = ent.RawOff + int64(len(decodeBuf))
+		start := off - rawOff
+		if start >= int64(len(data)) {
+			off = rawOff + int64(len(data))
 			continue
 		}
-		n := copy(p[totalRead:], decodeBuf[start:])
+		n := copy(p[totalRead:], data[start:])
 		totalRead += n
 		off += int64(n)
 	}
@@ -690,4 +670,116 @@ func (b *BlockFile) readAt(p []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 	return totalRead, nil
+}
+
+// blockData decompresses the compressed block containing logical offset off
+// into the reusable decode buffer and returns (data, rawOff, err). The
+// returned slice aliases b.decodeBuf and stays valid until the next read on
+// this BlockFile — callers must consume it before issuing another read.
+func (b *BlockFile) blockData(off int64) ([]byte, int64, error) {
+	blockIdx := b.findBlock(off)
+	if blockIdx < 0 || blockIdx >= len(b.index) {
+		return nil, 0, io.EOF
+	}
+	ent := b.index[blockIdx]
+
+	target := ent.CompOff + 4
+	if b.lastPhysicalPos != target {
+		if _, err := b.file.Seek(target, io.SeekStart); err != nil {
+			return nil, 0, err
+		}
+	}
+	need := int(ent.CompLen - 4)
+	if cap(b.readBuf) < need {
+		b.readBuf = make([]byte, need)
+	}
+	rBuf := b.readBuf[:need]
+	if _, err := io.ReadFull(b.file, rBuf); err != nil {
+		return nil, 0, err
+	}
+	b.lastPhysicalPos = ent.CompOff + ent.CompLen
+
+	// Decompress into the reusable buffer (one allocation per compressed block
+	// lifetime instead of per read); NoCompressor is identity so the compressed
+	// bytes themselves are returned without a copy.
+	var decodeBuf []byte
+	var err error
+	storeDecode := true
+	switch b.blockCompressor.(type) {
+	case ZstdCompressor:
+		decodeBuf, err = blockZstdDecoder().DecodeAll(rBuf, b.decodeBuf[:0])
+	case SnappyCompressor:
+		decodeBuf, err = snappy.Decode(b.decodeBuf[:0], rBuf)
+	case NoCompressor:
+		// 恒等：直接返回压缩字节。不要把它存入 b.decodeBuf——那会使
+		// decodeBuf 与 readBuf 别名同一数组，后续 zstd/snappy 以
+		// b.decodeBuf[:0] 为 dst 时与 src（rBuf）底层重叠，解压会覆盖
+		// 尚未读取的源数据。
+		decodeBuf = rBuf
+		storeDecode = false
+	default:
+		decodeBuf, err = b.blockCompressor.Decode(rBuf)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	if storeDecode {
+		b.decodeBuf = decodeBuf
+	}
+	if ent.Crc32 != 0 && crc32.ChecksumIEEE(decodeBuf) != ent.Crc32 {
+		return nil, 0, ErrorBlockCRCMismatch
+	}
+	return decodeBuf, ent.RawOff, nil
+}
+
+// ReadBlockFrom returns a reference to the decompressed bytes starting at
+// logical offset off (the returned slice covers [off, end of its compressed
+// block)). The reference aliases the BlockFile's internal decode buffer and
+// stays valid only until the next read on this BlockFile. Ranges that span
+// compressed-block boundaries must be assembled by the caller.
+func (b *BlockFile) ReadBlockFrom(off int64) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	data, rawOff, err := b.blockData(off)
+	if err != nil {
+		return nil, err
+	}
+	return data[off-rawOff:], nil
+}
+
+// Path returns the file path this BlockFile is bound to.
+func (b *BlockFile) Path() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.filePath
+}
+
+// Rebind re-points this BlockFile at another file, reusing the instance (and
+// its buffers) for a different segment within one query. The caller must not
+// hold references to decode buffers returned before the rebind.
+func (b *BlockFile) Rebind(path string, compressor BlockCompressor) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.file.Close(); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	b.file = f
+	b.filePath = path
+	b.blockCompressor = compressor
+	b.buf = b.buf[:0]
+	b.index = nil
+	b.lastRawOff = 0
+	b.lastPhysicalPos = -1
+	b.decodeBuf = b.decodeBuf[:0]
+	if err := b.loadAndRecover(); err != nil {
+		if err == io.EOF {
+			return b.initNew()
+		}
+		return err
+	}
+	return nil
 }

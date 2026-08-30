@@ -26,11 +26,17 @@ func NewStringKeyCache[V any](slots int) *StringKeyCache[V] {
 }
 
 func (c *StringKeyCache[V]) Lookup(key string) (V, bool) {
+	return c.LookupHash(key, HashString(key))
+}
+
+// LookupHash is Lookup for callers that already hashed key for routing. The
+// exact string comparison remains the collision guard.
+func (c *StringKeyCache[V]) LookupHash(key string, hash uint64) (V, bool) {
 	var zero V
 	if c == nil {
 		return zero, false
 	}
-	e := c.slots[hashString(key)&uint64(len(c.slots)-1)].Load()
+	e := c.slots[hash&uint64(len(c.slots)-1)].Load()
 	if e != nil && e.key == key {
 		return e.val, true
 	}
@@ -38,16 +44,21 @@ func (c *StringKeyCache[V]) Lookup(key string) (V, bool) {
 }
 
 func (c *StringKeyCache[V]) Store(key string, val V) {
+	c.StoreHash(key, HashString(key), val)
+}
+
+// StoreHash is Store for callers that already hashed key.
+func (c *StringKeyCache[V]) StoreHash(key string, hash uint64, val V) {
 	if c == nil {
 		return
 	}
-	c.slots[hashString(key)&uint64(len(c.slots)-1)].Store(&stringKeyEntry[V]{key: key, val: val})
+	c.slots[hash&uint64(len(c.slots)-1)].Store(&stringKeyEntry[V]{key: key, val: val})
 }
 
-// hashString is FNV-1a (64-bit). Self-contained (no maphash seed) and fast for
+// HashString is FNV-1a (64-bit). Self-contained (no maphash seed) and fast for
 // the short tags/table names that dominate. Callers use the low bits as a slot
 // index, so the size must be a power of two.
-func hashString(s string) uint64 {
+func HashString(s string) uint64 {
 	const (
 		offset64 = 14695981039346656037
 		prime64  = 1099511628211

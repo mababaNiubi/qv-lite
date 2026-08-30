@@ -662,6 +662,67 @@ func TestAdaptColumnEncoder_Reset(t *testing.T) {
 	}
 }
 
+func TestAdaptColumnEncoder_ResetReusesScalarEncoder(t *testing.T) {
+	enc := NewAdaptColumnEncoder(2)
+	if !enc.Write(variant.NewFloat64(12.34)) {
+		t.Fatal("first float write")
+	}
+	first := enc.encoder
+	if _, err := enc.Bytes(); err != nil {
+		t.Fatal(err)
+	}
+
+	enc.Reset()
+	if enc.encoder != nil {
+		t.Fatal("reset must leave the next segment type-discoverable")
+	}
+	if !enc.Write(variant.NewFloat64(56.78)) {
+		t.Fatal("second float write")
+	}
+	if enc.encoder != first {
+		t.Fatal("same scalar type should reuse its encoder")
+	}
+
+	data, err := enc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := &AdaptColumnDecoder{}
+	dec.SetBytes(data)
+	if !dec.Next() {
+		t.Fatalf("decode second segment: %v", dec.Error())
+	}
+	got, err := dec.Read().AsFloat64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 56.78 {
+		t.Fatalf("second segment value=%v, want 56.78", got)
+	}
+}
+
+func TestAdaptColumnEncoder_ResetRediscoversChangedScalarType(t *testing.T) {
+	enc := NewAdaptColumnEncoder(2)
+	enc.Write(variant.NewFloat64(1.25))
+	enc.Reset()
+
+	if !enc.Write(variant.NewString("changed")) {
+		t.Fatal("reset should allow a different scalar type")
+	}
+	data, err := enc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := &AdaptColumnDecoder{}
+	dec.SetBytes(data)
+	if !dec.Next() {
+		t.Fatalf("decode changed type: %v", dec.Error())
+	}
+	if got := dec.Read().AsString(); got != "changed" {
+		t.Fatalf("changed scalar=%q, want changed", got)
+	}
+}
+
 // ---- Multi-segment: columns added and removed across segments (glow/restructure) ----
 
 func TestAdaptColumnEncoder_MultiSegmentColumnChurn(t *testing.T) {

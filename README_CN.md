@@ -118,11 +118,14 @@ if point != nil {
 
 | 方法 | 说明 |
 |------|------|
-| `Query(tableName, tag, startTime, endTime, maxNumber, polymerization, cond)` | 范围查询。时间跨度 > 1 小时时返回最多 `maxNumber` 个降采样点；≤ 1 小时时直接返回全部原始数据。 |
-| `QueryAll(tableName, tag, startTime, endTime, cond)` | 返回范围内的全部原始数据点，不做数量限制。 |
+| `Query(tableName, tag, startTime, endTime, windowSize, polymerization, cond)` | 范围查询。`windowSize` 为聚合窗口（纳秒，>0 时按窗口降采样，0 = 返回全部原始点）；`polymerization` 为聚合模式（0 avg / 1 min / 2 max）。 |
+| `QueryAll(tableName, tag, startTime, endTime, cond)` | 返回范围内的全部原始数据点，不做数量限制（大范围请谨慎使用）。 |
+| `QueryIter(ctx, tableName, tag, startTime, endTime, cond, opts)` | **流式查询**：按时间序逐点输出，不物化完整结果集，峰值内存远低于 `QueryAll`；`opts`（`*tsdb.QueryOptions`）可设 `Limit`（返回点数上限）与 `Offset`（跳过的点数）。返回的迭代器必须 `Close()`。 |
 | `QueryLatest(tableName, tag)` | 返回指定 tag 的最新一条数据。 |
 
-所有时间戳单位为**纳秒**（UnixNano）。`maxNumber` 设为 0 时默认 10000。
+所有时间戳单位为**纳秒**（UnixNano）。原始点查询请务必配合 `limit` 或聚合窗口使用，避免一次查询拉取全量数据。
+
+> 注：`Query` 的第 5 个参数是 `windowSize`（聚合窗口），**不是**结果数量上限；结果数量限制请用 `QueryIter` + `QueryOptions.Limit`（HTTP 接口的 `limit`/`offset` 字段即走该路径）。
 
 ### 表管理
 

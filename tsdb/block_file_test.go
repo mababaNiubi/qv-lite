@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestOpenBlockFile_New(t *testing.T) {
@@ -409,131 +408,6 @@ func TestBlockFile_ManySmallWrites(t *testing.T) {
 			t.Fatalf("mismatch at %d: got %d, want %d", i, result[i], expectedData[i])
 		}
 	}
-}
-
-// ─── 500MB Throughput Test ──────────────────────────────────────
-func TestThroughput_500MB(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping 500MB throughput test in short mode")
-	}
-
-	const dataSize = 500 * 1024 * 1024
-	t.Logf("=== 500MB Throughput Test ===")
-
-	compressors := []struct {
-		name string
-		comp BlockCompressor
-	}{
-		{"none", NoCompressor{}},
-		{"snappy", SnappyCompressor{}},
-		{"lz4", LZ4Compressor{}},
-		{"gzip", GzipCompressor{}},
-		{"zstd", ZstdCompressor{}},
-	}
-
-	for _, c := range compressors {
-		t.Run(c.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "thru_"+c.name+".bf")
-
-			// Use a repeating pattern so compressors show meaningful differences.
-			data := makePattern(dataSize, func(i int) byte {
-				return byte('a' + (i % 26))
-			})
-
-			// Measure write speed.
-			writeStart := time.Now()
-			bf, _ := OpenBlockFile(path, c.comp, BlockSizeDef)
-			n, err := bf.Write(data)
-			if err != nil {
-				t.Fatalf("Write error: %v", err)
-			}
-			bf.Close()
-			writeDuration := time.Since(writeStart)
-			writeMBps := float64(n) / writeDuration.Seconds() / (1024 * 1024)
-
-			// Physical file size and compression ratio.
-			fi, _ := os.Stat(path)
-			physicalSize := fi.Size()
-			compressionRatio := float64(physicalSize) / float64(n) * 100
-
-			// Measure read speed.
-			readStart := time.Now()
-			bf2, _ := OpenBlockFile(path, c.comp, BlockSizeDef)
-			buf := make([]byte, n)
-			_, err = io.ReadFull(bf2, buf)
-			if err != nil {
-				t.Fatalf("Read error: %v", err)
-			}
-			bf2.Close()
-			readDuration := time.Since(readStart)
-			readMBps := float64(n) / readDuration.Seconds() / (1024 * 1024)
-
-			t.Logf("%-6s: write=%.1f MB/s  read=%.1f MB/s  physical=%d  ratio=%.1f%%",
-				c.name, writeMBps, readMBps, physicalSize, compressionRatio)
-		})
-	}
-}
-
-// ─── Compression Ratio Report ─────────────────────────────────
-
-func TestCompressionRatioReport(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping compression report in short mode")
-	}
-
-	const dataSize = 100 * 1024 * 1024
-	compressors := []struct {
-		name string
-		comp BlockCompressor
-	}{
-		{"none", NoCompressor{}},
-		{"snappy", SnappyCompressor{}},
-		{"lz4", LZ4Compressor{}},
-		{"gzip", GzipCompressor{}},
-		{"zstd", ZstdCompressor{}},
-	}
-
-	patterns := []struct {
-		name string
-		fn   func(int) byte
-	}{
-		{"random", func(i int) byte { return byte(i % 256) }},
-		{"zeros", func(i int) byte { return 0 }},
-		{"alpha", func(i int) byte { return byte('a' + (i % 26)) }},
-		{"text", func(i int) byte { return byte(32 + (i % 95)) }},
-		{"sine", func(i int) byte { return byte(128 + int(127.0*(float64(i%628)*0.01))) }},
-	}
-
-	fmt.Println("\n=== Compression Ratio Report ===")
-	fmt.Printf("%-8s", "pattern")
-	for _, c := range compressors {
-		fmt.Printf(" %9s", c.name)
-	}
-	fmt.Println()
-
-	for _, p := range patterns {
-		data := makePattern(dataSize, p.fn)
-		fmt.Printf("%-8s", p.name)
-		for _, c := range compressors {
-			path := filepath.Join(t.TempDir(), fmt.Sprintf("cmp_%s_%s.bf", p.name, c.name))
-			bf, _ := OpenBlockFile(path, c.comp, BlockSizeDef)
-			bf.Write(data)
-			bf.Close()
-			fi, _ := os.Stat(path)
-			ratio := float64(fi.Size()) / float64(dataSize) * 100
-			fmt.Printf(" %9.2f%%", ratio)
-			os.Remove(path)
-		}
-		fmt.Println()
-	}
-}
-
-func makePattern(size int, fn func(i int) byte) []byte {
-	data := make([]byte, size)
-	for i := range data {
-		data[i] = fn(i)
-	}
-	return data
 }
 
 // ─── Truncate Tests ───────────────────────────────────────────

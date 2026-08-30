@@ -106,7 +106,9 @@ func TestDB_Query_WithUnsortedWAL(t *testing.T) {
 	}
 }
 
-func TestDB_ColumnQuery_WhyNot10000(t *testing.T) {
+// TestDB_ColumnQuery_ManyPoints verifies a float-precision column table
+// round-trips a large number of points through QueryAll.
+func TestDB_ColumnQuery_ManyPoints(t *testing.T) {
 	db, err := Open(Config{
 		Path:           tempDir(t),
 		WalConfig:      WalConfig{MaxFileSize: 64 * 1024 * 1024},

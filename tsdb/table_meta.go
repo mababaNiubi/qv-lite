@@ -32,7 +32,26 @@ import (
 const (
 	metaMagic   = 0x4D455441 // "META"
 	metaHeadLen = 4
+
+	// defaultTagCacheSlots 是每表 tag→code 热缓存的默认槽数(2 的幂)。
+	// 直接映射缓存, tag 基数大且轮询写入时, 槽数过小会导致缓存 miss 抖动
+	// (每次 miss 都回查 SyncMap 并回填 Store), 拖慢写入路径。65536 槽下
+	// 10K tag 轮询的碰撞概率约 1%(命中率 99%), 内存上限约 2MB, 可忽略。
+	defaultTagCacheSlots = 65536
 )
+
+// nextPowerOfTwo 向上取整到 2 的幂, 保证 StringKeyCache 的 &(len-1) 索引正确。
+// n <= 0 时返回默认值。
+func nextPowerOfTwo(n int) int {
+	if n <= 0 {
+		return defaultTagCacheSlots
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
+}
 
 type Meta struct {
 	MaxPointDict tagCode
@@ -42,9 +61,10 @@ type Meta struct {
 	mu   sync.Mutex
 	file *os.File
 	// pending buffers tag entries written by addTag. They are flushed to the
-	// file (and fsynced) by flushPendingLocked, which the WAL calls before any
-	// WAL bytes reach the OS. This turns per-tag fsync (~3ms/tag) into one
-	// fsync per WAL batch, which is what makes high-cardinality writes viable.
+	// file (and fsynced) by flushPendingLocked, which the table batcher worker
+	// calls before appending the points that reference them to the WAL. This
+	// turns per-tag fsync (~3ms/tag) into one fsync per WAL batch, which is what
+	// makes high-cardinality writes viable.
 	pending []byte
 
 	// tagCache is a direct-mapped hot-tag cache in front of the embedded map.
@@ -56,12 +76,19 @@ type Meta struct {
 // Load resolves a tag to its code, using the hot-tag cache to skip the map on
 // the write hot loop. Identical semantics to the embedded map's Load.
 func (s *Meta) Load(tag string) (tagCode, bool) {
-	if code, ok := s.tagCache.Lookup(tag); ok {
+	return s.loadHash(tag, container.HashString(tag))
+}
+
+// loadHash avoids hashing tag again when the ingest path already computed its
+// routing hash. The embedded SyncMap remains the authoritative collision-safe
+// fallback.
+func (s *Meta) loadHash(tag string, hash uint64) (tagCode, bool) {
+	if code, ok := s.tagCache.LookupHash(tag, hash); ok {
 		return code, true
 	}
 	code, ok := s.SyncMap.Load(tag)
 	if ok {
-		s.tagCache.Store(tag, code)
+		s.tagCache.StoreHash(tag, hash, code)
 	}
 	return code, ok
 }
@@ -92,10 +119,10 @@ func (s *Meta) addTag(tag string) (tagCode, error) {
 	return s.MaxPointDict, nil
 }
 
-// FlushPending writes and fsyncs any buffered tag entries. The WAL calls it
-// before writing WAL bytes to the OS, guaranteeing tag codes are durable
-// before the points that reference them can be. Idempotent and safe to call
-// when nothing is pending.
+// FlushPending writes and fsyncs any buffered tag entries. The table batcher
+// worker calls it before appending a batch to the WAL, guaranteeing tag codes
+// are durable before the points that reference them can be. Idempotent and
+// safe to call when nothing is pending.
 func (s *Meta) FlushPending() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,7 +162,13 @@ func (s *Meta) Close() error {
 	return nil
 }
 
-func NewMeta(path string) (*Meta, error) {
+// NewMeta opens or creates the tag meta file for a table directory.
+// slots 可选: 指定 tag→code 热缓存槽数(2 的幂), 缺省或 <=0 时用默认值 65536。
+func NewMeta(path string, slots ...int) (*Meta, error) {
+	tagCacheSlots := defaultTagCacheSlots
+	if len(slots) > 0 && slots[0] > 0 {
+		tagCacheSlots = slots[0]
+	}
 	m := &Meta{
 		Path:     filepath.Join(path, metaFile),
 		pending:  make([]byte, 0, 1024),

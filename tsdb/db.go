@@ -17,11 +17,48 @@ type WalConfig struct {
 	MaxFileSize int64 `json:"max_file_size"`
 	// MaxFileNumber is the maximum number of WAL files.
 	MaxFileNumber int `json:"max_file_number"`
-	// CloseBuffer disables the WAL write buffer when true.
+	// CloseBuffer disables the in-memory WAL read cache when true; queries read
+	// WAL files directly in that mode.
 	CloseBuffer bool `json:"close_buffer"`
-	// MaxBufferBatchSize is the maximum number of entries to buffer in memory
-	// before sorting by timestamp and flushing to the WAL file. Default 10000.
+	// MaxBufferBatchSize is the chunk capacity of the WAL read cache. Write
+	// accumulation is configured independently by IngestConfig. Default 4096.
 	MaxBufferBatchSize int `json:"max_buffer_batch_size"`
+}
+
+// IngestConfig controls the table-level sharded MemTable that sits in front of
+// the WAL. Points are accumulated without resolving tagCode, then active
+// buffers are swapped and prepared asynchronously when either the point limit
+// or flush interval is reached.
+type IngestConfig struct {
+	// Shards is the number of independently locked tag shards. It is rounded up
+	// to a power of two. Default 16.
+	Shards int `json:"shards"`
+	// MaxBatchSize triggers an asynchronous buffer swap after this many active
+	// points. Default 4096.
+	MaxBatchSize int `json:"max_batch_size"`
+	// FlushIntervalMs is the maximum time a point waits in the active MemTable.
+	// Default 5ms.
+	FlushIntervalMs int64 `json:"flush_interval_ms"`
+	// QueueSize bounds the number of frozen batches waiting for the WAL writer.
+	// Normal writes are independent of queue occupancy; callers wait only if a
+	// stalled trigger lets the active maps grow past two batches. Default 8.
+	QueueSize int `json:"queue_size"`
+}
+
+func (config *IngestConfig) setDefaultValues() {
+	if config.Shards <= 0 {
+		config.Shards = 16
+	}
+	config.Shards = nextPowerOfTwo(config.Shards)
+	if config.MaxBatchSize <= 0 {
+		config.MaxBatchSize = 4096
+	}
+	if config.FlushIntervalMs <= 0 {
+		config.FlushIntervalMs = 5
+	}
+	if config.QueueSize <= 0 {
+		config.QueueSize = 8
+	}
 }
 
 func (config *WalConfig) setDefaultValues() {
@@ -38,6 +75,9 @@ type Config struct {
 	Path string `json:"path"`
 	// WalConfig groups WAL-related settings.
 	WalConfig WalConfig `json:"wal_config"`
+	// IngestConfig configures the sharded table-level write buffer in front of
+	// the WAL.
+	IngestConfig IngestConfig `json:"ingest_config"`
 	// maxSegmentSize is the maximum size of a segment in bytes.
 	// Default 64M
 	MaxSegmentSize int64 `json:"max_segment_size"`
@@ -75,6 +115,23 @@ type Config struct {
 	// cleanup sweeps when AsyncCleanup is enabled. An initial sweep runs
 	// immediately on startup. Default 60.
 	CleanupIntervalSeconds int64 `json:"cleanup_interval_seconds"`
+	// TagCacheSlots 是每个表的 tag→code 热缓存槽数(直接映射, 需为 2 的幂)。
+	// 默认 65536。tag 基数大且轮询写入时, 槽数过小会导致缓存 miss 抖动
+	// (每次 miss 都回查 SyncMap 并回填 Store), 显著拖慢写入; 增大可提升
+	// 高基数写入性能。内存开销约 8B×slots + 24B×活跃tag数, 65536 槽上限
+	// 约 2MB, 可忽略。非 2 的幂会自动向上取整。
+	TagCacheSlots int `json:"tag_cache_slots"`
+
+	// QueryTimeout 是单次查询（物化 Query/QueryAll/QueryWindow 与流式
+	// QueryIter）的最长执行时间。默认 0 不限制。超时返回
+	// context.DeadlineExceeded（物化路径）或迭代器的 ctx 错误。
+	// 检查粒度为每 4096 点一次，超时响应延迟 ≤ 一个检查周期。
+	QueryTimeout time.Duration `json:"query_timeout"`
+
+	// MaxQueryPoints 是单次物化查询（Query/QueryAll/QueryWindow）允许返回的
+	// 最大点数。默认 0 不限制。超过即返回 ErrorQueryResultLimitExceeded——
+	// 用于防止大结果查询无限分配内存（1M 点 ≈ 40MB）。
+	MaxQueryPoints int64 `json:"max_query_points"`
 }
 
 const DefaultTableName = "default"
@@ -117,9 +174,15 @@ func Open(config Config, ctx context.Context) (*DB, error) {
 		config.SecondaryCompressionName = "zstd"
 	}
 	config.WalConfig.setDefaultValues()
+	config.IngestConfig.setDefaultValues()
 	if config.CleanupIntervalSeconds <= 0 {
 		config.CleanupIntervalSeconds = 60
 	}
+	if config.TagCacheSlots <= 0 {
+		config.TagCacheSlots = defaultTagCacheSlots
+	}
+	// StringKeyCache 索引用 &(len-1), 槽数必须是 2 的幂。
+	config.TagCacheSlots = nextPowerOfTwo(config.TagCacheSlots)
 	db := &DB{
 		Config:     config,
 		tableCache: *container.NewStringKeyCache[*ssTable](tableCacheSlots),
@@ -166,10 +229,14 @@ func (db *DB) BuildTable() error {
 			db.MaxStorageTime*int64(time.Second),
 			db.SecondaryCompressionName,
 			config,
+			db.TagCacheSlots,
 			db.ctx,
 			db.AsyncFlush,
 			db.AsyncCleanup,
-			time.Duration(db.CleanupIntervalSeconds)*time.Second)
+			time.Duration(db.CleanupIntervalSeconds)*time.Second,
+			db.IngestConfig,
+			db.QueryTimeout,
+			db.MaxQueryPoints)
 		if err != nil {
 			return err
 		}
@@ -208,10 +275,14 @@ func (db *DB) CreateTable(tableConfig TableInfo) error {
 		db.MinIntervalMs*int64(time.Millisecond),
 		db.MaxStorageTime*int64(time.Second),
 		db.SecondaryCompressionName, config,
+		db.TagCacheSlots,
 		db.ctx,
 		db.AsyncFlush,
 		db.AsyncCleanup,
-		time.Duration(db.CleanupIntervalSeconds)*time.Second)
+		time.Duration(db.CleanupIntervalSeconds)*time.Second,
+		db.IngestConfig,
+		db.QueryTimeout,
+		db.MaxQueryPoints)
 	if err != nil {
 		return err
 	}
@@ -273,7 +344,9 @@ func (db *DB) getTable(tableName string) (*ssTable, error) {
 	return table, nil
 }
 
-// Write writes a data point to the specified table and tag. Returns whether the data was actually written.
+// Write accepts a data point into the specified table's ingest buffer. A true
+// result means accepted; tag mapping, dedup and WAL persistence happen on the
+// ordered background worker. Queries and Close wait for prior accepted writes.
 // An empty tableName writes to the default table, which is auto-created on first use.
 func (db *DB) Write(tableName string, tag string, timestamp int64, value variant.Variant) (bool, error) {
 	table, err := db.getTable(tableName)
@@ -283,9 +356,9 @@ func (db *DB) Write(tableName string, tag string, timestamp int64, value variant
 	return table.Write(tag, timestamp, value)
 }
 
-// WriteBatch writes multiple data points to the specified table in a single batch.
-// This acquires the WAL mutex once instead of once per point, reducing lock contention.
-// An empty tableName writes to the default table.
+// WriteBatch appends multiple raw-tag points to the table's sharded ingest
+// buffer. Tag mapping, sorting and WAL I/O are handled asynchronously. An empty
+// tableName writes to the default table.
 func (db *DB) WriteBatch(tableName string, points []TagPoint) (int, error) {
 	if len(points) == 0 {
 		return 0, nil
@@ -328,6 +401,25 @@ func (db *DB) QueryAll(tableName string, tag string, startTime int64, endTime in
 	return table.Query(tag, startTime, endTime, cond)
 }
 
+// QueryIter streams query results for one tag in time order without
+// materializing the full result set, so peak memory stays bounded by the
+// largest single block plus the merge state instead of the whole result.
+// The returned iterator must be closed by the caller (it holds the table's
+// query lock). opts controls limit/offset; nil means unbounded. An empty
+// tableName queries the default table.
+func (db *DB) QueryIter(ctx context.Context, tableName string, tag string, startTime int64, endTime int64, cond any, opts *QueryOptions) (PointIter, error) {
+	tableName = db.resolveTableName(tableName)
+	if db.ExpirationMinuteTime != 0 {
+		startTime = max(startTime, time.Now().Add(-time.Duration(db.ExpirationMinuteTime)*time.Minute).UnixNano())
+		endTime = min(endTime, time.Now().Add(time.Duration(db.ExpirationMinuteTime)*time.Minute).UnixNano())
+	}
+	table, ok := db.ssTables.Load(tableName)
+	if !ok {
+		return nil, nil
+	}
+	return table.QueryIter(ctx, tag, startTime, endTime, cond, opts)
+}
+
 // QueryLatest returns the most recent data point for the specified tag.
 // An empty tableName queries the default table.
 func (db *DB) QueryLatest(tableName string, tag string) (*Point, error) {
@@ -337,4 +429,21 @@ func (db *DB) QueryLatest(tableName string, tag string) (*Point, error) {
 		return nil, ErrorTableNotExists
 	}
 	return table.QueryLatest(tag)
+}
+
+// TableNames returns the names of all tables currently managed by the DB,
+// in creation order. The default table is included once created.
+func (db *DB) TableNames() []string {
+	names := make([]string, 0, len(db.tableInfos))
+	for i := range db.tableInfos {
+		names = append(names, db.tableInfos[i].Name)
+	}
+	return names
+}
+
+// TableInfos returns a copy of the metadata for all tables.
+func (db *DB) TableInfos() []TableInfo {
+	out := make([]TableInfo, len(db.tableInfos))
+	copy(out, db.tableInfos)
+	return out
 }

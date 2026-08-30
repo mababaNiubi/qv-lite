@@ -8,3 +8,16 @@
 # Build artifact
 qv-lite.exe
 tsdb.test.exe
+bin/
+client.testbin
+variant.zip
+
+# Local build/module caches and test data
+.gocache/
+.modcache/
+.smoke-data/
+gostdout.txt
+b2.txt
+
+# Local tool state
+.claude/

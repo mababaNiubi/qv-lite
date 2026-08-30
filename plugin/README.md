@@ -30,7 +30,7 @@ cplugin/
 export PATH="/d/mingw64/mingw64/bin:$PATH"
 
 # Build the CGO shared library
-cd cplugin
+cd plugin
 CGO_ENABLED=1 go build -buildmode=c-shared -o build/qv_lite.dll .
 cp qv_lite.h build/
 

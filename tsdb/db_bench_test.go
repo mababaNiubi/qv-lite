@@ -477,6 +477,8 @@ func fileDirSize(dir string, tableName string) string {
 //	batch : WriteBatch 分批写(4096/批), 对比批量写路径。
 //
 // 总量固定不可重复,请用 -benchtime=1x 运行;调整 totalPoints 可测更大规模。
+// 进度通过 fmt.Printf 流式输出([E2E] 前缀):长跑期间实时可见,不会被误判为
+// 死循环(默认 benchtime 下单个配置可能静默数分钟)。
 func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 	go func() {
 		http.ListenAndServe(":6060", nil)
@@ -492,6 +494,11 @@ func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 				// 32MB 小 WAL:强制写入过程旋转落盘,Close 后 data 目录才有
 				// 压缩段文件可量(与 BenchmarkE2E_WriteAndQuery 的大 WAL 不同,
 				// 后者靠 8640 万点的体量自然触发旋转)。
+				//
+				// 进度直接 fmt.Printf 流式输出(不走 benchmark 输出缓冲):
+				// 长跑(如 tags10000 读阶段可达数分钟)期间必须实时可见,否则
+				// 静默期会被误判为死循环。每行带 [E2E] 前缀便于区分。
+				fmt.Printf("[E2E] tags%d: writing %d points...\n", numTags, totalPoints)
 				db, dir := benchOpen(b, tableName, 32*1024*1024)
 				tags := prebuiltTags(numTags)
 
@@ -531,16 +538,27 @@ func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 					}
 				}
 				writeElapsed := time.Since(writeStart)
+				fmt.Printf("[E2E] tags%d: write done %v (%.0f pts/s), querying %d tags...\n",
+					numTags, writeElapsed, float64(written)/writeElapsed.Seconds(), numTags)
 
-				// 逐 tag 全量查询,累加总点数。
+				// 逐 tag 全量查询,累加总点数。进度每 10% 打一行。
 				queryStart := time.Now()
 				total := 0
-				for _, tag := range tags {
+				progressStep := numTags / 10
+				if progressStep < 1 {
+					progressStep = 1
+				}
+				for i, tag := range tags {
 					all, err := db.QueryAll(tableName, tag, baseTime-100, baseTime+int64(totalPoints)*int64(time.Millisecond)+100, nil)
 					if err != nil {
 						b.Fatal(err)
 					}
 					total += len(all)
+					if (i+1)%progressStep == 0 {
+						elapsed := time.Since(queryStart)
+						fmt.Printf("[E2E] tags%d: query %d/%d tags, %d pts (%v, %.0f pts/s)\n",
+							numTags, i+1, numTags, total, elapsed, float64(total)/elapsed.Seconds())
+					}
 				}
 				queryElapsed := time.Since(queryStart)
 				if total != written {
@@ -551,6 +569,8 @@ func BenchmarkE2E_TagScaleWriteAndQuery(b *testing.B) {
 				if err := db.Close(); err != nil {
 					b.Fatal(err)
 				}
+				fmt.Printf("[E2E] tags%d: done — write %v, read %v, count %d/%d, size %v\n",
+					numTags, writeElapsed, queryElapsed, total, written, fileDirSize(dir, tableName))
 				b.Logf("write: %v (%.0f pts/s), read: %v (%.0f pts/s), count: %d, size: %v",
 					writeElapsed, float64(written)/writeElapsed.Seconds(),
 					queryElapsed, float64(total)/queryElapsed.Seconds(),

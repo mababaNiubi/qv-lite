@@ -463,6 +463,14 @@ func parseFieldValue(line []byte, pos *int) (variant.Variant, error) {
 			}
 		}
 	}
+	// 纯整数（无小数/指数）快速路径：|v| ≤ 2^53 时 float64(int64(v)) 与
+	// strconv.ParseFloat 逐位一致（整数精确表示），省去 strconv 解析；
+	// 超出 2^53 回退 strconv 保持舍入语义一致。
+	if n := tok.end - tok.start; n <= 18 {
+		if v, ok := parseSpanInt64(line, tok.start, tok.end); ok && v >= -(1<<53) && v <= 1<<53 {
+			return variant.NewFloat64(float64(v)), nil
+		}
+	}
 	s := unsafe.String(unsafe.SliceData(line[tok.start:tok.end]), tok.end-tok.start)
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return variant.NewFloat64(f), nil

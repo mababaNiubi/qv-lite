@@ -242,6 +242,8 @@ func parseBytesUint64(b []byte) (uint64, bool) {
 }
 
 // parseSpanInt64 解析 [-+]?[0-9]+ 到 int64；支持 -2^63 边界。
+// ≤18 位数字（int64 最大 19 位）走无溢出检查的快速路径（时间戳等常见
+// 输入），避免逐位除法。
 func parseSpanInt64(b []byte, start, end int) (int64, bool) {
 	i := start
 	neg := false
@@ -254,25 +256,36 @@ func parseSpanInt64(b []byte, start, end int) (int64, bool) {
 	if i >= end {
 		return 0, false
 	}
-	const maxNegMag = uint64(1) << 63 // |math.MinInt64|
 	var v uint64
-	for ; i < end; i++ {
-		c := b[i]
-		if c < '0' || c > '9' {
-			return 0, false
+	if end-i <= 18 {
+		// 快速路径：18 位以内无溢出（最大 999,999,999,999,999,999 < 2^63）。
+		for ; i < end; i++ {
+			c := b[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			v = v*10 + uint64(c-'0')
 		}
-		d := uint64(c - '0')
-		limit := maxNegMag - 1 // 正数上限 2^63-1
-		if neg {
-			limit = maxNegMag // 负数幅度上限 2^63
+	} else {
+		const maxNegMag = uint64(1) << 63 // |math.MinInt64|
+		for ; i < end; i++ {
+			c := b[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			d := uint64(c - '0')
+			limit := maxNegMag - 1 // 正数上限 2^63-1
+			if neg {
+				limit = maxNegMag // 负数幅度上限 2^63
+			}
+			if v > (limit-d)/10 {
+				return 0, false
+			}
+			v = v*10 + d
 		}
-		if v > (limit-d)/10 {
-			return 0, false
-		}
-		v = v*10 + d
 	}
 	if neg {
-		if v == maxNegMag {
+		if v == uint64(1)<<63 {
 			return -1 << 63, true
 		}
 		return -int64(v), true
@@ -281,6 +294,7 @@ func parseSpanInt64(b []byte, start, end int) (int64, bool) {
 }
 
 // parseSpanUint64 解析 [+][0-9]+ 到 uint64。
+// ≤19 位数字（uint64 最大 20 位）走无溢出检查的快速路径。
 func parseSpanUint64(b []byte, start, end int) (uint64, bool) {
 	i := start
 	if i < end && b[i] == '+' {
@@ -289,18 +303,29 @@ func parseSpanUint64(b []byte, start, end int) (uint64, bool) {
 	if i >= end {
 		return 0, false
 	}
-	const maxU = ^uint64(0)
 	var v uint64
-	for ; i < end; i++ {
-		c := b[i]
-		if c < '0' || c > '9' {
-			return 0, false
+	if end-i <= 19 {
+		// 快速路径：19 位以内无溢出（最大 9,999,999,999,999,999,999 < 2^64）。
+		for ; i < end; i++ {
+			c := b[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			v = v*10 + uint64(c-'0')
 		}
-		d := uint64(c - '0')
-		if v > (maxU-d)/10 {
-			return 0, false
+	} else {
+		const maxU = ^uint64(0)
+		for ; i < end; i++ {
+			c := b[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			d := uint64(c - '0')
+			if v > (maxU-d)/10 {
+				return 0, false
+			}
+			v = v*10 + d
 		}
-		v = v*10 + d
 	}
 	return v, true
 }

@@ -93,19 +93,39 @@ func spanEq(line []byte, s tokenSpan, esc bool, want string) bool {
 	return true
 }
 
-// lineSepMask 是 Line Protocol 全部分隔符的位掩码（ASCII 均 < 64）。
-// scanToken 用单次位测试替代逐分隔符循环（pprof 中该循环是解析 CPU 热点）。
-const lineSepMask = 1<<byte(',') | 1<<byte(' ') | 1<<byte('=')
+// Line Protocol 分隔符位掩码（ASCII 均 < 64）：单次位测试替代逐分隔符
+// 循环（pprof 中该循环是解析 CPU 热点）。
+const (
+	sepMaskCS  = 1<<byte(',') | 1<<byte(' ')
+	sepMaskECS = 1<<byte('=') | 1<<byte(',') | 1<<byte(' ')
+)
 
 // scanToken 从 *pos 扫描到任意分隔符（seps）或行尾，返回 token 区间（零分配）。
 // 遇转义时校验转义合法性并置 *esc=true（区间仍为原始文本，由 spanString
 // 解码）。返回后 *pos 指向分隔符（未消费）或行尾。
+//
+// 热点调用点使用无变参的固定分隔符版本（scanTokenCS / scanTokenECS）——
+// 变参 + errors 返回值使本函数无法内联；固定版本可内联，消除每 token 的
+// 调用帧开销。
 func scanToken(line []byte, pos *int, esc *bool, seps ...byte) (tokenSpan, error) {
-	// 分隔符集合很小（',', ' ', '='），按调用点固定为位掩码。
 	var mask uint64
 	for _, s := range seps {
 		mask |= 1 << s
 	}
+	return scanTokenMask(line, pos, esc, mask)
+}
+
+// scanTokenCS 扫描到 ',' 或 ' '（measurement、tag/field value）。
+func scanTokenCS(line []byte, pos *int, esc *bool) (tokenSpan, error) {
+	return scanTokenMask(line, pos, esc, sepMaskCS)
+}
+
+// scanTokenECS 扫描到 '='、',' 或 ' '（tag/field key）。
+func scanTokenECS(line []byte, pos *int, esc *bool) (tokenSpan, error) {
+	return scanTokenMask(line, pos, esc, sepMaskECS)
+}
+
+func scanTokenMask(line []byte, pos *int, esc *bool, mask uint64) (tokenSpan, error) {
 	start := *pos
 	hasEsc := false
 	for *pos < len(line) {
@@ -195,39 +215,115 @@ type tagPair struct {
 // parseSeries 解析 measurement 与 tag set。返回表名（measurement）字节区间、
 // 是否含转义，以及 tag 区间列表。tags 为复用缓冲：追加到 *tags，避免每行
 // 分配切片。
+//
+// 实现为单遍内联状态机（measurement → tag key/value 交替 → 空格结束），
+// 替代逐 token 的 scanToken 调用（该函数因循环+errors 无法内联，热路径上
+// 每次调用有固定帧开销；pprof 中 parseSeries + scanToken 合计约 15% CPU）。
+// 分隔符/转义语义与 scanToken(',',' ') / scanToken('=',',',' ') 完全一致。
 func parseSeries(line []byte, pos *int, tags *[]tagPair) (tokenSpan, bool, []tagPair, error) {
-	// measurement：到 ','（tag 开始）或 ' '（无 tag）为止。
-	var tableEsc bool
-	tspan, err := scanToken(line, pos, &tableEsc, ',', ' ')
-	if err != nil {
-		return tokenSpan{}, false, nil, errors.New("invalid escape in measurement")
-	}
+	n := len(line)
+	i := *pos
+	tableEsc := false
 
-	if *pos < len(line) && line[*pos] == ',' {
-		for *pos < len(line) && line[*pos] != ' ' {
-			*pos++ // 跳过 ','
-			var keyEsc bool
-			k, err := scanToken(line, pos, &keyEsc, '=', ',', ' ')
-			if err != nil {
-				return tokenSpan{}, false, nil, err
+	// measurement：到 ','（tag 开始）或 ' '（无 tag）为止。
+	tokStart := i
+	for i < n {
+		c := line[i]
+		if c == '\\' {
+			if i+1 >= n {
+				return tokenSpan{}, false, nil, errors.New("invalid escape")
 			}
-			if *pos >= len(line) || line[*pos] != '=' {
-				return tokenSpan{}, false, nil, fmt.Errorf("malformed tag %q", spanString(line, k, keyEsc))
+			switch line[i+1] {
+			case ',', '=', ' ', '\\':
+				tableEsc = true
+				i += 2
+				continue
+			default:
+				return tokenSpan{}, false, nil, errors.New("invalid escape")
+			}
+		}
+		if c == ',' || c == ' ' {
+			break
+		}
+		i++
+	}
+	if i == tokStart {
+		return tokenSpan{}, false, nil, errors.New("empty token")
+	}
+	table := tokenSpan{start: tokStart, end: i}
+	*pos = i
+
+	if *pos < n && line[*pos] == ',' {
+		for *pos < n && line[*pos] != ' ' {
+			*pos++ // 跳过 ','（value 之后的下一个逗号也在下一次迭代这里跳过）
+			// tag key：到 '='、',' 或 ' '。
+			ks := *pos
+			keyEsc := false
+			for *pos < n {
+				c := line[*pos]
+				if c == '\\' {
+					if *pos+1 >= n {
+						return tokenSpan{}, false, nil, errors.New("invalid escape")
+					}
+					switch line[*pos+1] {
+					case ',', '=', ' ', '\\':
+						keyEsc = true
+						*pos += 2
+						continue
+					default:
+						return tokenSpan{}, false, nil, errors.New("invalid escape")
+					}
+				}
+				if c == '=' || c == ',' || c == ' ' {
+					break
+				}
+				*pos++
+			}
+			if *pos == ks {
+				return tokenSpan{}, false, nil, errors.New("empty token")
+			}
+			keyEnd := *pos // key 结束于 '=' 之前
+			if *pos >= n || line[*pos] != '=' {
+				return tokenSpan{}, false, nil, fmt.Errorf("malformed tag %q", spanString(line, tokenSpan{start: ks, end: keyEnd}, keyEsc))
 			}
 			*pos++ // 跳过 '='
-			var valEsc bool
-			v, err := scanToken(line, pos, &valEsc, ',', ' ')
-			if err != nil {
-				return tokenSpan{}, false, nil, err
+			// tag value：到 ',' 或 ' '。
+			vs := *pos
+			valEsc := false
+			for *pos < n {
+				c := line[*pos]
+				if c == '\\' {
+					if *pos+1 >= n {
+						return tokenSpan{}, false, nil, errors.New("invalid escape")
+					}
+					switch line[*pos+1] {
+					case ',', '=', ' ', '\\':
+						valEsc = true
+						*pos += 2
+						continue
+					default:
+						return tokenSpan{}, false, nil, errors.New("invalid escape")
+					}
+				}
+				if c == ',' || c == ' ' {
+					break
+				}
+				*pos++
 			}
-			*tags = append(*tags, tagPair{key: k, keyEsc: keyEsc, value: v, valEsc: valEsc})
+			if *pos == vs {
+				return tokenSpan{}, false, nil, errors.New("empty token")
+			}
+			*tags = append(*tags, tagPair{
+				key: tokenSpan{start: ks, end: keyEnd}, keyEsc: keyEsc,
+				value: tokenSpan{start: vs, end: *pos}, valEsc: valEsc,
+			})
 		}
 	}
 	// 跳过 measurement/tags 与 fields 之间的空格。
-	for *pos < len(line) && line[*pos] == ' ' {
+	for *pos < n && line[*pos] == ' ' {
 		*pos++
 	}
-	return tspan, tableEsc, *tags, nil
+	return table, tableEsc, *tags, nil
 }
 
 // tagFromSet 把 tag set 映射为 qv-lite 的 tag 标识（字节区间 + 转义标记）。
@@ -259,27 +355,51 @@ type fieldPair struct {
 
 // parseFields 解析 field set（k=v 对）。返回解析后的字段名区间与字面量。
 // fields 为复用缓冲：追加到 *fields，避免每行分配切片。
+// key 扫描内联（同 parseSeries：scanToken 调用帧在热路径上是纯开销）。
 func parseFields(line []byte, pos *int, fields *[]fieldPair) ([]fieldPair, error) {
+	n := len(line)
 	for {
-		if *pos >= len(line) {
+		if *pos >= n {
 			return nil, errors.New("missing field set")
 		}
-		var keyEsc bool
-		k, err := scanToken(line, pos, &keyEsc, '=', ' ')
-		if err != nil {
-			return nil, err
+		// field key：到 '='、',' 或 ' '。
+		ks := *pos
+		keyEsc := false
+		for *pos < n {
+			c := line[*pos]
+			if c == '\\' {
+				if *pos+1 >= n {
+					return nil, errors.New("invalid escape")
+				}
+				switch line[*pos+1] {
+				case ',', '=', ' ', '\\':
+					keyEsc = true
+					*pos += 2
+					continue
+				default:
+					return nil, errors.New("invalid escape")
+				}
+			}
+			if c == '=' || c == ',' || c == ' ' {
+				break
+			}
+			*pos++
 		}
-		if *pos >= len(line) || line[*pos] != '=' {
-			return nil, fmt.Errorf("malformed field %q", spanString(line, k, keyEsc))
+		if *pos == ks {
+			return nil, errors.New("empty token")
+		}
+		keyEnd := *pos
+		if *pos >= n || line[*pos] != '=' {
+			return nil, fmt.Errorf("malformed field %q", spanString(line, tokenSpan{start: ks, end: keyEnd}, keyEsc))
 		}
 		*pos++ // 跳过 '='
 		val, err := parseFieldValue(line, pos)
 		if err != nil {
 			return nil, err
 		}
-		*fields = append(*fields, fieldPair{key: k, keyEsc: keyEsc, value: val})
+		*fields = append(*fields, fieldPair{key: tokenSpan{start: ks, end: keyEnd}, keyEsc: keyEsc, value: val})
 		// 逗号分隔继续；空格后是 timestamp。
-		if *pos < len(line) && line[*pos] == ',' {
+		if *pos < n && line[*pos] == ',' {
 			*pos++
 			continue
 		}
@@ -299,12 +419,34 @@ func parseFieldValue(line []byte, pos *int) (variant.Variant, error) {
 	if line[*pos] == '"' {
 		return parseQuotedString(line, pos)
 	}
-	// 数字或 bool：读到 ',' 或 ' ' 或行尾。
-	var esc bool
-	tok, err := scanToken(line, pos, &esc, ',', ' ')
-	if err != nil {
-		return variant.NewEmpty(), err
+	// 数字或 bool：读到 ',' 或 ' ' 或行尾（token 扫描内联）。
+	tokStart := *pos
+	hasEsc := false
+	for *pos < len(line) {
+		c := line[*pos]
+		if c == '\\' {
+			if *pos+1 >= len(line) {
+				return variant.NewEmpty(), errors.New("invalid escape")
+			}
+			switch line[*pos+1] {
+			case ',', '=', ' ', '\\':
+				hasEsc = true
+				*pos += 2
+				continue
+			default:
+				return variant.NewEmpty(), errors.New("invalid escape")
+			}
+		}
+		if c == ',' || c == ' ' {
+			break
+		}
+		*pos++
 	}
+	if *pos == tokStart {
+		return variant.NewEmpty(), errors.New("empty token")
+	}
+	tok := tokenSpan{start: tokStart, end: *pos}
+	esc := hasEsc
 	if spanEq(line, tok, esc, "true") {
 		return variant.NewBool(true), nil
 	}

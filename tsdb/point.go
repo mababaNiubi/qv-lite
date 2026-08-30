@@ -105,10 +105,11 @@ func (p *cappedChunkPool) put(c []Point) {
 // same shard mutex while total retention stays bounded (shards × per-shard
 // cap).
 type shardedChunkPool struct {
-	shards          int
+	once             sync.Once
+	shards           int
 	maxBytesPerShard int
-	shardCursor     atomic.Uint64
-	pools           []cappedChunkPool
+	shardCursor      atomic.Uint64
+	pools            []cappedChunkPool
 }
 
 func (p *shardedChunkPool) get() []Point {
@@ -124,12 +125,14 @@ func (p *shardedChunkPool) put(c []Point) {
 }
 
 func (p *shardedChunkPool) ensure() {
-	if p.pools == nil {
+	// sync.Once: 并发首个查询同时触发初始化时，保证 pools 只被构造一次
+	// 且构造结果对所有 goroutine 可见（无同步的懒初始化是 data race）。
+	p.once.Do(func() {
 		p.pools = make([]cappedChunkPool, p.shards)
 		for i := range p.pools {
 			p.pools[i].maxBytes = p.maxBytesPerShard
 		}
-	}
+	})
 }
 
 var (

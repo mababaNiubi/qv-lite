@@ -704,20 +704,28 @@ func (b *BlockFile) blockData(off int64) ([]byte, int64, error) {
 	// bytes themselves are returned without a copy.
 	var decodeBuf []byte
 	var err error
+	storeDecode := true
 	switch b.blockCompressor.(type) {
 	case ZstdCompressor:
 		decodeBuf, err = blockZstdDecoder().DecodeAll(rBuf, b.decodeBuf[:0])
 	case SnappyCompressor:
 		decodeBuf, err = snappy.Decode(b.decodeBuf[:0], rBuf)
 	case NoCompressor:
+		// 恒等：直接返回压缩字节。不要把它存入 b.decodeBuf——那会使
+		// decodeBuf 与 readBuf 别名同一数组，后续 zstd/snappy 以
+		// b.decodeBuf[:0] 为 dst 时与 src（rBuf）底层重叠，解压会覆盖
+		// 尚未读取的源数据。
 		decodeBuf = rBuf
+		storeDecode = false
 	default:
 		decodeBuf, err = b.blockCompressor.Decode(rBuf)
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	b.decodeBuf = decodeBuf
+	if storeDecode {
+		b.decodeBuf = decodeBuf
+	}
 	if ent.Crc32 != 0 && crc32.ChecksumIEEE(decodeBuf) != ent.Crc32 {
 		return nil, 0, ErrorBlockCRCMismatch
 	}

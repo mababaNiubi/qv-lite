@@ -78,6 +78,8 @@ func spanString(line []byte, s tokenSpan, esc bool) string {
 }
 
 // spanEq 零分配比较区间与字符串是否相等（esc 时先解码）。
+// 无转义时用 string 头 + 比较（编译器 memequal，机器字比较优于手写循环；
+// pprof 中 spanEq 是 tagFromSet/parseFieldValue 的次要热点）。
 func spanEq(line []byte, s tokenSpan, esc bool, want string) bool {
 	if esc {
 		return spanString(line, s, true) == want
@@ -85,12 +87,7 @@ func spanEq(line []byte, s tokenSpan, esc bool, want string) bool {
 	if s.end-s.start != len(want) {
 		return false
 	}
-	for i := 0; i < len(want); i++ {
-		if line[s.start+i] != want[i] {
-			return false
-		}
-	}
-	return true
+	return string(line[s.start:s.end]) == want
 }
 
 // Line Protocol 分隔符位掩码（ASCII 均 < 64）：单次位测试替代逐分隔符

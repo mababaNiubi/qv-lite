@@ -2,7 +2,6 @@ package tsdb
 
 // 并发写查一致性回归测试套件。
 //
-// 背景（详见 docs/CONCURRENCY_BUG_REPORT.md）：
 // 在"高峰并发写入"场景（多 writer + 小 WAL 高频 flush）下，某 tag 第一个
 // 点可能出现值错位：值 0 消失、值 1 重复。根因是 PointDiskPack.Next() 的
 // 时间过滤分支跳过了 valueDecoder.Read()，导致 IntegerDecoder simple8b 的

@@ -90,6 +90,19 @@ func (p *cappedChunkPool) get() []Point {
 	return make([]Point, 0, pointChunkSize)
 }
 
+// tryGet pops a pooled chunk without allocating; nil when the shard is empty.
+func (p *cappedChunkPool) tryGet() []Point {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n := len(p.free); n > 0 {
+		c := p.free[n-1]
+		p.free = p.free[:n-1]
+		p.bytes -= cap(c) * int(unsafe.Sizeof(Point{}))
+		return c
+	}
+	return nil
+}
+
 func (p *cappedChunkPool) put(c []Point) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -115,6 +128,15 @@ type shardedChunkPool struct {
 func (p *shardedChunkPool) get() []Point {
 	p.ensure()
 	i := p.shardCursor.Add(1) % uint64(p.shards)
+	if c := p.pools[i].tryGet(); c != nil {
+		return c
+	}
+	// 单 goroutine 顺序查询场景：上一轮 put 落在片 i-1（get/put 都轮转
+	// 递增），miss 当前片时试上一片，避免小结果查询每轮重新分配 chunk。
+	// 并发场景下各片都被填充，第二片只作兜底。
+	if c := p.pools[(i+uint64(p.shards)-1)%uint64(p.shards)].tryGet(); c != nil {
+		return c
+	}
 	return p.pools[i].get()
 }
 
